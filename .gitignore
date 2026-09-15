@@ -1,0 +1,4 @@
+/build/
+/external/
+compile_commands.json
+.cache/
