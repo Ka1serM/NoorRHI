@@ -1,6 +1,6 @@
 #pragma once
 
-// A minimal SDL3 SurfaceProvider for the presentation test. The gpu library
+// A minimal SDL3 SurfaceProvider for the presentation test. The NoorRHI library
 // never links a windowing toolkit, so its tests carry their own instead of
 // borrowing an application's window class.
 
@@ -14,9 +14,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
-#include <gpu/surface.hpp>
+#include <noorrhi/surface.hpp>
 
-class TestWindow final : public gpu::SurfaceProvider {
+class TestWindow final : public noorrhi::SurfaceProvider {
 public:
     TestWindow(std::uint32_t width, std::uint32_t height) {
         if (!SDL_Init(SDL_INIT_VIDEO))
@@ -25,7 +25,7 @@ public:
             SDL_Quit();
             throw std::runtime_error(std::string("SDL_Vulkan_LoadLibrary: ") + SDL_GetError());
         }
-        window_ = SDL_CreateWindow("gpu tests", static_cast<int>(width),
+        window_ = SDL_CreateWindow("NoorRHI tests", static_cast<int>(width),
             static_cast<int>(height), SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
         if (!window_) {
             SDL_Vulkan_UnloadLibrary();

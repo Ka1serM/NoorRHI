@@ -9,7 +9,7 @@
 #include <span>
 #include <string_view>
 
-namespace gpu {
+namespace noorrhi {
 
 class Device;
 
@@ -87,7 +87,7 @@ struct MemoryReport {
 
 struct DeviceConfig {
     bool enable_validation = false;
-    std::string_view application_name = "gpu";
+    std::string_view application_name = "NoorRHI";
     // Ring holding the per-launch root argument records. Records are tens to
     // a few hundred bytes; this only has to outlast the command buffers that
     // still reference a given offset.
@@ -187,4 +187,4 @@ private:
     std::shared_ptr<detail::DeviceImpl> impl_;
 };
 
-} // namespace gpu
+} // namespace noorrhi

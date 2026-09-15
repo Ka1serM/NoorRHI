@@ -1,4 +1,4 @@
-#include <gpu/gpu.hpp>
+#include <noorrhi/noorrhi.hpp>
 
 #include <array>
 #include <cstddef>
@@ -27,8 +27,8 @@ std::vector<std::byte> read_shader(const char* path) {
 int main() {
     try {
         constexpr std::size_t count = 257;
-        gpu::Device device;
-        const auto shader = device.create_shader(read_shader(GPU_COMPUTE_SHADER));
+        noorrhi::Device device;
+        const auto shader = device.create_shader(read_shader(NOORRHI_COMPUTE_SHADER));
         auto lhs = device.buffer<float>(count);
         auto rhs = device.buffer<float>(count);
         auto output = device.buffer<float>(count);
@@ -43,14 +43,14 @@ int main() {
         rhs.upload(std::span<const float>(right));
 
         struct Args {
-            gpu::GpuPtr<float> lhs;
-            gpu::GpuPtr<float> rhs;
-            gpu::GpuPtr<float> result;
+            noorrhi::GpuPtr<float> lhs;
+            noorrhi::GpuPtr<float> rhs;
+            noorrhi::GpuPtr<float> result;
             std::uint32_t count;
         } args{lhs.ptr(), rhs.ptr(), output.ptr(), static_cast<std::uint32_t>(count)};
 
         device.compute(shader).launch({(args.count + 63u) / 64u, 1, 1}, args);
-        device.barrier(gpu::Stage::Compute, gpu::Stage::Copy);
+        device.barrier(noorrhi::Stage::Compute, noorrhi::Stage::Copy);
         device.synchronize();
 
         std::array<float, count> actual{};

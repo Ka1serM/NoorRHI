@@ -8,7 +8,7 @@
 #include <limits>
 #include <type_traits>
 
-namespace gpu {
+namespace noorrhi {
 
 namespace detail { struct BufferImpl; }
 
@@ -38,20 +38,20 @@ private:
     std::size_t count_ = 0;
 };
 
-} // namespace gpu
+} // namespace noorrhi
 
-namespace gpu::detail {
+namespace noorrhi::detail {
 std::shared_ptr<BufferImpl> make_buffer(const std::shared_ptr<DeviceImpl>&, std::size_t, std::size_t);
 void upload_buffer(const std::shared_ptr<BufferImpl>&, const void*, std::size_t, std::size_t);
 void download_buffer(const std::shared_ptr<BufferImpl>&, void*, std::size_t);
 std::uint64_t buffer_address(const std::shared_ptr<BufferImpl>&);
 }
 
-namespace gpu {
+namespace noorrhi {
 template<class T>
 GpuPtr<T> Buffer<T>::ptr() const {
     if (!impl_)
-        throw Error(ErrorCode::InvalidResource, "gpu::Buffer is empty");
+        throw Error(ErrorCode::InvalidResource, "noorrhi::Buffer is empty");
     return {detail::buffer_address(impl_)};
 }
 
@@ -61,7 +61,7 @@ Buffer<T> Device::buffer(const std::size_t count) {
     if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
         throw Error(ErrorCode::InvalidArgument, "GPU buffer size overflows address space");
     if (count == 0)
-        throw Error(ErrorCode::InvalidArgument, "gpu::Device::buffer requires a non-zero count");
+        throw Error(ErrorCode::InvalidArgument, "noorrhi::Device::buffer requires a non-zero count");
     return Buffer<T>(detail::make_buffer(impl_, count * sizeof(T), alignof(T)), count);
 }
 
@@ -82,4 +82,4 @@ void Buffer<T>::download(std::span<T> destination) const {
     if (!destination.empty())
         detail::download_buffer(impl_, destination.data(), destination.size_bytes());
 }
-} // namespace gpu
+} // namespace noorrhi

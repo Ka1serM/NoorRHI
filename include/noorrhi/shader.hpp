@@ -7,7 +7,7 @@
 #include <span>
 #include <string_view>
 
-namespace gpu {
+namespace noorrhi {
 namespace detail { struct ShaderImpl; }
 namespace detail { class DeviceImpl; }
 
@@ -26,4 +26,4 @@ private:
     std::shared_ptr<detail::ShaderImpl> impl_;
     std::string_view entry_point_ = "main";
 };
-} // namespace gpu
+} // namespace noorrhi

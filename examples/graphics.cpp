@@ -1,4 +1,4 @@
-#include <gpu/gpu.hpp>
+#include <noorrhi/noorrhi.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -25,14 +25,14 @@ std::vector<std::byte> read_shader(const char* path) {
 
 int main() {
     try {
-        gpu::Device device;
-        const auto shader_bytes = read_shader(GPU_GRAPHICS_SHADER);
+        noorrhi::Device device;
+        const auto shader_bytes = read_shader(NOORRHI_GRAPHICS_SHADER);
         const auto vertex = device.create_shader(shader_bytes, "vertMain");
         const auto fragment = device.create_shader(shader_bytes, "fragMain");
         const auto pipeline = device.graphics({vertex, fragment, {},
-            gpu::ImageFormat::Rgba8Unorm});
+            noorrhi::ImageFormat::Rgba8Unorm});
         const auto target = device.image<std::uint8_t>(128, 128,
-            gpu::ImageUsage::ColorAttachment, gpu::ImageFormat::Rgba8Unorm);
+            noorrhi::ImageUsage::ColorAttachment, noorrhi::ImageFormat::Rgba8Unorm);
 
         device.render({target.handle(), {}}, [&] { pipeline.draw(3); });
         device.synchronize();

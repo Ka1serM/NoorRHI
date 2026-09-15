@@ -7,7 +7,7 @@
 #include <cstring>
 #include <vector>
 
-namespace gpu {
+namespace noorrhi {
 
 // CPU data plus one GPU allocation. The owner calls commit() because it just
 // changed the data, so there is nothing to re-compare first.
@@ -43,4 +43,4 @@ private:
     Buffer<T> buffer_;
 };
 
-} // namespace gpu
+} // namespace noorrhi

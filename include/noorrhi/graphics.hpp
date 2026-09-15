@@ -7,7 +7,7 @@
 #include <memory>
 #include <type_traits>
 
-namespace gpu {
+namespace noorrhi {
 
 enum class CullMode { None, Front, Back, FrontAndBack };
 enum class FrontFace { CounterClockwise, Clockwise };
@@ -86,4 +86,4 @@ private:
     std::shared_ptr<detail::GraphicsPipelineImpl> impl_;
 };
 
-} // namespace gpu
+} // namespace noorrhi

@@ -1,4 +1,4 @@
-#include <gpu/gpu.hpp>
+#include <noorrhi/noorrhi.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,16 +23,16 @@ std::vector<std::byte> read_shader(const char* path) {
 
 // Every test runs with the validation layers on, so a spec violation fails the
 // build rather than going unnoticed.
-gpu::Device make_device() {
-    return gpu::Device({.enable_validation = true, .application_name = "gpu tests"});
+noorrhi::Device make_device() {
+    return noorrhi::Device({.enable_validation = true, .application_name = "NoorRHI tests"});
 }
 }
 
-TEST_CASE("gpu API adds typed buffers through a root argument") {
+TEST_CASE("NoorRHI API adds typed buffers through a root argument") {
     constexpr std::size_t count = 257;
 
-    gpu::Device device = make_device();
-    auto shader = device.create_shader(read_shader(GPU_TEST_SHADER));
+    noorrhi::Device device = make_device();
+    auto shader = device.create_shader(read_shader(NOORRHI_TEST_SHADER));
     auto a = device.buffer<float>(count);
     auto b = device.buffer<float>(count);
     auto output = device.buffer<float>(count);
@@ -50,9 +50,9 @@ TEST_CASE("gpu API adds typed buffers through a root argument") {
     b.upload(std::span<const float>(rhs));
 
     struct Args {
-        gpu::GpuPtr<float> a;
-        gpu::GpuPtr<float> b;
-        gpu::GpuPtr<float> output;
+        noorrhi::GpuPtr<float> a;
+        noorrhi::GpuPtr<float> b;
+        noorrhi::GpuPtr<float> output;
         std::uint32_t count;
     } args{a.ptr(), b.ptr(), output.ptr(), static_cast<std::uint32_t>(count)};
 
@@ -60,7 +60,7 @@ TEST_CASE("gpu API adds typed buffers through a root argument") {
     // submission must retain the Vulkan pipeline until GPU completion.
     device.compute(shader).launch(
         {static_cast<std::uint32_t>((count + 63) / 64), 1, 1}, args);
-    device.barrier(gpu::Stage::Compute, gpu::Stage::Copy);
+    device.barrier(noorrhi::Stage::Compute, noorrhi::Stage::Copy);
     const auto token = device.signal();
     device.wait(token);
 
@@ -69,10 +69,10 @@ TEST_CASE("gpu API adds typed buffers through a root argument") {
     REQUIRE(actual == expected);
 }
 
-TEST_CASE("gpu API dispatches compute indirectly with root arguments") {
+TEST_CASE("NoorRHI API dispatches compute indirectly with root arguments") {
     constexpr std::size_t count = 64;
-    gpu::Device device = make_device();
-    auto shader = device.create_shader(read_shader(GPU_TEST_SHADER));
+    noorrhi::Device device = make_device();
+    auto shader = device.create_shader(read_shader(NOORRHI_TEST_SHADER));
     auto pipeline = device.compute(shader);
 
     auto a = device.buffer<float>(count);
@@ -83,14 +83,14 @@ TEST_CASE("gpu API dispatches compute indirectly with root arguments") {
     a.upload(std::span<const float>(ones));
     b.upload(std::span<const float>(twos));
 
-    auto groups = device.buffer<gpu::DispatchArgs>(1);
-    const gpu::DispatchArgs dispatch{1, 1, 1};
-    groups.upload(std::span<const gpu::DispatchArgs>(&dispatch, 1));
+    auto groups = device.buffer<noorrhi::DispatchArgs>(1);
+    const noorrhi::DispatchArgs dispatch{1, 1, 1};
+    groups.upload(std::span<const noorrhi::DispatchArgs>(&dispatch, 1));
 
     struct Args {
-        gpu::GpuPtr<float> a;
-        gpu::GpuPtr<float> b;
-        gpu::GpuPtr<float> output;
+        noorrhi::GpuPtr<float> a;
+        noorrhi::GpuPtr<float> b;
+        noorrhi::GpuPtr<float> output;
         std::uint32_t count;
     } args{a.ptr(), b.ptr(), output.ptr(), static_cast<std::uint32_t>(count)};
 
@@ -102,7 +102,7 @@ TEST_CASE("gpu API dispatches compute indirectly with root arguments") {
     REQUIRE(actual == std::vector<float>(count, 3.0f));
 }
 
-TEST_CASE("gpu uploads capture bytes and preserve overlapping write order") {
+TEST_CASE("NoorRHI uploads capture bytes and preserve overlapping write order") {
     auto device = make_device();
     auto buffer = device.buffer<std::uint32_t>(4);
     std::vector<std::uint32_t> values{1, 2, 3, 4};
@@ -115,7 +115,7 @@ TEST_CASE("gpu uploads capture bytes and preserve overlapping write order") {
     CHECK(actual == std::vector<std::uint32_t>{1, 7, 3, 4});
 }
 
-TEST_CASE("gpu buffers keep their address across partial uploads") {
+TEST_CASE("NoorRHI buffers keep their address across partial uploads") {
     auto device = make_device();
     constexpr std::size_t count = 40000;
     auto a = device.buffer<float>(count);
@@ -129,9 +129,9 @@ TEST_CASE("gpu buffers keep their address across partial uploads") {
     aData[17] = 8.0f;
     a.upload(std::span<const float>(aData).subspan(17, 1), 17);
     CHECK(a.ptr().address == address.address);
-    auto shader = device.create_shader(read_shader(GPU_TEST_SHADER));
+    auto shader = device.create_shader(read_shader(NOORRHI_TEST_SHADER));
     struct Args {
-        gpu::GpuPtr<float> a, b, output;
+        noorrhi::GpuPtr<float> a, b, output;
         std::uint32_t count;
     } args{a.ptr(), b.ptr(), output.ptr(), count};
     device.compute(shader).launch({(count + 63) / 64, 1, 1}, args);
@@ -142,9 +142,9 @@ TEST_CASE("gpu buffers keep their address across partial uploads") {
     CHECK(actual == expected);
 }
 
-TEST_CASE("gpu shared records publish their data on commit") {
+TEST_CASE("NoorRHI shared records publish their data on commit") {
     auto device = make_device();
-    gpu::Shared<std::uint32_t> record(device);
+    noorrhi::Shared<std::uint32_t> record(device);
     record.data = 42;
     record.commit();
     device.synchronize();
@@ -152,8 +152,8 @@ TEST_CASE("gpu shared records publish their data on commit") {
     CHECK(record.ptr().address != 0);
 }
 
-TEST_CASE("gpu argument arena preserves launches across wraparound") {
-    gpu::Device device({.enable_validation = true, .application_name = "arena tests",
+TEST_CASE("NoorRHI argument arena preserves launches across wraparound") {
+    noorrhi::Device device({.enable_validation = true, .application_name = "arena tests",
         .argument_arena_bytes = 4096});
     auto input = device.buffer<float>(1);
     auto output = device.buffer<float>(400);
@@ -161,24 +161,24 @@ TEST_CASE("gpu argument arena preserves launches across wraparound") {
     input.upload(std::span(&one, 1));
     std::vector<float> actual(400, 0.0f);
     output.upload(std::span<const float>(actual));
-    auto pipeline = device.compute(device.create_shader(read_shader(GPU_TEST_SHADER)));
+    auto pipeline = device.compute(device.create_shader(read_shader(NOORRHI_TEST_SHADER)));
     struct Args {
-        gpu::GpuPtr<float> a, b, output;
+        noorrhi::GpuPtr<float> a, b, output;
         std::uint32_t count;
     };
     for (std::size_t i = 0; i < actual.size(); ++i) {
         const Args args{input.ptr(), input.ptr(),
-            gpu::GpuPtr<float>{output.ptr().address + i * sizeof(float)}, 1};
+            noorrhi::GpuPtr<float>{output.ptr().address + i * sizeof(float)}, 1};
         pipeline.launch({1, 1, 1}, args);
     }
     output.download(std::span(actual));
     CHECK(actual == std::vector<float>(400, 2.0f));
 }
 
-TEST_CASE("gpu API round-trips image contents") {
-    gpu::Device device = make_device();
+TEST_CASE("NoorRHI API round-trips image contents") {
+    noorrhi::Device device = make_device();
     auto image = device.image<std::uint8_t>(4, 4,
-        gpu::ImageUsage::Storage | gpu::ImageUsage::Sampled);
+        noorrhi::ImageUsage::Storage | noorrhi::ImageUsage::Sampled);
     REQUIRE(image.storage_handle());
     REQUIRE(image.sampled_handle());
     REQUIRE(image.storage_handle().value != image.sampled_handle().value);
@@ -193,17 +193,17 @@ TEST_CASE("gpu API round-trips image contents") {
     REQUIRE(read_back == pixels);
 }
 
-TEST_CASE("gpu shaders read and write images through the descriptor heaps") {
-    gpu::Device device = make_device();
+TEST_CASE("NoorRHI shaders read and write images through the descriptor heaps") {
+    noorrhi::Device device = make_device();
     constexpr std::uint32_t size = 8;
     auto target = device.image<std::uint8_t>(size, size,
-        gpu::ImageUsage::Storage, gpu::ImageFormat::Rgba8Unorm);
+        noorrhi::ImageUsage::Storage, noorrhi::ImageFormat::Rgba8Unorm);
     auto source = device.image<std::uint8_t>(1, 1,
-        gpu::ImageUsage::Sampled, gpu::ImageFormat::Rgba8Unorm);
+        noorrhi::ImageUsage::Sampled, noorrhi::ImageFormat::Rgba8Unorm);
     const std::uint8_t texel[4]{0, 0, 64, 255};
     source.upload(std::span<const std::uint8_t>(texel));
-    auto sampler = device.sampler({gpu::Filter::Nearest});
-    auto pipeline = device.compute(device.create_shader(read_shader(GPU_IMAGE_SHADER)));
+    auto sampler = device.sampler({noorrhi::Filter::Nearest});
+    auto pipeline = device.compute(device.create_shader(read_shader(NOORRHI_IMAGE_SHADER)));
 
     struct Args {
         std::uint32_t target, source, sampler, size;
@@ -225,13 +225,13 @@ TEST_CASE("gpu shaders read and write images through the descriptor heaps") {
     }
 }
 
-TEST_CASE("gpu descriptor heap slots are reused after retirement and never overflow") {
+TEST_CASE("NoorRHI descriptor heap slots are reused after retirement and never overflow") {
     // Slot 0 is reserved, so three storage images fill this heap.
-    gpu::Device device({.enable_validation = true, .application_name = "heap tests",
+    noorrhi::Device device({.enable_validation = true, .application_name = "heap tests",
         .texture_descriptor_capacity = 4, .sampler_descriptor_capacity = 2});
     for (std::uint32_t i = 0; i < 64u; ++i) {
         {
-            auto image = device.image<std::uint8_t>(2, 2, gpu::ImageUsage::Storage);
+            auto image = device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage);
             REQUIRE(image.storage_handle());
             REQUIRE(image.storage_handle().value < 4u);
             auto sampler = device.sampler({});
@@ -241,32 +241,32 @@ TEST_CASE("gpu descriptor heap slots are reused after retirement and never overf
         device.synchronize();
     }
 
-    std::vector<gpu::Image<std::uint8_t>> held;
+    std::vector<noorrhi::Image<std::uint8_t>> held;
     for (std::uint32_t i = 0; i < 3u; ++i)
-        held.push_back(device.image<std::uint8_t>(2, 2, gpu::ImageUsage::Storage));
+        held.push_back(device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage));
     REQUIRE(held[0].storage_handle().value != held[1].storage_handle().value);
     REQUIRE(held[1].storage_handle().value != held[2].storage_handle().value);
     REQUIRE(held[0].storage_handle().value != held[2].storage_handle().value);
     try {
-        auto overflow = device.image<std::uint8_t>(2, 2, gpu::ImageUsage::Storage);
+        auto overflow = device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage);
         FAIL("a full descriptor heap accepted another image");
-    } catch (const gpu::Error& error) {
-        REQUIRE(error.code() == gpu::ErrorCode::OutOfMemory);
+    } catch (const noorrhi::Error& error) {
+        REQUIRE(error.code() == noorrhi::ErrorCode::OutOfMemory);
     }
     auto sampler = device.sampler({});
-    REQUIRE_THROWS_AS(device.sampler({}), gpu::Error);
+    REQUIRE_THROWS_AS(device.sampler({}), noorrhi::Error);
 }
 
-TEST_CASE("gpu API rasterizes a triangle into a render target") {
-    gpu::Device device = make_device();
-    const auto triangle = read_shader(GPU_TRIANGLE_SHADER);
+TEST_CASE("NoorRHI API rasterizes a triangle into a render target") {
+    noorrhi::Device device = make_device();
+    const auto triangle = read_shader(NOORRHI_TRIANGLE_SHADER);
     auto vertex = device.create_shader(triangle, "vertMain");
     auto fragment = device.create_shader(triangle, "fragMain");
 
     constexpr std::uint32_t size = 64;
     auto target = device.image<std::uint8_t>(size, size,
-        gpu::ImageUsage::ColorAttachment, gpu::ImageFormat::Rgba8Unorm);
-    auto pipeline = device.graphics({vertex, fragment, {}, gpu::ImageFormat::Rgba8Unorm});
+        noorrhi::ImageUsage::ColorAttachment, noorrhi::ImageFormat::Rgba8Unorm);
+    auto pipeline = device.graphics({vertex, fragment, {}, noorrhi::ImageFormat::Rgba8Unorm});
 
     device.render({target.handle(), {}}, [&] { pipeline.draw(3); });
     device.synchronize();
@@ -288,30 +288,30 @@ TEST_CASE("gpu API rasterizes a triangle into a render target") {
     // A pipeline built for a different attachment format must be rejected
     // rather than silently mismatching the render pass instance.
     auto bgra_target = device.image<std::uint8_t>(8, 8,
-        gpu::ImageUsage::ColorAttachment, gpu::ImageFormat::Bgra8Unorm);
+        noorrhi::ImageUsage::ColorAttachment, noorrhi::ImageFormat::Bgra8Unorm);
     REQUIRE_THROWS_AS(
-        device.render({bgra_target.handle(), {}}, [&] { pipeline.draw(3); }), gpu::Error);
+        device.render({bgra_target.handle(), {}}, [&] { pipeline.draw(3); }), noorrhi::Error);
 }
 
-TEST_CASE("gpu API draws indirectly and honours depth targets") {
-    gpu::Device device = make_device();
-    const auto triangle = read_shader(GPU_TRIANGLE_SHADER);
+TEST_CASE("NoorRHI API draws indirectly and honours depth targets") {
+    noorrhi::Device device = make_device();
+    const auto triangle = read_shader(NOORRHI_TRIANGLE_SHADER);
     auto vertex = device.create_shader(triangle, "vertMain");
     auto fragment = device.create_shader(triangle, "fragMain");
 
     constexpr std::uint32_t size = 32;
-    auto target = device.image<std::uint8_t>(size, size, gpu::ImageUsage::ColorAttachment);
-    auto depth = device.image<float>(size, size, gpu::ImageUsage::DepthAttachment);
+    auto target = device.image<std::uint8_t>(size, size, noorrhi::ImageUsage::ColorAttachment);
+    auto depth = device.image<float>(size, size, noorrhi::ImageUsage::DepthAttachment);
 
-    gpu::GraphicsState state{};
+    noorrhi::GraphicsState state{};
     state.depth_test = true;
     state.depth_write = true;
     auto depth_pipeline = device.graphics({vertex, fragment, state});
     auto plain_pipeline = device.graphics({vertex, fragment, {}});
 
-    auto commands = device.buffer<gpu::DrawArgs>(1);
-    const gpu::DrawArgs draw_args{3, 1, 0, 0};
-    commands.upload(std::span<const gpu::DrawArgs>(&draw_args, 1));
+    auto commands = device.buffer<noorrhi::DrawArgs>(1);
+    const noorrhi::DrawArgs draw_args{3, 1, 0, 0};
+    commands.upload(std::span<const noorrhi::DrawArgs>(&draw_args, 1));
 
     device.render({target.handle(), depth.handle()},
         [&] { depth_pipeline.draw_indirect(commands.ptr()); });
@@ -325,28 +325,28 @@ TEST_CASE("gpu API draws indirectly and honours depth targets") {
 
     // Depth attachment presence is part of the pipeline's contract.
     REQUIRE_THROWS_AS(device.render({target.handle(), depth.handle()},
-        [&] { plain_pipeline.draw(3); }), gpu::Error);
+        [&] { plain_pipeline.draw(3); }), noorrhi::Error);
     REQUIRE_THROWS_AS(device.render({target.handle(), {}},
-        [&] { depth_pipeline.draw(3); }), gpu::Error);
+        [&] { depth_pipeline.draw(3); }), noorrhi::Error);
 }
 
-TEST_CASE("gpu API exposes samplers and rejects invalid resources") {
-    gpu::Device device = make_device();
+TEST_CASE("NoorRHI API exposes samplers and rejects invalid resources") {
+    noorrhi::Device device = make_device();
     auto sampler = device.sampler({});
     REQUIRE(sampler);
     REQUIRE(sampler.handle());
-    auto texture = device.image<std::uint8_t>(1, 1, gpu::ImageUsage::Sampled);
+    auto texture = device.image<std::uint8_t>(1, 1, noorrhi::ImageUsage::Sampled);
     REQUIRE(texture.sampled_handle());
     REQUIRE_FALSE(texture.storage_handle());
 
-    REQUIRE_THROWS_AS(device.buffer<float>(0), gpu::Error);
-    REQUIRE_THROWS_AS(device.image<std::uint8_t>(0, 4, gpu::ImageUsage::Storage), gpu::Error);
-    REQUIRE_THROWS_AS(gpu::Buffer<float>{}.ptr(), gpu::Error);
-    REQUIRE_THROWS_AS(gpu::ComputePipeline{}.launch({1, 1, 1}, 0u), gpu::Error);
+    REQUIRE_THROWS_AS(device.buffer<float>(0), noorrhi::Error);
+    REQUIRE_THROWS_AS(device.image<std::uint8_t>(0, 4, noorrhi::ImageUsage::Storage), noorrhi::Error);
+    REQUIRE_THROWS_AS(noorrhi::Buffer<float>{}.ptr(), noorrhi::Error);
+    REQUIRE_THROWS_AS(noorrhi::ComputePipeline{}.launch({1, 1, 1}, 0u), noorrhi::Error);
 }
 
-TEST_CASE("gpu API reclaims buffer allocations after GPU retirement") {
-    gpu::Device device = make_device();
+TEST_CASE("NoorRHI API reclaims buffer allocations after GPU retirement") {
+    noorrhi::Device device = make_device();
     const auto before = device.memory_report().allocation_bytes;
     // Churn far more short-lived buffers than any heap would once have held,
     // keeping only one live at a time. Buffers consume no descriptor now, so
@@ -367,23 +367,23 @@ TEST_CASE("gpu API reclaims buffer allocations after GPU retirement") {
     CHECK(device.memory_report().allocation_bytes == before);
 }
 
-TEST_CASE("gpu owners reject invalid ranges and expired host references") {
+TEST_CASE("NoorRHI owners reject invalid ranges and expired host references") {
     auto device = make_device();
-    gpu::ImageHandle expired;
+    noorrhi::ImageHandle expired;
     {
-        auto image = device.image<std::uint8_t>(1, 1, gpu::ImageUsage::ColorAttachment);
+        auto image = device.image<std::uint8_t>(1, 1, noorrhi::ImageUsage::ColorAttachment);
         expired = image.handle();
         REQUIRE(expired);
     }
     device.synchronize(); // Retire the initial image-layout submission's reference.
     CHECK_FALSE(expired);
-    CHECK_THROWS_AS(device.render({expired, {}}, [] {}), gpu::Error);
+    CHECK_THROWS_AS(device.render({expired, {}}, [] {}), noorrhi::Error);
 
     auto buffer = device.buffer<std::uint32_t>(2);
     const std::uint32_t value = 42;
-    CHECK_THROWS_AS(buffer.upload(std::span(&value, 1), 2), gpu::Error);
-    gpu::Shared<unsigned> empty;
-    CHECK_THROWS_AS(empty.commit(), gpu::Error);
+    CHECK_THROWS_AS(buffer.upload(std::span(&value, 1), 2), noorrhi::Error);
+    noorrhi::Shared<unsigned> empty;
+    CHECK_THROWS_AS(empty.commit(), noorrhi::Error);
     struct alignas(1024) Aligned { std::uint32_t value; };
     auto aligned = device.buffer<Aligned>(1);
     CHECK(aligned.ptr().address % alignof(Aligned) == 0);

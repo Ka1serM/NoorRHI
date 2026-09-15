@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace gpu {
+namespace noorrhi {
 class Device;
 }
 
@@ -22,7 +22,7 @@ class Device;
 // as it is. Handles are widened to uintptr_t so the public headers stay free
 // of Vulkan types; reinterpret_cast them back to the Vulkan type named in
 // each comment.
-namespace gpu::interop {
+namespace noorrhi::interop {
 
 struct DeviceHandles {
     std::uintptr_t instance = 0;         // VkInstance
@@ -35,7 +35,7 @@ struct DeviceHandles {
 // A duplicated POSIX FD for an image allocation created with
 // ImageUsage::ExternalMemory. Ownership transfers to the caller, which must
 // close it after importing it into the consuming API. The memory remains
-// owned by gpu::Device; the consumer must release its imported object before
+// owned by noorrhi::Device; the consumer must release its imported object before
 // the Image is destroyed.
 struct ExternalImageMemory {
     int fd = -1;
@@ -75,4 +75,4 @@ ExternalSemaphore signal_external(Device& device);
 // pipelines that must be created against a matching attachment format.
 std::uint32_t native_format(ImageFormat format);
 
-} // namespace gpu::interop
+} // namespace noorrhi::interop

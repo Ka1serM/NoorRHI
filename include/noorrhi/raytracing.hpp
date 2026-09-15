@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace gpu {
+namespace noorrhi {
 
 class RayTracingPipeline;
 
@@ -104,4 +104,4 @@ private:
     void trace_bytes(DispatchSize, const void*, std::size_t) const;
     std::shared_ptr<detail::RayTracingPipelineImpl> impl_;
 };
-} // namespace gpu
+} // namespace noorrhi

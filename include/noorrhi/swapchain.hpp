@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace gpu {
+namespace noorrhi {
 
 namespace detail { class SwapchainImpl; class DeviceImpl; }
 namespace interop { std::uintptr_t command_buffer(const class Frame&); }
@@ -78,4 +78,4 @@ private:
     std::shared_ptr<State> impl_;
 };
 
-} // namespace gpu
+} // namespace noorrhi

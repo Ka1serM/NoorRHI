@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <limits>
 
-namespace gpu {
+namespace noorrhi {
 namespace detail {
 namespace {
 
@@ -206,7 +206,7 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
         throw Error(ErrorCode::InvalidArgument, "begin_frame requires a valid Swapchain");
     std::lock_guard lock(mutex_);
     if (shut_down_)
-        throw Error(ErrorCode::InvalidState, "gpu::Device has been shut down");
+        throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
     if (frame_command_)
         throw Error(ErrorCode::InvalidState, "a frame is already open on this device");
     reap_completed();
@@ -380,4 +380,4 @@ ImageFormat Frame::format() const noexcept {
     return impl_ && impl_->swapchain ? impl_->swapchain->public_format : ImageFormat::Auto;
 }
 
-} // namespace gpu
+} // namespace noorrhi

@@ -8,7 +8,7 @@
 #include <memory>
 #include <string>
 
-namespace gpu {
+namespace noorrhi {
 namespace detail { class DeviceImpl; struct ImageImpl; }
 
 enum class ErrorCode {
@@ -118,4 +118,4 @@ struct AccelerationStructureHandle {
     explicit operator bool() const noexcept { return value != 0; }
 };
 
-} // namespace gpu
+} // namespace noorrhi

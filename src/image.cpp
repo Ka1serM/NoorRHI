@@ -2,11 +2,11 @@
 #include <vulkan/vulkan.hpp>
 
 #include "internal.hpp"
-#include "gpu/interop.hpp"
+#include "noorrhi/interop.hpp"
 
 #include <cstring>
 
-namespace gpu::detail {
+namespace noorrhi::detail {
 
 // The shader-facing handle for an image: a resource-heap slot holding a
 // descriptor for the whole image. The view is described inline, so the heap
@@ -249,7 +249,7 @@ interop::ExternalImageMemory DeviceImpl::export_image_memory(const ImageHandle h
     const auto image = find_image(handle);
     if (!image || !image->exportable || !image->external_memory)
         throw Error(ErrorCode::InvalidArgument,
-            "image was not created with gpu::ImageUsage::ExternalMemory");
+            "image was not created with noorrhi::ImageUsage::ExternalMemory");
     vk::MemoryGetFdInfoKHR fd_info{};
     fd_info.memory = image->external_memory;
     fd_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
@@ -323,4 +323,4 @@ void download_image(const std::shared_ptr<ImageImpl>& image, void* data, std::si
     image->device->download_image(image, data, bytes);
 }
 
-} // namespace gpu::detail
+} // namespace noorrhi::detail

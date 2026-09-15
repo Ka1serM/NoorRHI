@@ -6,7 +6,7 @@
 #include <memory>
 #include <type_traits>
 
-namespace gpu {
+namespace noorrhi {
 namespace detail { class ComputePipelineImpl; }
 
 class ComputePipeline {
@@ -37,4 +37,4 @@ private:
         std::size_t size) const;
     std::shared_ptr<detail::ComputePipelineImpl> impl_;
 };
-} // namespace gpu
+} // namespace noorrhi

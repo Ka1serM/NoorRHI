@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace gpu {
+namespace noorrhi {
 
 // The small format vocabulary keeps image/pipeline compatibility explicit
 // without exposing backend-specific format enums in the public API.
@@ -27,7 +27,7 @@ enum class ImageUsage : std::uint32_t {
     TransferSource = 1u << 4,
     TransferDestination = 1u << 5,
     // Allocate dedicated Vulkan memory that can be exported through
-    // gpu::interop for another Vulkan-capable API, such as OpenGL's
+    // noorrhi::interop for another Vulkan-capable API, such as OpenGL's
     // GL_EXT_memory_object_fd implementation. This is deliberately opt-in:
     // ordinary images keep using VMA's compact internal allocations.
     ExternalMemory = 1u << 6,
@@ -70,9 +70,9 @@ private:
     ImageFormat format_ = ImageFormat::Auto;
 };
 
-} // namespace gpu
+} // namespace noorrhi
 
-namespace gpu::detail {
+namespace noorrhi::detail {
 std::shared_ptr<ImageImpl> make_image(const std::shared_ptr<DeviceImpl>&, std::uint32_t,
                                       std::uint32_t, ImageUsage, ImageFormat);
 std::uint32_t image_sampled_handle(const std::shared_ptr<ImageImpl>&);
@@ -82,7 +82,7 @@ void download_image(const std::shared_ptr<ImageImpl>&, void*, std::size_t);
 std::size_t image_byte_size(const std::shared_ptr<ImageImpl>&);
 }
 
-namespace gpu {
+namespace noorrhi {
 template<class T>
 Image<T> Device::image(const std::uint32_t width, const std::uint32_t height,
     const ImageUsage usage) {
@@ -93,7 +93,7 @@ template<class T>
 Image<T> Device::image(const std::uint32_t width, const std::uint32_t height,
     const ImageUsage usage, const ImageFormat format) {
     if (width == 0 || height == 0)
-        throw Error(ErrorCode::InvalidArgument, "gpu::Device::image requires non-zero dimensions");
+        throw Error(ErrorCode::InvalidArgument, "noorrhi::Device::image requires non-zero dimensions");
     const ImageFormat actual_format = format == ImageFormat::Auto
         ? ((static_cast<std::uint32_t>(usage)
             & static_cast<std::uint32_t>(ImageUsage::DepthAttachment))
@@ -121,7 +121,7 @@ TextureHandle Image<T>::storage_handle() const noexcept {
 template<class T>
 void Image<T>::upload(const std::span<const T> data) {
     if (!impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot upload to an empty gpu::Image");
+        throw Error(ErrorCode::InvalidResource, "cannot upload to an empty noorrhi::Image");
     if (data.size_bytes() != detail::image_byte_size(impl_))
         throw Error(ErrorCode::InvalidArgument,
             "image upload must cover exactly one full mip level");
@@ -131,10 +131,10 @@ void Image<T>::upload(const std::span<const T> data) {
 template<class T>
 void Image<T>::download(const std::span<T> destination) const {
     if (!impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot download from an empty gpu::Image");
+        throw Error(ErrorCode::InvalidResource, "cannot download from an empty noorrhi::Image");
     if (destination.size_bytes() != detail::image_byte_size(impl_))
         throw Error(ErrorCode::InvalidArgument,
             "image download must cover exactly one full mip level");
     detail::download_image(impl_, destination.data(), destination.size_bytes());
 }
-} // namespace gpu
+} // namespace noorrhi

@@ -1,10 +1,10 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #include <vulkan/vulkan.hpp>
 
-#include "gpu/gpu.hpp"
-#include "gpu/interop.hpp"
+#include "noorrhi/noorrhi.hpp"
+#include "noorrhi/interop.hpp"
 #include "internal.hpp"
-#include "gpu/shared.hpp"
+#include "noorrhi/shared.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -13,7 +13,7 @@
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
-namespace gpu::detail {
+namespace noorrhi::detail {
 
 namespace {
 [[noreturn]] void throw_vk(const vk::SystemError& error, const char* operation) {
@@ -29,7 +29,7 @@ vk::Bool32 VKAPI_CALL debug_callback(
             severity & vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "error"
             : severity & vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning ? "warning"
             : "info";
-        std::fprintf(stderr, "[gpu validation %s] %s\n", label, data->pMessage);
+        std::fprintf(stderr, "[NoorRHI validation %s] %s\n", label, data->pMessage);
     }
     return vk::False;
 }
@@ -209,7 +209,7 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
     const std::string application_name(config.application_name);
     // 1.4 so that a 1.4 device exposes maintenance5 as core; 1.3 devices
     // still qualify through the extension.
-    const vk::ApplicationInfo appInfo(application_name.c_str(), 1, "gpu", 1, VK_API_VERSION_1_4);
+    const vk::ApplicationInfo appInfo(application_name.c_str(), 1, "NoorRHI", 1, VK_API_VERSION_1_4);
     vk::InstanceCreateInfo createInfo{};
     createInfo.setPApplicationInfo(&appInfo)
         .setPEnabledLayerNames(layers)
@@ -570,7 +570,7 @@ void DeviceImpl::bind_heaps(const vk::CommandBuffer command) const {
 std::uint32_t DeviceImpl::allocate_slot(DescriptorHeap& heap) {
     std::lock_guard lock(heap_mutex_);
     if (!heap.buffer)
-        throw Error(ErrorCode::InvalidState, "gpu::Device has been shut down");
+        throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
     if (!heap.free.empty()) {
         const std::uint32_t slot = heap.free.back();
         heap.free.pop_back();
@@ -798,7 +798,7 @@ GpuToken DeviceImpl::submit(const std::function<void(vk::CommandBuffer)>& record
     std::vector<std::shared_ptr<void>> resources) {
     std::lock_guard lock(mutex_);
     if (shut_down_)
-        throw Error(ErrorCode::InvalidState, "gpu::Device has been shut down");
+        throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
     if (frame_command_) {
         // A frame is open: batch into its command buffer instead of opening a
         // submission of our own. Every dispatch, trace and render scope issued
@@ -964,7 +964,7 @@ vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_
         return 0;
     std::lock_guard lock(argument_mutex_);
     if (!argument_arena_)
-        throw Error(ErrorCode::InvalidState, "gpu::Device has been shut down");
+        throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
     if (size > argument_arena_->size)
         throw Error(ErrorCode::OutOfMemory,
             "root arguments do not fit in the GPU argument arena");
@@ -1066,7 +1066,7 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::create_ray_tracing(
     const RayTracingPipelineDesc& desc) {
     if (!ray_tracing_supported_)
         throw Error(ErrorCode::UnsupportedFeature,
-            "acceleration structures are not enabled on this gpu::Device");
+            "acceleration structures are not enabled on this noorrhi::Device");
     if (!desc.raygen.impl_)
         throw Error(ErrorCode::InvalidArgument, "ray-tracing pipelines require a ray-generation shader");
 
@@ -1174,7 +1174,7 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::create_ray_tracing(
 AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeometry> geometry) {
     if (!acceleration_structure_supported_)
         throw Error(ErrorCode::UnsupportedFeature,
-            "acceleration structures are not enabled on this gpu::Device");
+            "acceleration structures are not enabled on this noorrhi::Device");
     if (geometry.empty())
         throw Error(ErrorCode::InvalidArgument, "BLAS requires at least one triangle geometry");
 
@@ -1272,7 +1272,7 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
 
 AccelerationStructure DeviceImpl::build_tlas(const std::span<const Instance> instances) {
     if (!acceleration_structure_supported_)
-        throw Error(ErrorCode::UnsupportedFeature, "ray tracing is not enabled on this gpu::Device");
+        throw Error(ErrorCode::UnsupportedFeature, "ray tracing is not enabled on this noorrhi::Device");
     if (instances.empty())
         throw Error(ErrorCode::InvalidArgument, "TLAS requires at least one instance");
 
@@ -1315,7 +1315,7 @@ AccelerationStructure DeviceImpl::build_tlas(const std::span<const Instance> ins
 AccelerationStructure DeviceImpl::build_tlas(const GpuPtr<InstanceRecord> records,
     const std::uint32_t count, const std::span<const AccelerationStructure> referenced) {
     if (!acceleration_structure_supported_)
-        throw Error(ErrorCode::UnsupportedFeature, "ray tracing is not enabled on this gpu::Device");
+        throw Error(ErrorCode::UnsupportedFeature, "ray tracing is not enabled on this noorrhi::Device");
     if (count == 0)
         throw Error(ErrorCode::InvalidArgument, "TLAS requires at least one instance");
     if (records.address == 0)
@@ -1711,9 +1711,9 @@ AccelerationStructureHandle acceleration_structure_handle(
     return acceleration_structure ? acceleration_structure->handle : AccelerationStructureHandle{};
 }
 
-} // namespace gpu::detail
+} // namespace noorrhi::detail
 
-namespace gpu {
+namespace noorrhi {
 
 Device::Device(const DeviceConfig& config)
     : impl_(std::make_shared<detail::DeviceImpl>(config)) {
@@ -1873,21 +1873,21 @@ AccelerationStructure::operator bool() const noexcept {
 }
 
 
-} // namespace gpu
+} // namespace noorrhi
 
-namespace gpu {
+namespace noorrhi {
 
 namespace interop {
 
 DeviceHandles device_handles(Device& device) {
     if (!device.impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot read handles from an empty gpu::Device");
+        throw Error(ErrorCode::InvalidResource, "cannot read handles from an empty noorrhi::Device");
     return device.impl_->native_handles();
 }
 
 std::uintptr_t image_view(Device& device, const ImageHandle handle) {
     if (!device.impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot inspect through an empty gpu::Device");
+        throw Error(ErrorCode::InvalidResource, "cannot inspect through an empty noorrhi::Device");
     const auto image = device.impl_->find_image(handle);
     if (!image)
         throw Error(ErrorCode::InvalidResource, "GPU image handle is not live");
@@ -1896,13 +1896,13 @@ std::uintptr_t image_view(Device& device, const ImageHandle handle) {
 
 ExternalImageMemory export_image_memory(Device& device, const ImageHandle handle) {
     if (!device.impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot export from an empty gpu::Device");
+        throw Error(ErrorCode::InvalidResource, "cannot export from an empty noorrhi::Device");
     return device.impl_->export_image_memory(handle);
 }
 
 ExternalSemaphore signal_external(Device& device) {
     if (!device.impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot export from an empty gpu::Device");
+        throw Error(ErrorCode::InvalidResource, "cannot export from an empty noorrhi::Device");
     return device.impl_->signal_external();
 }
 
@@ -1919,4 +1919,4 @@ std::uint32_t native_format(const ImageFormat format) {
 }
 
 } // namespace interop
-} // namespace gpu
+} // namespace noorrhi

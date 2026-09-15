@@ -4,7 +4,7 @@
 
 #include <memory>
 
-namespace gpu {
+namespace noorrhi {
 
 enum class Filter { Nearest, Linear };
 enum class AddressMode { Repeat, MirroredRepeat, ClampToEdge, ClampToBorder };
@@ -38,4 +38,4 @@ private:
     explicit Sampler(std::shared_ptr<detail::SamplerImpl> impl) : impl_(std::move(impl)) {}
     std::shared_ptr<detail::SamplerImpl> impl_;
 };
-} // namespace gpu
+} // namespace noorrhi

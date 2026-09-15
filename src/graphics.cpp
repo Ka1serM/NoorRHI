@@ -5,7 +5,7 @@
 
 #include <cstring>
 
-namespace gpu::detail {
+namespace noorrhi::detail {
 
 namespace {
 vk::CullModeFlags cull_mode(const CullMode mode) {
@@ -220,9 +220,9 @@ void GraphicsPipelineImpl::draw_indirect(const GpuPtr<DrawArgs> commands,
     device->record_draw_indirect(*this, commands, draw_count, args, size);
 }
 
-} // namespace gpu::detail
+} // namespace noorrhi::detail
 
-namespace gpu {
+namespace noorrhi {
 void GraphicsPipeline::draw(const std::uint32_t vertex_count) const {
     draw_bytes(vertex_count, nullptr, 0);
 }

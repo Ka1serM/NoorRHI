@@ -1,17 +1,17 @@
 #include "TestWindow.hpp"
 
-#include <gpu/gpu.hpp>
+#include <noorrhi/noorrhi.hpp>
 #include <SDL3/SDL.h>
 #include <cstdlib>
 #include <catch2/catch_test_macros.hpp>
 
-TEST_CASE("gpu presentation survives resize and abandoned frames", "[gpu][window]") {
+TEST_CASE("NoorRHI presentation survives resize and abandoned frames", "[NoorRHI][window]") {
     if (!std::getenv("DISPLAY") && !std::getenv("WAYLAND_DISPLAY"))
         SKIP("presentation test requires a desktop display");
     TestWindow window(320, 240);
-    gpu::Device device({.enable_validation = true, .surface = &window});
+    noorrhi::Device device({.enable_validation = true, .surface = &window});
     auto swapchain = device.swapchain();
-    gpu::Shared<unsigned> record(device);
+    noorrhi::Shared<unsigned> record(device);
     record.commit();
     device.synchronize();
     const auto allocation_bytes = device.memory_report().allocation_bytes;
@@ -31,7 +31,7 @@ TEST_CASE("gpu presentation survives resize and abandoned frames", "[gpu][window
         CHECK(frame.height() == window.height());
         record.data = iteration + 1;
         // Uploads are rejected while a frame's command buffer is open.
-        CHECK_THROWS_AS(record.commit(), gpu::Error);
+        CHECK_THROWS_AS(record.commit(), noorrhi::Error);
 
         if (iteration % 3 == 0) {
             frame = {}; // Discard the acquire and command buffer through RAII.

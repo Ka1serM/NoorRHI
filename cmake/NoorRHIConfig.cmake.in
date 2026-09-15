@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# NoorRHI links Vulkan::Vulkan publicly, so consumers need it resolved.
+find_dependency(Vulkan)
+
+include("${CMAKE_CURRENT_LIST_DIR}/NoorRHITargets.cmake")
+
+check_required_components(NoorRHI)

@@ -1,4 +1,4 @@
-#include <gpu/gpu.hpp>
+#include <noorrhi/noorrhi.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -22,33 +22,33 @@ std::vector<std::byte> read_shader(const char* path) {
 }
 }
 
-TEST_CASE("gpu API traces rays against a built acceleration structure") {
-    gpu::Device device({.enable_validation = true, .application_name = "gpu tests"});
+TEST_CASE("NoorRHI API traces rays against a built acceleration structure") {
+    noorrhi::Device device({.enable_validation = true, .application_name = "NoorRHI tests"});
     if (!device.features().ray_tracing)
         SKIP("selected Vulkan device does not expose ray tracing");
 
     // A triangle covering the middle of the z=0 plane, large enough that the
     // centre of the launch grid hits it and the corners miss.
-    auto positions = device.buffer<gpu::float3>(3);
+    auto positions = device.buffer<noorrhi::float3>(3);
     auto indices = device.buffer<std::uint32_t>(3);
-    const std::vector<gpu::float3> vertices{
+    const std::vector<noorrhi::float3> vertices{
         {-0.6f, -0.6f, 0.0f}, {0.6f, -0.6f, 0.0f}, {0.0f, 0.6f, 0.0f}};
-    positions.upload(std::span<const gpu::float3>(vertices));
+    positions.upload(std::span<const noorrhi::float3>(vertices));
     indices.upload(std::span<const std::uint32_t>(
         std::vector<std::uint32_t>{0, 1, 2}));
 
-    const gpu::TriangleGeometry triangles{positions.ptr(), indices.ptr(), 1};
-    auto blas = device.build_blas(std::span<const gpu::TriangleGeometry>(&triangles, 1));
+    const noorrhi::TriangleGeometry triangles{positions.ptr(), indices.ptr(), 1};
+    auto blas = device.build_blas(std::span<const noorrhi::TriangleGeometry>(&triangles, 1));
     REQUIRE(blas);
 
-    gpu::Instance instance{blas, {}};
+    noorrhi::Instance instance{blas, {}};
     for (std::size_t i = 0; i < 4; ++i)
         instance.transform.values[i][i] = 1.0f;
-    auto tlas = device.build_tlas(std::span<const gpu::Instance>(&instance, 1));
+    auto tlas = device.build_tlas(std::span<const noorrhi::Instance>(&instance, 1));
     REQUIRE(tlas);
     REQUIRE(tlas.handle());
 
-    const auto shaders = read_shader(GPU_RAYTRACING_SHADER);
+    const auto shaders = read_shader(NOORRHI_RAYTRACING_SHADER);
     auto raygen = device.create_shader(shaders, "rayGenMain");
     auto miss = device.create_shader(shaders, "missMain");
     auto closest_hit = device.create_shader(shaders, "closestHitMain");
@@ -59,7 +59,7 @@ TEST_CASE("gpu API traces rays against a built acceleration structure") {
     auto output = device.buffer<std::uint32_t>(width * height);
 
     struct Args {
-        gpu::GpuPtr<std::uint32_t> result;
+        noorrhi::GpuPtr<std::uint32_t> result;
         std::uint64_t scene;
         std::uint32_t width;
         std::uint32_t padding = 0;
@@ -86,14 +86,14 @@ TEST_CASE("gpu API traces rays against a built acceleration structure") {
 
     SECTION("TLAS instances can be updated in place") {
         instance.transform.values[0][3] = 10.0f;
-        device.update_tlas(tlas, std::span<const gpu::Instance>(&instance, 1));
+        device.update_tlas(tlas, std::span<const noorrhi::Instance>(&instance, 1));
         pipeline.trace({width, height, 1}, args);
         device.synchronize();
         output.download(std::span<std::uint32_t>(hits));
         REQUIRE(std::count(hits.begin(), hits.end(), 1u) == 0);
 
         instance.transform.values[0][3] = 0.0f;
-        device.update_tlas(tlas, std::span<const gpu::Instance>(&instance, 1));
+        device.update_tlas(tlas, std::span<const noorrhi::Instance>(&instance, 1));
         pipeline.trace({width, height, 1}, args);
         device.synchronize();
         output.download(std::span<std::uint32_t>(hits));

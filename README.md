@@ -1,4 +1,4 @@
-# gpu
+# NoorRHI
 
 A small, object-oriented Vulkan API. Buffers are device addresses; textures and
 samplers are 32-bit indices into descriptor heaps the device owns and fills
@@ -20,7 +20,7 @@ Vulkan and [VulkanMemoryAllocator][vma] are the only dependencies. VMA comes
 from an existing `GPUOpen::VulkanMemoryAllocator` target, then
 `find_package(VulkanMemoryAllocator)`, then `-DGPU_VMA_DIR=`, then a vendored copy
 at `external/VulkanMemoryAllocator`.
-`GPU_BUILD_EXAMPLES` and `GPU_BUILD_TESTS` default to `ON` for a standalone
+`NOORRHI_BUILD_EXAMPLES` and `NOORRHI_BUILD_TESTS` default to `ON` for a standalone
 build and `OFF` when this project is added as a subdirectory. Both need `slangc`
 from the Vulkan SDK (set `VULKAN_SDK`). The tests also need Catch2 v3, found with
 `find_package`, `-DGPU_CATCH2_DIR=`, or `external/Catch2`.
@@ -30,23 +30,23 @@ from the Vulkan SDK (set `VULKAN_SDK`). The tests also need Catch2 v3, found wit
 ## Consuming
 
 ```cmake
-find_package(gpu REQUIRED)
-target_link_libraries(my_app PRIVATE gpu::gpu)
+find_package(NoorRHI REQUIRED)
+target_link_libraries(my_app PRIVATE NoorRHI::NoorRHI)
 ```
 
-Or vendor it and `add_subdirectory(external/gpu)`, which defines the same
-`gpu::gpu` target.
+Or vendor it and `add_subdirectory(external/NoorRHI)`, which defines the same
+`NoorRHI::NoorRHI` target.
 
 ```cpp
-gpu::Device device;
+noorrhi::Device device;
 auto vertices = device.buffer<Vertex>(source.size());
 vertices.upload(std::span<const Vertex>(source));
 
-gpu::Shared<SceneData> scene(device);
+noorrhi::Shared<SceneData> scene(device);
 scene.data.vertices = vertices.ptr();
 scene.commit();
 
-struct FrameData { gpu::GpuPtr<SceneData> scene; Camera camera; };
+struct FrameData { noorrhi::GpuPtr<SceneData> scene; Camera camera; };
 pipeline.launch(groups, FrameData{scene.ptr(), camera});
 ```
 
@@ -143,6 +143,6 @@ count, and argument-arena capacity, including pending allocations. Dedicated
 external-memory images are outside these VMA totals.
 
 GPU tests cover compute, images (including heap reads and writes, and slot reuse
-and exhaustion), ray tracing, shared updates, argument wraparound, and retirement. `gpu_presentation_test` additionally needs a desktop display and
+and exhaustion), ray tracing, shared updates, argument wraparound, and retirement. `noorrhi_presentation_test` additionally needs a desktop display and
 tests resizing and abandoned frames. Enable synchronization validation with
 `VK_LAYER_VALIDATE_SYNC=1`.

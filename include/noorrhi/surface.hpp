@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace gpu {
+namespace noorrhi {
 
 // The window system's side of swapchain creation. The library never links a
 // windowing toolkit, so the application implements this and hands it to
@@ -38,4 +38,4 @@ public:
     virtual std::uint32_t height() const = 0;
 };
 
-} // namespace gpu
+} // namespace noorrhi

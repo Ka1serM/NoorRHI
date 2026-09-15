@@ -4,14 +4,14 @@
 #include <vulkan/vulkan.hpp>
 #include <vk_mem_alloc.h>
 
-#include "gpu/compute.hpp"
-#include "gpu/graphics.hpp"
-#include "gpu/image.hpp"
-#include "gpu/interop.hpp"
-#include "gpu/surface.hpp"
-#include "gpu/swapchain.hpp"
-#include "gpu/raytracing.hpp"
-#include "gpu/sampler.hpp"
+#include "noorrhi/compute.hpp"
+#include "noorrhi/graphics.hpp"
+#include "noorrhi/image.hpp"
+#include "noorrhi/interop.hpp"
+#include "noorrhi/surface.hpp"
+#include "noorrhi/swapchain.hpp"
+#include "noorrhi/raytracing.hpp"
+#include "noorrhi/sampler.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-namespace gpu {
+namespace noorrhi {
 
 namespace detail { class DeviceImpl; class SwapchainImpl; struct ImageImpl; }
 
@@ -52,9 +52,9 @@ struct Frame::State {
     bool open = false;
 };
 
-} // namespace gpu
+} // namespace noorrhi
 
-namespace gpu::detail {
+namespace noorrhi::detail {
 
 class DeviceImpl;
 struct SamplerImpl;
@@ -505,4 +505,4 @@ std::uint32_t image_storage_handle(const std::shared_ptr<ImageImpl>&);
 AccelerationStructureHandle acceleration_structure_handle(
     const std::shared_ptr<AccelerationStructureImpl>&);
 
-} // namespace gpu::detail
+} // namespace noorrhi::detail
