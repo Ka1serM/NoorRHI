@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -145,7 +146,7 @@ TEST_CASE("NoorRHI buffers keep their address across partial uploads") {
 TEST_CASE("NoorRHI shared records publish their data on commit") {
     auto device = make_device();
     noorrhi::Shared<std::uint32_t> record(device);
-    record.data = 42;
+    record.setData(42);
     record.commit();
     device.synchronize();
     std::uint32_t actual = 0;
@@ -191,6 +192,45 @@ TEST_CASE("NoorRHI API round-trips image contents") {
     std::vector<std::uint8_t> read_back(pixels.size());
     image.download(std::span<std::uint8_t>(read_back));
     REQUIRE(read_back == pixels);
+}
+
+TEST_CASE("NoorRHI API reads back single texels and sub-rectangles") {
+    noorrhi::Device device = make_device();
+    constexpr std::uint32_t width = 5;
+    constexpr std::uint32_t height = 3;
+    auto image = device.image<std::uint8_t>(width, height,
+        noorrhi::ImageUsage::Storage | noorrhi::ImageUsage::Sampled);
+    std::vector<std::uint8_t> pixels(width * height * 4u);
+    for (std::size_t i = 0; i < pixels.size(); ++i)
+        pixels[i] = static_cast<std::uint8_t>(i * 7u + 2u);
+    image.upload(std::span<const std::uint8_t>(pixels));
+    const auto texel_at = [&](const std::uint32_t x, const std::uint32_t y) {
+        return pixels.begin() + static_cast<std::ptrdiff_t>((y * width + x) * 4u);
+    };
+
+    std::vector<std::uint8_t> texel(4);
+    image.download_region(3, 2, 1, 1, std::span<std::uint8_t>(texel));
+    CHECK(std::equal(texel.begin(), texel.end(), texel_at(3, 2)));
+
+    // A rectangle comes back row by row, starting at its own origin.
+    std::vector<std::uint8_t> region(2u * 2u * 4u);
+    image.download_region(1, 1, 2, 2, std::span<std::uint8_t>(region));
+    for (std::uint32_t row = 0; row < 2; ++row)
+        for (std::uint32_t column = 0; column < 2; ++column)
+            CHECK(std::equal(region.begin() + static_cast<std::ptrdiff_t>((row * 2u + column) * 4u),
+                region.begin() + static_cast<std::ptrdiff_t>((row * 2u + column + 1u) * 4u),
+                texel_at(1 + column, 1 + row)));
+
+    // Regions past the edge, empty regions and mismatched destinations throw.
+    std::vector<std::uint8_t> two_texels(8);
+    CHECK_THROWS_AS(image.download_region(4, 0, 2, 1, std::span<std::uint8_t>(two_texels)),
+        noorrhi::Error);
+    CHECK_THROWS_AS(image.download_region(0, 3, 1, 1, std::span<std::uint8_t>(texel)),
+        noorrhi::Error);
+    CHECK_THROWS_AS(image.download_region(0, 0, 0, 1, std::span<std::uint8_t>(texel)),
+        noorrhi::Error);
+    CHECK_THROWS_AS(image.download_region(0, 0, 1, 1, std::span<std::uint8_t>(region)),
+        noorrhi::Error);
 }
 
 TEST_CASE("NoorRHI shaders read and write images through the descriptor heaps") {

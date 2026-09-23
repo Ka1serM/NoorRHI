@@ -18,12 +18,12 @@ cmake --install build --prefix /your/prefix
 
 Vulkan and [VulkanMemoryAllocator][vma] are the only dependencies. VMA comes
 from an existing `GPUOpen::VulkanMemoryAllocator` target, then
-`find_package(VulkanMemoryAllocator)`, then `-DGPU_VMA_DIR=`, then a vendored copy
+`find_package(VulkanMemoryAllocator)`, then `-DNOORRHI_VMA_DIR=`, then a vendored copy
 at `external/VulkanMemoryAllocator`.
 `NOORRHI_BUILD_EXAMPLES` and `NOORRHI_BUILD_TESTS` default to `ON` for a standalone
 build and `OFF` when this project is added as a subdirectory. Both need `slangc`
 from the Vulkan SDK (set `VULKAN_SDK`). The tests also need Catch2 v3, found with
-`find_package`, `-DGPU_CATCH2_DIR=`, or `external/Catch2`.
+`find_package`, `-DNOORRHI_CATCH2_DIR=`, or `external/Catch2`.
 
 [vma]: https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
 
@@ -54,7 +54,7 @@ Buffer, image, sampler, and shared-data owners are move-only. Internal reference
 keep submitted Vulkan objects alive until completion. GPU pointers and texture
 handles are non-owning: keep their owners alive while using them, including
 objects referenced indirectly through another GPU record. Destroy resources
-before their Device; the surface provider outlives its Device.
+before their Device; a surface provider outlives the Swapchains created for it.
 
 ## Data and uploads
 
@@ -103,17 +103,54 @@ The backend copies these into a mapped arena and retires ranges by timeline valu
 Exhausting the arena within one open frame throws instead of deadlocking; increase
 `DeviceConfig::argument_arena_bytes` if a frame genuinely needs more space.
 
+## Presentation
+
+A `Device` renders into images and needs no window. Presentation is an optional
+`Swapchain`, one per window, for hosts that show results directly:
+
+```cpp
+noorrhi::Device device({.presentation = &window});   // window: a SurfaceProvider
+noorrhi::Swapchain swapchain(device, window, {.present_mode = noorrhi::PresentMode::LowLatency});
+
+while (running) {
+    swapchain.wait_until_ready();      // before sampling input
+    poll_input_and_update();
+    noorrhi::Frame frame = swapchain.begin_frame();
+    if (!frame) continue;              // minimised or just rebuilt
+    record_work_and_draw_into(frame.target());
+    swapchain.present(std::move(frame));
+}
+```
+
+`DeviceConfig::presentation` only adopts the window system's loader and instance
+extensions and restricts GPU and queue selection to ones that can present to it.
+Each `Swapchain` creates and owns its surface.
+
+The swapchain is built for low latency:
+
+- `PresentMode::LowLatency` (default) prefers MAILBOX, then FIFO_LATEST_READY
+  (enabled when the device supports it), then FIFO. `Vsync` is FIFO and
+  `Immediate` prefers IMMEDIATE. `active_present_mode()` reports the result;
+  `set_present_mode()` switches on the next frame.
+- `SwapchainDesc::max_frames_in_flight` (default 1) paces the CPU to the GPU, so
+  frames never queue behind a busy GPU. `wait_until_ready()` performs that wait
+  up front so input is sampled after it, not before.
+- Resizes rebuild from the previous chain without waiting for the GPU. The old
+  chain, its images and semaphores are retired and released once the frames
+  that used them have finished.
+- `present()` submits and queues the image without a CPU wait.
+
 ## Frames and synchronization
 
 Prepare changed resources and commit shared data **before** `begin_frame()`.
-Launch rendering and presentation between begin/end; they share one submission.
-End presents without a device-wide CPU wait. Acquire slots wait only when reused.
+Launch rendering and presentation between begin and present; they share one
+submission. Acquire slots wait only when reused.
 Timestamp reads are nonblocking and return the latest available measurement.
 
-Uploads/readbacks during an open frame are rejected. Large scene replacement,
-resize, and destruction may synchronize. Ordered submissions handle normal
-updates and TLAS refits. Dropping a Frame discards it and rebuilds the acquired
-swapchain before the next frame. The window provider reports live pixel dimensions.
+Uploads/readbacks during an open frame are rejected. Large scene replacement and
+destruction may synchronize. Ordered submissions handle normal updates and TLAS
+refits. Dropping a Frame discards it and rebuilds the acquired swapchain before
+the next frame. The window provider reports live pixel dimensions.
 
 The API is single-threaded per Device. Raw pointers cannot validate arbitrary
 shader pointer graphs; callers remain responsible for pointer bounds, compatible
@@ -144,5 +181,5 @@ external-memory images are outside these VMA totals.
 
 GPU tests cover compute, images (including heap reads and writes, and slot reuse
 and exhaustion), ray tracing, shared updates, argument wraparound, and retirement. `noorrhi_presentation_test` additionally needs a desktop display and
-tests resizing and abandoned frames. Enable synchronization validation with
+tests resizing, present-mode switches and abandoned frames. Enable synchronization validation with
 `VK_LAYER_VALIDATE_SYNC=1`.

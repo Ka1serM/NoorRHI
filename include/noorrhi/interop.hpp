@@ -5,6 +5,7 @@
 #include "types.hpp"
 
 #include <cstdint>
+#include <functional>
 
 namespace noorrhi {
 class Device;
@@ -60,6 +61,20 @@ DeviceHandles device_handles(Device& device);
 // and end_frame. A library given this buffer may record its own draws, but
 // must not begin or end the buffer, submit it, or leave a render scope open.
 std::uintptr_t command_buffer(const Frame& frame);
+
+// Records native Vulkan commands in the device's command stream: into the
+// open frame's command buffer, or into a submission of its own when no frame
+// is open, with the same ordering barriers as every other operation. The
+// callback receives the VkCommandBuffer; it must leave no pipeline state the
+// library relies on (the library rebinds its own pipelines and heaps) and must
+// not call back into the Device. Resources the commands use must outlive their
+// completion.
+void record(Device& device, const std::function<void(std::uintptr_t)>& commands);
+
+// The VkImage of an image the library owns, for libraries that register
+// images by handle. Images stay in VK_IMAGE_LAYOUT_GENERAL: a library that
+// transitions one must return it to GENERAL in the same command stream.
+std::uintptr_t image(Device& device, ImageHandle image);
 
 // The VkImageView backing an image the library owns - what ImGui's
 // AddTexture wants in order to sample a rendered AOV.

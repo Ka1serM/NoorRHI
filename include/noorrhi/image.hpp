@@ -15,8 +15,37 @@ enum class ImageFormat {
     Rgba8Unorm,
     Bgra8Unorm,
     Rgba32Float,
+    Rgba16Float,
     R32Uint,
+    R32Float,
     D32Float,
+    // Sampled-only formats for uploading texture assets in their stored
+    // encoding. Block-compressed formats are 4x4-texel blocks; their upload
+    // spans must hold whole blocks.
+    R8Unorm,
+    Rg8Unorm,
+    Rgba8Srgb,
+    Bgra8Srgb,
+    R16Unorm,
+    Rg16Unorm,
+    Rgba16Unorm,
+    R16Float,
+    Rg16Float,
+    Rg32Float,
+    A2b10g10r10Unorm,
+    B10g11r11Float,
+    Bc1Unorm,
+    Bc1Srgb,
+    Bc2Unorm,
+    Bc2Srgb,
+    Bc3Unorm,
+    Bc3Srgb,
+    Bc4Unorm,
+    Bc5Unorm,
+    Bc6hUfloat,
+    Bc6hSfloat,
+    Bc7Unorm,
+    Bc7Srgb,
 };
 
 enum class ImageUsage : std::uint32_t {
@@ -48,6 +77,11 @@ public:
     Image& operator=(Image&&) noexcept = default;
     void upload(std::span<const T> data);
     void download(std::span<T> destination) const;
+    // Reads the width x height texels starting at (x, y), row by row. Copies
+    // only that rectangle, so sampling a single texel (picking, probing) costs
+    // a few bytes instead of a full-image readback. Waits for its own copy.
+    void download_region(std::uint32_t x, std::uint32_t y, std::uint32_t width,
+        std::uint32_t height, std::span<T> destination) const;
     ImageHandle handle() const noexcept;
     // Resource-heap indices. There is no combined image/sampler form: pair a
     // sampled handle with a Sampler::handle() in the shader instead.
@@ -79,6 +113,8 @@ std::uint32_t image_sampled_handle(const std::shared_ptr<ImageImpl>&);
 std::uint32_t image_storage_handle(const std::shared_ptr<ImageImpl>&);
 void upload_image(const std::shared_ptr<ImageImpl>&, const void*, std::size_t);
 void download_image(const std::shared_ptr<ImageImpl>&, void*, std::size_t);
+void download_image_region(const std::shared_ptr<ImageImpl>&, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, void*, std::size_t);
 std::size_t image_byte_size(const std::shared_ptr<ImageImpl>&);
 }
 
@@ -136,5 +172,14 @@ void Image<T>::download(const std::span<T> destination) const {
         throw Error(ErrorCode::InvalidArgument,
             "image download must cover exactly one full mip level");
     detail::download_image(impl_, destination.data(), destination.size_bytes());
+}
+
+template<class T>
+void Image<T>::download_region(const std::uint32_t x, const std::uint32_t y,
+    const std::uint32_t width, const std::uint32_t height, const std::span<T> destination) const {
+    if (!impl_)
+        throw Error(ErrorCode::InvalidResource, "cannot download from an empty noorrhi::Image");
+    detail::download_image_region(impl_, x, y, width, height, destination.data(),
+        destination.size_bytes());
 }
 } // namespace noorrhi

@@ -5,14 +5,14 @@
 
 namespace noorrhi {
 
-// The window system's side of swapchain creation. The library never links a
-// windowing toolkit, so the application implements this and hands it to
-// DeviceConfig. Every value crossing the boundary is either a plain integer or
-// an opaque handle widened to uintptr_t, which keeps Vulkan types out of the
-// public headers exactly as the rest of the API does.
+// The window system's side of presentation. The library never links a
+// windowing toolkit, so the application implements this for its window and
+// hands it to DeviceConfig::presentation and to each Swapchain. Every value
+// crossing the boundary is either a plain integer or an opaque handle widened
+// to uintptr_t, which keeps Vulkan types out of the public headers exactly as
+// the rest of the API does.
 //
-// A Device constructed without a provider is headless: it has no swapchain and
-// begin_frame() is invalid on it.
+// A Device constructed without a provider is headless and cannot present.
 class SurfaceProvider {
 public:
     virtual ~SurfaceProvider() = default;

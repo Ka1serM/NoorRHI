@@ -14,13 +14,17 @@ namespace noorrhi {
 template<class T>
 class Shared {
 public:
-    T data{};
     Shared() = default;
     explicit Shared(Device& device) : buffer_(device.buffer<T>(1)) {}
     Shared(const Shared&) = delete;
     Shared& operator=(const Shared&) = delete;
     Shared(Shared&&) noexcept = default;
     Shared& operator=(Shared&&) noexcept = default;
+
+    const T& getData() const noexcept { return data; }
+    // For owners that hold a Shared by composition rather than inheritance and
+    // therefore cannot reach the protected record.
+    void setData(const T& value) { data = value; }
 
     GpuPtr<T> ptr() const { return buffer_.ptr(); }
     explicit operator bool() const noexcept { return bool(buffer_); }
@@ -39,6 +43,8 @@ public:
         if (!buffer_) throw Error(ErrorCode::InvalidResource, "empty shared record");
         buffer_.upload(std::span<const T>(&data, 1));
     }
+protected:
+    T data{};
 private:
     Buffer<T> buffer_;
 };

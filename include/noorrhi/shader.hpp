@@ -21,6 +21,7 @@ private:
     friend class Device;
     friend class detail::DeviceImpl;
     friend class ComputePipeline;
+    friend class RayTracingPipeline;
     Shader(std::shared_ptr<detail::ShaderImpl> impl, std::string_view entry_point)
         : impl_(std::move(impl)), entry_point_(entry_point) {}
     std::shared_ptr<detail::ShaderImpl> impl_;

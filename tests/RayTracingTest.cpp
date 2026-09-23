@@ -1,3 +1,4 @@
+#include <array>
 #include <noorrhi/noorrhi.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -52,7 +53,11 @@ TEST_CASE("NoorRHI API traces rays against a built acceleration structure") {
     auto raygen = device.create_shader(shaders, "rayGenMain");
     auto miss = device.create_shader(shaders, "missMain");
     auto closest_hit = device.create_shader(shaders, "closestHitMain");
-    auto pipeline = device.ray_tracing({raygen, {miss}, {closest_hit}, {}, {}});
+    const noorrhi::RayTracingInterface interface{sizeof(std::uint32_t)};
+    const std::array libraries{
+        device.ray_tracing_library({{raygen}, {miss}, {}, {}, {}}, interface),
+        device.ray_tracing_library({{}, {}, {closest_hit}, {}, {}}, interface)};
+    auto pipeline = device.ray_tracing(std::span<const noorrhi::RayTracingLibrary>(libraries));
 
     constexpr std::uint32_t width = 16;
     constexpr std::uint32_t height = 16;
@@ -68,7 +73,7 @@ TEST_CASE("NoorRHI API traces rays against a built acceleration structure") {
     static_assert(offsetof(Args, scene) == 8);
     static_assert(offsetof(Args, width) == 16);
 
-    pipeline.trace({width, height, 1}, args);
+    pipeline.trace(raygen, {width, height, 1}, args);
     device.synchronize();
 
     std::vector<std::uint32_t> hits(width * height);
@@ -87,14 +92,14 @@ TEST_CASE("NoorRHI API traces rays against a built acceleration structure") {
     SECTION("TLAS instances can be updated in place") {
         instance.transform.values[0][3] = 10.0f;
         device.update_tlas(tlas, std::span<const noorrhi::Instance>(&instance, 1));
-        pipeline.trace({width, height, 1}, args);
+        pipeline.trace(raygen, {width, height, 1}, args);
         device.synchronize();
         output.download(std::span<std::uint32_t>(hits));
         REQUIRE(std::count(hits.begin(), hits.end(), 1u) == 0);
 
         instance.transform.values[0][3] = 0.0f;
         device.update_tlas(tlas, std::span<const noorrhi::Instance>(&instance, 1));
-        pipeline.trace({width, height, 1}, args);
+        pipeline.trace(raygen, {width, height, 1}, args);
         device.synchronize();
         output.download(std::span<std::uint32_t>(hits));
         REQUIRE(hits[(height / 2) * width + width / 2] == 1u);

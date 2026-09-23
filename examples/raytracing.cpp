@@ -53,10 +53,11 @@ int main() {
             throw std::runtime_error("acceleration structure creation failed");
 
         const auto shader = device.create_shader(read_shader(NOORRHI_RAYGEN_SHADER));
-        const auto pipeline = device.ray_tracing({shader, {}, {}, {}, {}});
+        const auto library = device.ray_tracing_library({{shader}, {}, {}, {}, {}}, {});
+        const auto pipeline = device.ray_tracing(std::span(&library, 1));
         auto output = device.buffer<std::uint32_t>(1);
         struct Args { noorrhi::GpuPtr<std::uint32_t> result_buffer; } args{output.ptr()};
-        pipeline.trace({4, 3, 1}, args);
+        pipeline.trace(shader, {4, 3, 1}, args);
         device.synchronize();
 
         std::uint32_t actual = 0;

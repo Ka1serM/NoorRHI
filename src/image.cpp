@@ -84,6 +84,9 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
     if ((depth && format_choice != ImageFormat::D32Float)
         || (!depth && format_choice == ImageFormat::D32Float))
         throw Error(ErrorCode::InvalidArgument, "image format does not match image usage");
+    if (is_block_compressed(format_choice)
+        && (wants(ImageUsage::Storage) || wants(ImageUsage::ColorAttachment)))
+        throw Error(ErrorCode::InvalidArgument, "block-compressed images are sampled-only");
     const vk::Format format = to_vulkan_format(format_choice);
     const vk::ImageAspectFlags aspect = depth
         ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
@@ -141,8 +144,8 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
     result->aspect = aspect;
     result->width = width;
     result->height = height;
-    result->byte_size = static_cast<std::size_t>(width) * height
-        * format_texel_size(format_choice);
+    result->byte_size = format_byte_size(format_choice, width, height);
+    result->block_compressed = is_block_compressed(format_choice);
     // The identity handle names this image to render(), copy() and interop. It
     // is a weak host reference, deliberately unrelated to the heap indices
     // below, which only mean something to shaders.
@@ -236,6 +239,37 @@ void DeviceImpl::download_image(const std::shared_ptr<ImageImpl>& image, void* d
     std::memcpy(data, staging->mapped, bytes);
 }
 
+void DeviceImpl::download_image_region(const std::shared_ptr<ImageImpl>& image,
+    const std::uint32_t x, const std::uint32_t y, const std::uint32_t width,
+    const std::uint32_t height, void* data, const std::size_t bytes) {
+    if (!image || image->device.get() != this || !data || width == 0 || height == 0
+        || x >= image->width || y >= image->height
+        || width > image->width - x || height > image->height - y)
+        throw Error(ErrorCode::InvalidArgument, "invalid GPU image region download");
+    if (image->block_compressed)
+        throw Error(ErrorCode::InvalidArgument, "block-compressed images have no texel regions");
+    const std::size_t texel_bytes = image->byte_size
+        / (static_cast<std::size_t>(image->width) * image->height);
+    if (bytes != texel_bytes * width * height)
+        throw Error(ErrorCode::InvalidArgument,
+            "image region download must match the region's size exactly");
+    if (frame_command_)
+        throw Error(ErrorCode::InvalidState, "read back images after ending a frame");
+    // Staging only holds the region, so a one-texel pick copies a few bytes.
+    auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferDst,
+        VMA_MEMORY_USAGE_GPU_TO_CPU, true);
+    const auto token = submit([=](vk::CommandBuffer command) {
+        command.copyImageToBuffer(image->image, vk::ImageLayout::eGeneral, staging->buffer,
+            vk::BufferImageCopy(0, 0, 0, {image->aspect, 0, 0, 1},
+                {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0},
+                {width, height, 1}));
+    }, {staging, image});
+    wait(token);
+    if (vmaInvalidateAllocation(allocator_, staging->allocation, 0, bytes) != VK_SUCCESS)
+        throw Error(ErrorCode::DeviceLost, "invalidating image readback failed");
+    std::memcpy(data, staging->mapped, bytes);
+}
+
 std::shared_ptr<ImageImpl> make_image(const std::shared_ptr<DeviceImpl>& device,
     const std::uint32_t width, const std::uint32_t height, const ImageUsage usage,
     const ImageFormat format) {
@@ -319,6 +353,12 @@ std::size_t image_byte_size(const std::shared_ptr<ImageImpl>& image) {
 void upload_image(const std::shared_ptr<ImageImpl>& image, const void* data, std::size_t bytes) {
     image->device->upload_image(image, data, bytes);
 }
+void download_image_region(const std::shared_ptr<ImageImpl>& image, const std::uint32_t x,
+    const std::uint32_t y, const std::uint32_t width, const std::uint32_t height, void* data,
+    const std::size_t bytes) {
+    image->device->download_image_region(image, x, y, width, height, data, bytes);
+}
+
 void download_image(const std::shared_ptr<ImageImpl>& image, void* data, std::size_t bytes) {
     image->device->download_image(image, data, bytes);
 }

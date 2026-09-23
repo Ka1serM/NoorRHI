@@ -23,7 +23,8 @@ public:
 
     GpuPtr<T> ptr() const;
     void upload(std::span<const T> data, std::size_t offset = 0);
-    void download(std::span<T> destination) const;
+    // Reads destination.size() elements starting at element `offset`.
+    void download(std::span<T> destination, std::size_t offset = 0) const;
     std::size_t size() const noexcept { return count_; }
     std::size_t byte_size() const noexcept { return count_ * sizeof(T); }
     explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
@@ -43,7 +44,7 @@ private:
 namespace noorrhi::detail {
 std::shared_ptr<BufferImpl> make_buffer(const std::shared_ptr<DeviceImpl>&, std::size_t, std::size_t);
 void upload_buffer(const std::shared_ptr<BufferImpl>&, const void*, std::size_t, std::size_t);
-void download_buffer(const std::shared_ptr<BufferImpl>&, void*, std::size_t);
+void download_buffer(const std::shared_ptr<BufferImpl>&, void*, std::size_t, std::size_t);
 std::uint64_t buffer_address(const std::shared_ptr<BufferImpl>&);
 }
 
@@ -75,11 +76,12 @@ void Buffer<T>::upload(std::span<const T> data, std::size_t offset) {
 }
 
 template<class T>
-void Buffer<T>::download(std::span<T> destination) const {
+void Buffer<T>::download(std::span<T> destination, std::size_t offset) const {
     if (!impl_) throw Error(ErrorCode::InvalidResource, "cannot download from an empty buffer");
-    if (destination.size() > size())
+    if (offset > size() || destination.size() > size() - offset)
         throw Error(ErrorCode::InvalidArgument, "download range exceeds buffer");
     if (!destination.empty())
-        detail::download_buffer(impl_, destination.data(), destination.size_bytes());
+        detail::download_buffer(impl_, destination.data(), destination.size_bytes(),
+            offset * sizeof(T));
 }
 } // namespace noorrhi

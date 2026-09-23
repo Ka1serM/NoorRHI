@@ -1,6 +1,9 @@
 #include "internal.hpp"
 
+#include "noorrhi/device.hpp"
+
 #include <algorithm>
+#include <array>
 #include <limits>
 
 namespace noorrhi {
@@ -10,8 +13,8 @@ namespace {
 // Presentation images live in GENERAL like every other image this library
 // owns; VK_KHR_unified_image_layouts is mandatory, so a render pass, a blit
 // and a compute write all accept it. Only the handoff to the presentation
-// engine needs a specific layout, and that transition is what these two
-// helpers exist for.
+// engine needs a specific layout, and that transition is what this helper
+// exists for.
 void transition(const vk::CommandBuffer command, const vk::Image image,
     const vk::ImageLayout from, const vk::ImageLayout to) {
     vk::ImageMemoryBarrier2 barrier{};
@@ -33,7 +36,9 @@ ImageFormat to_public_format(const vk::Format format) {
     case vk::Format::eB8G8R8A8Unorm: return ImageFormat::Bgra8Unorm;
     case vk::Format::eR8G8B8A8Unorm: return ImageFormat::Rgba8Unorm;
     case vk::Format::eR32G32B32A32Sfloat: return ImageFormat::Rgba32Float;
+    case vk::Format::eR16G16B16A16Sfloat: return ImageFormat::Rgba16Float;
     case vk::Format::eR32Uint: return ImageFormat::R32Uint;
+    case vk::Format::eR32Sfloat: return ImageFormat::R32Float;
     default: return ImageFormat::Bgra8Unorm;
     }
 }
@@ -60,26 +65,86 @@ vk::SurfaceFormatKHR choose_format(const std::vector<vk::SurfaceFormatKHR>& avai
     return available.front();
 }
 
-vk::PresentModeKHR choose_present_mode(const std::vector<vk::PresentModeKHR>& available) {
-    // Mailbox keeps latency low without tearing; FIFO is the only mode the
-    // spec guarantees, so it is the fallback.
-    if (std::ranges::find(available, vk::PresentModeKHR::eMailbox) != available.end())
-        return vk::PresentModeKHR::eMailbox;
-    return vk::PresentModeKHR::eFifo;
+// Walk the policy's preference order and take the first mode the surface
+// offers. FIFO is the only mode the spec guarantees, so every order ends there.
+vk::PresentModeKHR choose_present_mode(const std::vector<vk::PresentModeKHR>& available,
+    const PresentMode policy, const bool fifo_latest_ready) {
+    using Mode = vk::PresentModeKHR;
+    static constexpr std::array low_latency{Mode::eMailbox, Mode::eFifoLatestReadyEXT, Mode::eFifo};
+    static constexpr std::array vsync{Mode::eFifo};
+    static constexpr std::array immediate{
+        Mode::eImmediate, Mode::eMailbox, Mode::eFifoLatestReadyEXT, Mode::eFifo};
+    const std::span<const Mode> order = policy == PresentMode::Immediate ? std::span<const Mode>(immediate)
+        : policy == PresentMode::Vsync ? std::span<const Mode>(vsync)
+        : std::span<const Mode>(low_latency);
+    for (const Mode mode : order) {
+        // The mode is only valid with its device extension enabled, even when
+        // the surface lists it.
+        if (mode == Mode::eFifoLatestReadyEXT && !fifo_latest_ready)
+            continue;
+        if (std::ranges::find(available, mode) != available.end())
+            return mode;
+    }
+    return Mode::eFifo;
+}
+
+ActivePresentMode to_active(const vk::PresentModeKHR mode) {
+    switch (mode) {
+    case vk::PresentModeKHR::eImmediate: return ActivePresentMode::Immediate;
+    case vk::PresentModeKHR::eMailbox: return ActivePresentMode::Mailbox;
+    case vk::PresentModeKHR::eFifoLatestReadyEXT: return ActivePresentMode::FifoLatestReady;
+    default: return ActivePresentMode::Fifo;
+    }
+}
+
+// MAILBOX and IMMEDIATE replace a waiting image instead of queueing behind it,
+// so they need one image for the display, one waiting and one being rendered
+// for acquire never to block. The FIFO modes queue every image, where extra
+// images only add latency.
+std::uint32_t choose_image_count(const vk::SurfaceCapabilitiesKHR& capabilities,
+    const vk::PresentModeKHR mode) {
+    std::uint32_t count = capabilities.minImageCount + 1;
+    if (mode == vk::PresentModeKHR::eMailbox || mode == vk::PresentModeKHR::eImmediate)
+        count = std::max(count, 3u);
+    if (capabilities.maxImageCount > 0)
+        count = std::min(count, capabilities.maxImageCount);
+    return count;
+}
+
+vk::CompositeAlphaFlagBitsKHR choose_composite_alpha(const vk::SurfaceCapabilitiesKHR& capabilities,
+    const bool transparent) {
+    const auto supported = capabilities.supportedCompositeAlpha;
+    const auto supports = [supported](const vk::CompositeAlphaFlagBitsKHR candidate) {
+        return (static_cast<VkCompositeAlphaFlagsKHR>(supported)
+            & static_cast<VkCompositeAlphaFlagsKHR>(candidate)) != 0;
+    };
+
+    static constexpr std::array transparent_modes{
+        vk::CompositeAlphaFlagBitsKHR::eInherit,
+        vk::CompositeAlphaFlagBitsKHR::ePreMultiplied,
+        vk::CompositeAlphaFlagBitsKHR::ePostMultiplied,
+        vk::CompositeAlphaFlagBitsKHR::eOpaque,
+    };
+    static constexpr std::array opaque_modes{
+        vk::CompositeAlphaFlagBitsKHR::eOpaque,
+        vk::CompositeAlphaFlagBitsKHR::eInherit,
+        vk::CompositeAlphaFlagBitsKHR::ePostMultiplied,
+        vk::CompositeAlphaFlagBitsKHR::ePreMultiplied,
+    };
+    const auto& modes = transparent ? transparent_modes : opaque_modes;
+    for (const auto mode : modes)
+        if (supports(mode)) return mode;
+
+    throw Error(ErrorCode::UnsupportedFeature, "surface reports no supported composite-alpha mode");
 }
 
 } // namespace
 
 SwapchainImpl::~SwapchainImpl() {
-    if (!device)
-        return;
-    // Presentation images and their views may still be referenced by work in
-    // flight; the queue is the only thing that can tell us it is done.
-    device->device().waitIdle();
-    images.clear();
-    acquire_semaphores.clear();
-    present_semaphores.clear();
-    swapchain.reset();
+    // No wait: work in flight may still present to these images, and the
+    // retire queue releases them once it has finished.
+    if (device)
+        device->retire_chain(*this);
 }
 
 std::shared_ptr<ImageImpl> DeviceImpl::wrap_presentation_image(const vk::Image image,
@@ -94,8 +159,7 @@ std::shared_ptr<ImageImpl> DeviceImpl::wrap_presentation_image(const vk::Image i
     result->aspect = vk::ImageAspectFlagBits::eColor;
     result->width = width;
     result->height = height;
-    result->byte_size = static_cast<std::size_t>(width) * height
-        * format_texel_size(public_format);
+    result->byte_size = format_byte_size(public_format, width, height);
     // A presentation image is a render target and a blit destination, never a
     // shader resource, so it needs an identity handle but no heap slot.
     result->handle = ImageHandle{result};
@@ -105,13 +169,45 @@ std::shared_ptr<ImageImpl> DeviceImpl::wrap_presentation_image(const vk::Image i
     return result;
 }
 
-void DeviceImpl::rebuild_swapchain(SwapchainImpl& chain) {
-    if (!surface_provider_ || !surface_)
-        throw Error(ErrorCode::InvalidState, "this device was created without a SurfaceProvider");
+void DeviceImpl::retire_chain(SwapchainImpl& chain) {
+    if (!chain.swapchain && chain.images.empty())
+        return;
+    struct Retirement {
+        std::shared_ptr<SurfaceImpl> surface;
+        vk::UniqueSwapchainKHR swapchain;
+        std::vector<std::shared_ptr<ImageImpl>> images;
+        std::vector<SwapchainImpl::Acquire> acquire_semaphores;
+        std::vector<vk::UniqueSemaphore> present_semaphores;
+    };
+    auto retirement = std::make_shared<Retirement>();
+    retirement->surface = chain.surface;
+    retirement->swapchain = std::move(chain.swapchain);
+    retirement->images = std::move(chain.images);
+    retirement->acquire_semaphores = std::move(chain.acquire_semaphores);
+    retirement->present_semaphores = std::move(chain.present_semaphores);
+    chain.images.clear();
+    chain.acquire_semaphores.clear();
+    chain.present_semaphores.clear();
+    chain.presented.clear();
+    retire([retirement] {
+        // Views belong to images the swapchain owns, so they must go first,
+        // here, rather than through each image's own deferred release.
+        for (const auto& image : retirement->images)
+            if (image)
+                image->view.reset();
+        retirement->images.clear();
+        retirement->acquire_semaphores.clear();
+        retirement->present_semaphores.clear();
+        retirement->swapchain.reset();
+        retirement->surface.reset();
+    });
+}
 
-    const auto capabilities = physical_device_.getSurfaceCapabilitiesKHR(surface_.get());
-    std::uint32_t width = surface_provider_->width();
-    std::uint32_t height = surface_provider_->height();
+void DeviceImpl::rebuild_swapchain(SwapchainImpl& chain) {
+    const vk::SurfaceKHR surface = chain.surface->surface.get();
+    const auto capabilities = physical_device_.getSurfaceCapabilitiesKHR(surface);
+    std::uint32_t width = chain.provider->width();
+    std::uint32_t height = chain.provider->height();
     if (capabilities.currentExtent.width != std::numeric_limits<std::uint32_t>::max()) {
         width = capabilities.currentExtent.width;
         height = capabilities.currentExtent.height;
@@ -126,22 +222,17 @@ void DeviceImpl::rebuild_swapchain(SwapchainImpl& chain) {
         return;
     }
 
-    const auto surface_format = choose_format(
-        physical_device_.getSurfaceFormatsKHR(surface_.get()),
+    const auto surface_format = choose_format(physical_device_.getSurfaceFormatsKHR(surface),
         chain.format == vk::Format::eUndefined ? chain.public_format : ImageFormat::Auto);
     chain.format = surface_format.format;
     chain.color_space = surface_format.colorSpace;
     chain.public_format = to_public_format(surface_format.format);
-    chain.present_mode = choose_present_mode(
-        physical_device_.getSurfacePresentModesKHR(surface_.get()));
-
-    std::uint32_t image_count = capabilities.minImageCount + 1;
-    if (capabilities.maxImageCount > 0)
-        image_count = std::min(image_count, capabilities.maxImageCount);
+    chain.present_mode = choose_present_mode(physical_device_.getSurfacePresentModesKHR(surface),
+        chain.requested_mode, fifo_latest_ready_enabled_);
 
     vk::SwapchainCreateInfoKHR info{};
-    info.setSurface(surface_.get())
-        .setMinImageCount(image_count)
+    info.setSurface(surface)
+        .setMinImageCount(choose_image_count(capabilities, chain.present_mode))
         .setImageFormat(chain.format)
         .setImageColorSpace(chain.color_space)
         .setImageExtent({width, height})
@@ -153,18 +244,17 @@ void DeviceImpl::rebuild_swapchain(SwapchainImpl& chain) {
             | vk::ImageUsageFlagBits::eTransferSrc)
         .setImageSharingMode(vk::SharingMode::eExclusive)
         .setPreTransform(capabilities.currentTransform)
-        .setCompositeAlpha(vk::CompositeAlphaFlagBitsKHR::eOpaque)
+        .setCompositeAlpha(choose_composite_alpha(capabilities, chain.transparent))
         .setPresentMode(chain.present_mode)
         .setClipped(VK_TRUE)
+        // Handing over the old chain lets the driver reuse its resources and
+        // keep presenting its queued images while the new one takes over.
         .setOldSwapchain(chain.swapchain.get());
 
     auto replacement = vk_device().createSwapchainKHRUnique(info);
-
-    // Drop the old images only after the new chain exists, and only once the
-    // GPU is done with them - views retire through the ordinary deferred path,
-    // but the VkImages belong to the chain we are about to destroy.
-    vk_device().waitIdle();
-    chain.images.clear();
+    // The old chain may still be referenced by submitted frames. Retire it
+    // rather than waiting for the GPU: a resize must never stall the queue.
+    retire_chain(chain);
     chain.swapchain = std::move(replacement);
 
     const auto raw_images = vk_device().getSwapchainImagesKHR(chain.swapchain.get());
@@ -173,14 +263,9 @@ void DeviceImpl::rebuild_swapchain(SwapchainImpl& chain) {
         chain.images.push_back(
             wrap_presentation_image(image, chain.format, chain.public_format, width, height));
     chain.presented.assign(raw_images.size(), false);
-
-    {
-        chain.acquire_semaphores.clear();
-        chain.present_semaphores.clear();
-        for (std::size_t i = 0; i < raw_images.size(); ++i) {
-            chain.acquire_semaphores.push_back({vk_device().createSemaphoreUnique({}), {}});
-            chain.present_semaphores.push_back(vk_device().createSemaphoreUnique({}));
-        }
+    for (std::size_t i = 0; i < raw_images.size(); ++i) {
+        chain.acquire_semaphores.push_back({vk_device().createSemaphoreUnique({}), {}});
+        chain.present_semaphores.push_back(vk_device().createSemaphoreUnique({}));
     }
     chain.semaphore_cursor = 0;
     chain.width = width;
@@ -188,22 +273,61 @@ void DeviceImpl::rebuild_swapchain(SwapchainImpl& chain) {
     chain.stale = false;
 }
 
-std::shared_ptr<SwapchainImpl> DeviceImpl::create_swapchain(const ImageFormat preferred) {
+std::shared_ptr<SwapchainImpl> DeviceImpl::create_swapchain(SurfaceProvider& provider,
+    const SwapchainDesc& desc) {
     if (!presenting())
         throw Error(ErrorCode::InvalidState,
-            "Device::swapchain requires a DeviceConfig with a SurfaceProvider");
+            "noorrhi::Swapchain requires a Device created with DeviceConfig::presentation");
+    auto surface = std::make_shared<SurfaceImpl>();
+    const std::uintptr_t raw = provider.create_surface(
+        reinterpret_cast<std::uintptr_t>(static_cast<VkInstance>(vk_instance())));
+    if (!raw)
+        throw Error(ErrorCode::InvalidState, "SurfaceProvider failed to create a surface");
+    surface->surface = vk::UniqueSurfaceKHR(vk::SurfaceKHR(reinterpret_cast<VkSurfaceKHR>(raw)),
+        vk::detail::ObjectDestroy<vk::Instance, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>(vk_instance()));
+    // Every frame is submitted and presented on the device's one queue.
+    if (!physical_device_.getSurfaceSupportKHR(queue_family_, surface->surface.get()))
+        throw Error(ErrorCode::UnsupportedFeature,
+            "the device's queue cannot present to this surface");
+
     auto chain = std::make_shared<SwapchainImpl>();
     chain->device = self_.lock();
-    chain->public_format = preferred == ImageFormat::Auto ? ImageFormat::Bgra8Unorm : preferred;
+    chain->provider = &provider;
+    chain->surface = std::move(surface);
+    chain->public_format = desc.format == ImageFormat::Auto ? ImageFormat::Bgra8Unorm : desc.format;
+    chain->requested_mode = desc.present_mode;
+    chain->max_frames_in_flight = std::max(desc.max_frames_in_flight, 1u);
+    chain->transparent = desc.transparent;
     std::lock_guard lock(mutex_);
     rebuild_swapchain(*chain);
     return chain;
+}
+
+void DeviceImpl::wait_frame_slot(SwapchainImpl& chain) {
+    for (;;) {
+        std::uint64_t oldest = 0;
+        {
+            std::lock_guard lock(mutex_);
+            if (shut_down_)
+                throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
+            const std::uint64_t completed = vk_device().getSemaphoreCounterValue(timeline_.get());
+            while (!chain.in_flight.empty() && chain.in_flight.front().value <= completed)
+                chain.in_flight.pop_front();
+            if (chain.in_flight.size() < chain.max_frames_in_flight)
+                return;
+            oldest = chain.in_flight.front().value;
+        }
+        wait({oldest});
+    }
 }
 
 std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
     const std::shared_ptr<SwapchainImpl>& chain) {
     if (!chain)
         throw Error(ErrorCode::InvalidArgument, "begin_frame requires a valid Swapchain");
+    // Pace before acquiring. With one frame in flight the CPU never queues
+    // work behind a busy GPU, which is where input latency would accumulate.
+    wait_frame_slot(*chain);
     std::lock_guard lock(mutex_);
     if (shut_down_)
         throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
@@ -211,9 +335,8 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
         throw Error(ErrorCode::InvalidState, "a frame is already open on this device");
     reap_completed();
 
-    const bool size_changed = surface_provider_
-        && (chain->width != surface_provider_->width()
-            || chain->height != surface_provider_->height());
+    const bool size_changed = chain->width != chain->provider->width()
+        || chain->height != chain->provider->height();
     if (chain->stale || size_changed)
         rebuild_swapchain(*chain);
     if (chain->stale || chain->images.empty())
@@ -223,6 +346,8 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
     chain->semaphore_cursor =
         (chain->semaphore_cursor + 1) % static_cast<std::uint32_t>(chain->acquire_semaphores.size());
 
+    // A binary acquire semaphore may only be reused once the submission that
+    // waited on it has started. Frame pacing normally guarantees that already.
     const auto& slot = chain->acquire_semaphores[semaphore_index];
     if (slot.token.value) {
         const vk::Semaphore semaphore = timeline_.get();
@@ -275,7 +400,7 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
 void DeviceImpl::end_frame(Frame::State& state) {
     std::lock_guard lock(mutex_);
     if (!state.open || !frame_command_ || frame_command_ != state.command)
-        throw Error(ErrorCode::InvalidState, "end_frame called without a matching begin_frame");
+        throw Error(ErrorCode::InvalidState, "present called without a matching begin_frame");
     SwapchainImpl& chain = *state.swapchain;
 
     transition(state.command, chain.images[state.image_index]->image,
@@ -310,12 +435,15 @@ void DeviceImpl::end_frame(Frame::State& state) {
     }
     ++next_timeline_;
     chain.acquire_semaphores[state.semaphore_index].token = token;
+    chain.in_flight.push_back(token);
     frame_resources_.clear();
     frame_command_ = nullptr;
     state.open = false;
     state.command = nullptr;
     chain.presented[state.image_index] = true;
 
+    // The present waits on the submission's semaphore inside the driver, so
+    // the CPU returns immediately instead of waiting for the frame to finish.
     vk::PresentInfoKHR present_info{};
     const vk::SwapchainKHR raw_swapchain = chain.swapchain.get();
     present_info.setWaitSemaphores(presented)
@@ -332,6 +460,49 @@ void DeviceImpl::end_frame(Frame::State& state) {
 } // namespace detail
 
 // --- Public swapchain surface -------------------------------------------
+
+Swapchain::Swapchain(Device& device, SurfaceProvider& surface, const SwapchainDesc& desc) {
+    if (!device.impl_)
+        throw Error(ErrorCode::InvalidResource, "cannot create a swapchain on an empty noorrhi::Device");
+    impl_ = device.impl_->create_swapchain(surface, desc);
+}
+
+void Swapchain::wait_until_ready() {
+    if (!impl_)
+        throw Error(ErrorCode::InvalidResource, "swapchain is empty");
+    impl_->device->wait_frame_slot(*impl_);
+}
+
+Frame Swapchain::begin_frame() {
+    if (!impl_)
+        throw Error(ErrorCode::InvalidResource, "swapchain is empty");
+    return Frame(impl_->device->begin_frame(impl_));
+}
+
+void Swapchain::present(Frame&& frame) {
+    if (!impl_)
+        throw Error(ErrorCode::InvalidResource, "swapchain is empty");
+    if (!frame.impl_)
+        throw Error(ErrorCode::InvalidResource, "cannot present an unacquired frame");
+    if (frame.impl_->swapchain != impl_)
+        throw Error(ErrorCode::InvalidArgument, "frame was acquired from a different swapchain");
+    impl_->device->end_frame(*frame.impl_);
+}
+
+void Swapchain::set_present_mode(const PresentMode mode) {
+    if (!impl_ || impl_->requested_mode == mode)
+        return;
+    impl_->requested_mode = mode;
+    impl_->stale = true;
+}
+
+PresentMode Swapchain::present_mode() const noexcept {
+    return impl_ ? impl_->requested_mode : PresentMode::LowLatency;
+}
+
+ActivePresentMode Swapchain::active_present_mode() const noexcept {
+    return impl_ ? detail::to_active(impl_->present_mode) : ActivePresentMode::Fifo;
+}
 
 ImageFormat Swapchain::format() const noexcept {
     return impl_ ? impl_->public_format : ImageFormat::Auto;
@@ -356,7 +527,7 @@ Frame& Frame::operator=(Frame&& other) noexcept {
 }
 
 Frame::~Frame() {
-    // A frame dropped without end_frame discards its work rather than
+    // A frame dropped without present discards its work rather than
     // presenting a half-recorded image. The command buffer and any resources
     // it referenced are released with it.
     if (impl_ && impl_->open && impl_->device) {

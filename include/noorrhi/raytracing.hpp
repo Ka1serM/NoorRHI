@@ -16,6 +16,7 @@ class RayTracingPipeline;
 namespace detail {
 class DeviceImpl;
 class RayTracingPipelineImpl;
+struct RayTracingLibraryImpl;
 struct AccelerationStructureImpl;
 }
 
@@ -80,28 +81,58 @@ struct Instance {
     std::uint8_t mask = 0xff;
 };
 struct RayTracingPipelineDesc {
-    Shader raygen;
+    // Every ray-generation shader the pipeline can launch. Linking several
+    // into one pipeline shares a single driver compile of the other stages.
+    std::vector<Shader> raygen;
     std::vector<Shader> miss;
     std::vector<Shader> closest_hit;
     std::vector<Shader> any_hit;
     std::vector<Shader> intersection;
+    // Callable shaders, invoked by index with CallShader().
+    std::vector<Shader> callable;
+};
+
+// What every stage of a pipeline built from libraries agrees on. Libraries
+// linked together must share one.
+struct RayTracingInterface {
+    // Largest ray payload any stage declares, in bytes.
+    std::uint32_t max_payload_size = 0;
+    // Largest hit attribute any stage declares; triangles use two floats.
+    std::uint32_t max_hit_attribute_size = 8;
+    bool operator==(const RayTracingInterface&) const = default;
+};
+
+// A separately compiled part of a ray-tracing pipeline. Linking libraries
+// reuses their compiled stages, so a pipeline assembled from libraries that
+// already exist costs a link rather than a compile of every stage.
+class RayTracingLibrary {
+public:
+    RayTracingLibrary() = default;
+    explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+    friend class Device;
+    explicit RayTracingLibrary(std::shared_ptr<detail::RayTracingLibraryImpl> impl)
+        : impl_(std::move(impl)) {}
+    std::shared_ptr<detail::RayTracingLibraryImpl> impl_;
 };
 
 class RayTracingPipeline {
 public:
     RayTracingPipeline() = default;
     explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+    // Launches `raygen`, which must be one of the desc's raygen shaders.
     template<class Args>
-    void trace(DispatchSize size, const Args& args) const {
+    void trace(const Shader& raygen, DispatchSize size, const Args& args) const {
         static_assert(std::is_trivially_copyable_v<Args>, "GPU arguments must be trivially copyable");
-        trace_bytes(size, &args, sizeof(Args));
+        trace_bytes(raygen, size, &args, sizeof(Args));
     }
 
 private:
     friend class Device;
     explicit RayTracingPipeline(std::shared_ptr<detail::RayTracingPipelineImpl> impl)
         : impl_(std::move(impl)) {}
-    void trace_bytes(DispatchSize, const void*, std::size_t) const;
+    void trace_bytes(const Shader&, DispatchSize, const void*, std::size_t) const;
     std::shared_ptr<detail::RayTracingPipelineImpl> impl_;
 };
 } // namespace noorrhi

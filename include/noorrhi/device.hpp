@@ -2,10 +2,12 @@
 
 #include "types.hpp"
 
+#include <filesystem>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <type_traits>
 #include <span>
 #include <string_view>
 
@@ -24,6 +26,8 @@ class SurfaceProvider;
 struct GraphicsPipelineDesc;
 struct RenderTarget;
 struct RayTracingPipelineDesc;
+struct RayTracingInterface;
+class RayTracingLibrary;
 struct TriangleGeometry;
 struct Instance;
 struct InstanceRecord;
@@ -42,6 +46,8 @@ struct ExternalImageMemory;
 struct ExternalSemaphore;
 DeviceHandles device_handles(Device&);
 std::uintptr_t image_view(Device&, ImageHandle);
+std::uintptr_t image(Device&, ImageHandle);
+void record(Device&, const std::function<void(std::uintptr_t)>&);
 ExternalImageMemory export_image_memory(Device&, ImageHandle);
 ExternalSemaphore signal_external(Device&);
 }
@@ -65,6 +71,33 @@ private:
     struct State;
     explicit TimestampQuery(std::shared_ptr<State> impl) : impl_(std::move(impl)) {}
     std::shared_ptr<State> impl_;
+};
+
+// A record staged once in the device's argument arena and read by several
+// launches through its address - for arguments too large to copy into every
+// launch, which then pass only address(). The region is never reused while
+// this object lives; once it is destroyed, the region is freed after the work
+// recorded up to then has completed.
+class StagedArguments {
+public:
+    StagedArguments() = default;
+    StagedArguments(StagedArguments&& other) noexcept;
+    StagedArguments& operator=(StagedArguments&& other) noexcept;
+    StagedArguments(const StagedArguments&) = delete;
+    StagedArguments& operator=(const StagedArguments&) = delete;
+    ~StagedArguments();
+
+    std::uint64_t address() const noexcept { return address_; }
+
+private:
+    friend class Device;
+    StagedArguments(std::shared_ptr<detail::DeviceImpl> device, std::uint64_t id,
+        std::uint64_t address)
+        : device_(std::move(device)), id_(id), address_(address) {}
+    void release() noexcept;
+    std::shared_ptr<detail::DeviceImpl> device_;
+    std::uint64_t id_ = 0;
+    std::uint64_t address_ = 0;
 };
 
 // Buffer device addresses, dynamic rendering, descriptor heaps, untyped shader
@@ -98,11 +131,18 @@ struct DeviceConfig {
     // throws ErrorCode::OutOfMemory.
     std::uint32_t texture_descriptor_capacity = 16384;
     std::uint32_t sampler_descriptor_capacity = 256;
-    // Supplying a provider makes this a presenting device: it enables the
-    // swapchain extension, selects a present-capable queue, and lets
-    // swapchain() and begin_frame() be used. Leaving it null gives a headless
+    // Optional. Supplying a window's provider lets Swapchains be created on
+    // this device: it adopts the window system's Vulkan loader and instance
+    // extensions, enables the swapchain extensions, and only selects a GPU and
+    // queue that can present to that window. The device keeps no surface of
+    // its own; each Swapchain creates one. Leaving it null gives a headless
     // device, which is what offline rendering and the tests want.
-    SurfaceProvider* surface = nullptr;
+    SurfaceProvider* presentation = nullptr;
+    // Optional. The driver's compiled pipelines are loaded from this file at
+    // construction and written back by save_pipeline_cache(). Drivers do not
+    // all persist pipeline libraries themselves; without a file the cache only
+    // lives as long as the device.
+    std::filesystem::path pipeline_cache_file;
 };
 
 class Device {
@@ -127,7 +167,15 @@ public:
     Shader create_shader(std::span<const std::byte> spirv, std::string_view entry_point);
     ComputePipeline compute(const Shader& shader);
     GraphicsPipeline graphics(const GraphicsPipelineDesc& desc);
-    RayTracingPipeline ray_tracing(const RayTracingPipelineDesc& desc);
+    RayTracingLibrary ray_tracing_library(const RayTracingPipelineDesc& desc,
+        const RayTracingInterface& interface);
+    // Links the libraries into one pipeline. Each shader binding table region
+    // lists its groups library by library, in the order given, so a callable's
+    // index counts the callables of every library before its own.
+    RayTracingPipeline ray_tracing(std::span<const RayTracingLibrary> libraries);
+    // Writes every pipeline compiled so far to DeviceConfig::pipeline_cache_file.
+    // Does nothing when no file was configured.
+    void save_pipeline_cache();
     AccelerationStructure build_blas(std::span<const TriangleGeometry> geometry);
     // Refits a BLAS in place against the current contents of the vertex and
     // index buffers it was built from. Much cheaper than a rebuild, but only
@@ -159,29 +207,26 @@ public:
     // none is.
     void render(const RenderTarget& target, const std::function<void()>& draw_commands);
 
+    // Copies `args` into the argument arena once; see StagedArguments.
+    template<class Args>
+    StagedArguments stage(const Args& args) {
+        static_assert(std::is_trivially_copyable_v<Args>, "GPU arguments must be trivially copyable");
+        return stage_bytes(&args, sizeof(Args));
+    }
+    StagedArguments stage_bytes(const void* args, std::size_t size);
+
     TimestampQuery timestamp();
     // Bracket `commands` with GPU timestamps written into `query`.
     void measure(const TimestampQuery& query, const std::function<void()>& commands);
 
-    // --- Presentation. Valid only on a device built with a SurfaceProvider.
-
-    // Create the presentation chain. The overload taking a format honours it
-    // when the surface supports it and quietly replaces it with a supported
-    // one otherwise; read the result back with Swapchain::format().
-    Swapchain swapchain();
-    Swapchain swapchain(ImageFormat preferred);
-
-    // Acquire the next presentation image and open a recording scope. Returns
-    // a falsy Frame when the chain was rebuilt and no image was acquired - the
-    // caller should skip the frame and try again.
-    Frame begin_frame(Swapchain& swapchain);
-
-    // Close the frame, submit everything recorded into it, and present.
-    void end_frame(Frame&& frame);
+    // Presentation is not part of the device: see noorrhi::Swapchain.
 
 private:
+    friend class Swapchain;
     friend interop::DeviceHandles interop::device_handles(Device&);
     friend std::uintptr_t interop::image_view(Device&, ImageHandle);
+    friend std::uintptr_t interop::image(Device&, ImageHandle);
+    friend void interop::record(Device&, const std::function<void(std::uintptr_t)>&);
     friend interop::ExternalImageMemory interop::export_image_memory(Device&, ImageHandle);
     friend interop::ExternalSemaphore interop::signal_external(Device&);
     std::shared_ptr<detail::DeviceImpl> impl_;

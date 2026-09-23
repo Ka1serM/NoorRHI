@@ -6,10 +6,16 @@
 #include "internal.hpp"
 #include "noorrhi/shared.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <cstring>
 #include <limits>
 #include <set>
+#include <thread>
+#include <utility>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -42,7 +48,7 @@ bool has_extension(const std::vector<vk::ExtensionProperties>& extensions, const
 }
 
 DeviceImpl::DeviceImpl(const DeviceConfig& config) {
-    surface_provider_ = config.surface;
+    presentation_enabled_ = config.presentation != nullptr;
     // Root arguments use a fixed mapped arena; large assets use temporary staging.
     argument_arena_size_ = config.argument_arena_bytes;
     texture_descriptor_capacity_ = config.texture_descriptor_capacity;
@@ -54,9 +60,10 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
     try {
         create_instance(config);
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance());
-        // The surface has to exist before the physical device is chosen: a
-        // device that cannot present to it is not a candidate.
-        create_surface(config);
+        // A probe surface has to exist before the physical device is chosen:
+        // a device that cannot present to the host's window is not a
+        // candidate. It is released once the queue has been selected.
+        create_probe_surface(config);
         select_physical_device();
         host_alignment_ = std::max<std::size_t>(16,
             physical_device_.getProperties().limits.nonCoherentAtomSize);
@@ -67,6 +74,7 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_device());
         create_allocator();
         create_command_state();
+        probe_surface_.reset();
     } catch (const vk::SystemError& error) {
         throw_vk(error, "Vulkan device initialization failed");
     }
@@ -103,7 +111,8 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
         && has_extension(extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     const bool has_query = has_as && has_extension(extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
     const bool has_pipeline = has_as
-        && has_extension(extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+        && has_extension(extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)
+        && has_extension(extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 
     vk::PhysicalDeviceVulkan11Features supported11{};
     vk::PhysicalDeviceVulkan12Features supported12{};
@@ -180,8 +189,8 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
     // against a different loader is undefined. When one is present, its
     // loader is the one the whole device uses.
     auto loader = vkGetInstanceProcAddr;
-    if (config.surface) {
-        if (const auto provided = config.surface->instance_proc_address())
+    if (config.presentation) {
+        if (const auto provided = config.presentation->instance_proc_address())
             loader = reinterpret_cast<PFN_vkGetInstanceProcAddr>(provided);
     }
     if (!loader)
@@ -191,8 +200,8 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
     std::vector<const char*> layers;
     std::vector<const char*> extensions;
     // Platform extensions are supplied by the window provider below.
-    if (config.surface)
-        for (const char* extension : config.surface->instance_extensions())
+    if (config.presentation)
+        for (const char* extension : config.presentation->instance_extensions())
             extensions.push_back(extension);
     if (config.enable_validation) {
         for (const auto& layer : vk::enumerateInstanceLayerProperties()) {
@@ -230,14 +239,14 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
     }
 }
 
-void DeviceImpl::create_surface(const DeviceConfig& config) {
-    if (!config.surface)
+void DeviceImpl::create_probe_surface(const DeviceConfig& config) {
+    if (!config.presentation)
         return;
-    const std::uintptr_t raw = config.surface->create_surface(
+    const std::uintptr_t raw = config.presentation->create_surface(
         reinterpret_cast<std::uintptr_t>(static_cast<VkInstance>(vk_instance())));
     if (!raw)
         throw Error(ErrorCode::InvalidState, "SurfaceProvider failed to create a surface");
-    surface_ = vk::UniqueSurfaceKHR(vk::SurfaceKHR(reinterpret_cast<VkSurfaceKHR>(raw)),
+    probe_surface_ = vk::UniqueSurfaceKHR(vk::SurfaceKHR(reinterpret_cast<VkSurfaceKHR>(raw)),
         vk::detail::ObjectDestroy<vk::Instance, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>(vk_instance()));
 }
 
@@ -254,7 +263,7 @@ void DeviceImpl::select_physical_device() {
         const Capabilities capabilities = probe(candidate);
         if (!capabilities.mandatory)
             continue;
-        if (surface_ && !has_extension(candidate.enumerateDeviceExtensionProperties(),
+        if (probe_surface_ && !has_extension(candidate.enumerateDeviceExtensionProperties(),
                 VK_KHR_SWAPCHAIN_EXTENSION_NAME))
             continue;
 
@@ -285,7 +294,7 @@ void DeviceImpl::select_physical_device() {
     adopt_capabilities(best_capabilities);
 }
 
-void DeviceImpl::create_device(const DeviceConfig&) {
+void DeviceImpl::create_device(const DeviceConfig& config) {
     const auto queues = physical_device_.getQueueFamilyProperties();
     std::optional<std::uint32_t> selected;
     for (std::uint32_t i = 0; i < queues.size(); ++i) {
@@ -294,7 +303,7 @@ void DeviceImpl::create_device(const DeviceConfig&) {
         // A presenting device needs one queue that can do everything: the
         // frame's dispatches, its draws and its present all go through the
         // single queue this library owns.
-        if (surface_ && !physical_device_.getSurfaceSupportKHR(i, surface_.get()))
+        if (probe_surface_ && !physical_device_.getSurfaceSupportKHR(i, probe_surface_.get()))
             continue;
         // Prefer a unified graphics+compute queue. The public API exposes
         // both dispatch and raster operations, so selecting a compute-only
@@ -307,7 +316,7 @@ void DeviceImpl::create_device(const DeviceConfig&) {
             selected = i;
     }
     if (!selected)
-        throw Error(ErrorCode::UnsupportedFeature, surface_
+        throw Error(ErrorCode::UnsupportedFeature, probe_surface_
             ? "Selected Vulkan device has no queue that supports both compute and presentation"
             : "Selected Vulkan device has no compute queue");
     queue_family_ = *selected;
@@ -322,7 +331,7 @@ void DeviceImpl::create_device(const DeviceConfig&) {
     };
     if (physical_device_.getProperties().apiVersion < VK_API_VERSION_1_4)
         enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
-    if (surface_)
+    if (presentation_enabled_)
         enabled_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     external_memory_fd_enabled_ = has_extension(extensions,
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
@@ -343,6 +352,19 @@ void DeviceImpl::create_device(const DeviceConfig&) {
     vk::PhysicalDeviceVulkan11Features features11{};
     features11.shaderDrawParameters = VK_TRUE;
     vk::PhysicalDeviceVulkan12Features features12{};
+    // Slang declares Float16 for shared records containing half-precision
+    // Gaussian coefficients, including shaders that do not load them.
+    const auto supported_numeric = physical_device_.getFeatures2<
+        vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+        vk::PhysicalDeviceVulkan12Features>();
+    features11.storageBuffer16BitAccess = supported_numeric
+        .get<vk::PhysicalDeviceVulkan11Features>().storageBuffer16BitAccess;
+    features12.shaderFloat16 = supported_numeric
+        .get<vk::PhysicalDeviceVulkan12Features>().shaderFloat16;
+    // Atomic compare-exchange on 64-bit keys in storage buffers, used by
+    // lock-free GPU hash tables (NoorRay's SHaRC radiance cache).
+    features12.shaderBufferInt64Atomics = supported_numeric
+        .get<vk::PhysicalDeviceVulkan12Features>().shaderBufferInt64Atomics;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.timelineSemaphore = VK_TRUE;
     // Slang's natural layout for records reached through GPU pointers matches
@@ -391,6 +413,31 @@ void DeviceImpl::create_device(const DeviceConfig&) {
             *tail = &rt_features;
             tail = &rt_features.pNext;
             enabled_extensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+            enabled_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        }
+    }
+
+    // FIFO_LATEST_READY is the tear-free low-latency fallback where a surface
+    // offers no MAILBOX. Optional: swapchains simply skip it without support.
+    vk::PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latest_ready_features{};
+    if (presentation_enabled_) {
+        const char* latest_ready_extension =
+            has_extension(extensions, VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME)
+                ? VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME
+            : has_extension(extensions, VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME)
+                ? VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME
+                : nullptr;
+        if (latest_ready_extension) {
+            const auto supported = physical_device_.getFeatures2<vk::PhysicalDeviceFeatures2,
+                vk::PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR>();
+            if (supported.get<vk::PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR>()
+                    .presentModeFifoLatestReady) {
+                latest_ready_features.presentModeFifoLatestReady = VK_TRUE;
+                *tail = &latest_ready_features;
+                tail = &latest_ready_features.pNext;
+                enabled_extensions.push_back(latest_ready_extension);
+                fifo_latest_ready_enabled_ = true;
+            }
         }
     }
 
@@ -401,6 +448,35 @@ void DeviceImpl::create_device(const DeviceConfig&) {
         .setPNext(&features11);
     device_ = physical_device_.createDeviceUnique(createInfo);
     queue_ = vk_device().getQueue(queue_family_, 0);
+    pipeline_cache_file_ = config.pipeline_cache_file;
+    std::vector<char> cached;
+    // A missing file is the first run. The driver validates the header of the
+    // data it is given and starts empty on a mismatch, such as a new driver.
+    if (!pipeline_cache_file_.empty() && std::filesystem::exists(pipeline_cache_file_)) {
+        std::ifstream file(pipeline_cache_file_, std::ios::binary);
+        cached.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        if (!file.eof() && file.fail())
+            throw Error(ErrorCode::InvalidArgument,
+                "cannot read pipeline cache " + pipeline_cache_file_.string());
+    }
+    pipeline_cache_ = vk_device().createPipelineCacheUnique({{}, cached.size(), cached.data()});
+}
+
+void DeviceImpl::save_pipeline_cache() {
+    if (pipeline_cache_file_.empty())
+        return;
+    const std::vector<std::uint8_t> data = vk_device().getPipelineCacheData(*pipeline_cache_);
+    // Written beside the cache and renamed over it, so an interrupted write
+    // never leaves a truncated cache behind.
+    std::filesystem::path partial = pipeline_cache_file_;
+    partial += ".partial";
+    {
+        std::ofstream file(partial, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        if (!file)
+            throw Error(ErrorCode::InvalidArgument, "cannot write pipeline cache " + partial.string());
+    }
+    std::filesystem::rename(partial, pipeline_cache_file_);
 }
 
 void DeviceImpl::create_allocator() {
@@ -760,7 +836,7 @@ std::shared_ptr<ComputePipelineImpl> DeviceImpl::create_compute(const Shader& sh
     vk::ComputePipelineCreateInfo pipelineInfo{{}, stage, {}};
     pipelineInfo.pNext = &heap_flags;
     try {
-        result->pipeline = vk_device().createComputePipelineUnique({}, pipelineInfo).value;
+        result->pipeline = vk_device().createComputePipelineUnique(*pipeline_cache_, pipelineInfo).value;
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
@@ -792,6 +868,12 @@ std::shared_ptr<SamplerImpl> DeviceImpl::create_sampler(const SamplerDesc& desc)
     flush_slot(sampler_heap_, slot);
     result->handle = SamplerHandle{slot};
     return result;
+}
+
+void DeviceImpl::record_native(const std::function<void(std::uintptr_t)>& commands) {
+    submit([&commands](const vk::CommandBuffer command) {
+        commands(reinterpret_cast<std::uintptr_t>(static_cast<VkCommandBuffer>(command)));
+    });
 }
 
 GpuToken DeviceImpl::submit(const std::function<void(vk::CommandBuffer)>& record,
@@ -960,6 +1042,34 @@ void DeviceImpl::synchronize() {
 }
 
 vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_t size) {
+    return place_arguments(args, size, 0);
+}
+
+vk::DeviceAddress DeviceImpl::stage_held(const void* args, const std::size_t size,
+    std::uint64_t& id) {
+    std::lock_guard lock(mutex_);
+    id = next_staged_id_++;
+    return place_arguments(args, size, id);
+}
+
+void DeviceImpl::release_staged(const std::uint64_t id) noexcept {
+    std::lock_guard lock(mutex_);
+    std::lock_guard argument_lock(argument_mutex_);
+    for (ArgumentRegion& region : argument_pending_) {
+        if (region.held != id)
+            continue;
+        // Every launch that read the record was recorded before this call:
+        // into the open frame, or into submissions already made.
+        region.held = 0;
+        region.token = GpuToken{frame_command_ ? next_timeline_ : next_timeline_ - 1};
+        return;
+    }
+}
+
+// Called with mutex_ held, so next_timeline_ names the submission the record
+// is protected for.
+vk::DeviceAddress DeviceImpl::place_arguments(const void* args, const std::size_t size,
+    const std::uint64_t held) {
     if (!args || size == 0)
         return 0;
     std::lock_guard lock(argument_mutex_);
@@ -970,18 +1080,24 @@ vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_
             "root arguments do not fit in the GPU argument arena");
     const std::size_t alignment = host_alignment_;
     std::size_t offset = (argument_offset_ + alignment - 1) & ~(alignment - 1);
-    // Called while submit holds mutex_. Protect every launch record until
-    // its submission retires, including records recorded in an open frame.
+    // Protect every launch record until its submission retires, including
+    // records recorded in an open frame, and every staged record until its
+    // owner releases it.
     if (offset + size > argument_arena_->size)
         offset = 0;
     std::uint64_t overlap = 0;
     const auto completed = vk_device().getSemaphoreCounterValue(timeline_.get());
-    while (!argument_pending_.empty()
+    while (!argument_pending_.empty() && argument_pending_.front().held == 0
         && argument_pending_.front().token.value <= completed)
         argument_pending_.pop_front();
-    for (const auto& region : argument_pending_)
-        if (region.end > offset && region.begin < offset + size)
-            overlap = std::max(overlap, region.token.value);
+    for (const auto& region : argument_pending_) {
+        if (region.end <= offset || region.begin >= offset + size)
+            continue;
+        if (region.held != 0)
+            throw Error(ErrorCode::OutOfMemory,
+                "argument arena is full of staged records still in use");
+        overlap = std::max(overlap, region.token.value);
+    }
     if (overlap >= next_timeline_)
         throw Error(ErrorCode::OutOfMemory,
             "open submission exceeds argument arena capacity");
@@ -991,7 +1107,7 @@ vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_
             std::numeric_limits<std::uint64_t>::max()) != vk::Result::eSuccess)
             throw Error(ErrorCode::DeviceLost, "waiting for argument storage failed");
     }
-    argument_pending_.push_back({offset, offset + size, GpuToken{next_timeline_}});
+    argument_pending_.push_back({offset, offset + size, GpuToken{next_timeline_}, held});
     std::memcpy(static_cast<std::byte*>(argument_arena_->mapped) + offset, args, size);
     vmaFlushAllocation(allocator_, argument_arena_->allocation, offset, size);
     argument_offset_ = offset + size;
@@ -1062,38 +1178,96 @@ void DeviceImpl::barrier(const Stage source, const Stage destination) {
     });
 }
 
-std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::create_ray_tracing(
-    const RayTracingPipelineDesc& desc) {
+// Compiling a ray-tracing library costs up to seconds of driver work. A
+// deferred operation lets worker threads share it; without one the driver
+// also moves part of the compile into the link.
+vk::UniquePipeline DeviceImpl::create_deferred_pipeline(
+    const vk::RayTracingPipelineCreateInfoKHR& info) {
+    vk::UniqueDeferredOperationKHR operation;
+    try {
+        operation = vk_device().createDeferredOperationKHRUnique();
+    } catch (const vk::SystemError& error) {
+        throw Error(ErrorCode::ShaderCreationFailed, error.what());
+    }
+
+    vk::Pipeline pipeline;
+    const vk::Result deferred = static_cast<vk::Result>(
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateRayTracingPipelinesKHR(vk_device(), *operation,
+            *pipeline_cache_, 1, reinterpret_cast<const VkRayTracingPipelineCreateInfoKHR*>(&info),
+            nullptr, reinterpret_cast<VkPipeline*>(&pipeline)));
+    if (deferred != vk::Result::eSuccess && deferred != vk::Result::eOperationDeferredKHR
+        && deferred != vk::Result::eOperationNotDeferredKHR)
+        throw Error(ErrorCode::ShaderCreationFailed,
+            "Vulkan ray-tracing pipeline creation failed: " + vk::to_string(deferred));
+
+    if (deferred == vk::Result::eOperationDeferredKHR) {
+        const auto join = [this, handle = *operation] {
+            // eThreadDoneKHR means this thread is no longer needed; only
+            // eThreadIdleKHR asks it to come back for more work.
+            for (;;) {
+                const vk::Result result = static_cast<vk::Result>(
+                    VULKAN_HPP_DEFAULT_DISPATCHER.vkDeferredOperationJoinKHR(vk_device(), handle));
+                if (result != vk::Result::eThreadIdleKHR)
+                    return;
+                std::this_thread::yield();
+            }
+        };
+        const std::uint32_t concurrency = std::min<std::uint32_t>(
+            vk_device().getDeferredOperationMaxConcurrencyKHR(*operation),
+            std::max(std::thread::hardware_concurrency(), 1u));
+        std::vector<std::thread> workers;
+        workers.reserve(concurrency > 0 ? concurrency - 1 : 0);
+        for (std::uint32_t i = 1; i < concurrency; ++i)
+            workers.emplace_back(join);
+        join();
+        for (std::thread& worker : workers)
+            worker.join();
+        const vk::Result result = vk_device().getDeferredOperationResultKHR(*operation);
+        if (result != vk::Result::eSuccess)
+            throw Error(ErrorCode::ShaderCreationFailed,
+                "Vulkan ray-tracing pipeline creation failed: " + vk::to_string(result));
+    }
+    return vk::UniquePipeline(pipeline,
+        vk::detail::ObjectDestroy<vk::Device, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>(vk_device()));
+}
+
+RayTracingGroups DeviceImpl::ray_tracing_groups(const RayTracingPipelineDesc& desc) const {
     if (!ray_tracing_supported_)
         throw Error(ErrorCode::UnsupportedFeature,
             "acceleration structures are not enabled on this noorrhi::Device");
-    if (!desc.raygen.impl_)
-        throw Error(ErrorCode::InvalidArgument, "ray-tracing pipelines require a ray-generation shader");
 
-    auto result = std::make_shared<RayTracingPipelineImpl>();
-    result->device = self_.lock();
-
-    std::vector<vk::PipelineShaderStageCreateInfo> stages;
-    std::vector<vk::RayTracingShaderGroupCreateInfoKHR> groups;
+    RayTracingGroups result;
+    // One stage per distinct shader: drivers compile every stage entry, so a
+    // shader repeated across groups (the shared closest hit, for one) would
+    // otherwise be compiled once per group.
+    std::map<const ShaderImpl*, std::uint32_t> stage_indices;
     auto add_stage = [&](const Shader& shader, const vk::ShaderStageFlagBits stage) {
         if (!shader.impl_)
             throw Error(ErrorCode::InvalidResource, "ray-tracing shader list contains an empty shader");
-        const auto index = static_cast<std::uint32_t>(stages.size());
-        result->shaders.push_back(shader.impl_);
+        if (const auto existing = stage_indices.find(shader.impl_.get());
+            existing != stage_indices.end())
+            return existing->second;
+        const auto index = static_cast<std::uint32_t>(result.stages.size());
+        stage_indices.emplace(shader.impl_.get(), index);
+        result.shaders.push_back(shader.impl_);
         // Nothing to map: the raygen stage reads its acceleration structure
         // from an address in its root record, not from a binding.
-        stages.push_back({{}, stage, *shader.impl_->module,
+        result.stages.push_back({{}, stage, *shader.impl_->module,
             shader.impl_->entry_point.c_str()});
         return index;
     };
-    const auto raygen_index = add_stage(desc.raygen, vk::ShaderStageFlagBits::eRaygenKHR);
-    groups.emplace_back(vk::RayTracingShaderGroupTypeKHR::eGeneral, raygen_index,
-        VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR);
-    for (const auto& shader : desc.miss) {
-        const auto index = add_stage(shader, vk::ShaderStageFlagBits::eMissKHR);
-        groups.emplace_back(vk::RayTracingShaderGroupTypeKHR::eGeneral, index,
+    auto add_general = [&](const Shader& shader, const vk::ShaderStageFlagBits stage,
+                           const RayTracingGroups::Kind kind) {
+        const auto index = add_stage(shader, stage);
+        result.create_infos.emplace_back(vk::RayTracingShaderGroupTypeKHR::eGeneral, index,
             VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR);
-    }
+        result.groups.push_back({kind, kind == RayTracingGroups::Kind::Raygen
+            ? shader.impl_.get() : nullptr});
+    };
+    for (const auto& shader : desc.raygen)
+        add_general(shader, vk::ShaderStageFlagBits::eRaygenKHR, RayTracingGroups::Kind::Raygen);
+    for (const auto& shader : desc.miss)
+        add_general(shader, vk::ShaderStageFlagBits::eMissKHR, RayTracingGroups::Kind::Miss);
     const auto hit_count = std::max({desc.closest_hit.size(), desc.any_hit.size(), desc.intersection.size()});
     for (std::size_t i = 0; i < hit_count; ++i) {
         const bool has_intersection = i < desc.intersection.size();
@@ -1108,35 +1282,94 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::create_ray_tracing(
             any = add_stage(desc.any_hit[i], vk::ShaderStageFlagBits::eAnyHitKHR);
         if (has_intersection)
             intersection = add_stage(desc.intersection[i], vk::ShaderStageFlagBits::eIntersectionKHR);
-        groups.emplace_back(type, VK_SHADER_UNUSED_KHR, closest, any, intersection);
+        result.create_infos.emplace_back(type, VK_SHADER_UNUSED_KHR, closest, any, intersection);
+        result.groups.push_back({RayTracingGroups::Kind::Hit});
     }
-    if (groups.empty())
+    for (const auto& shader : desc.callable)
+        add_general(shader, vk::ShaderStageFlagBits::eCallableKHR, RayTracingGroups::Kind::Callable);
+    if (result.groups.empty())
         throw Error(ErrorCode::InvalidArgument, "ray-tracing pipeline contains no shader groups");
+    return result;
+}
 
+std::shared_ptr<RayTracingLibraryImpl> DeviceImpl::create_ray_tracing_library(
+    const RayTracingPipelineDesc& desc, const RayTracingInterface& interface) {
+    auto result = std::make_shared<RayTracingLibraryImpl>();
+    result->device = self_.lock();
+    result->interface = interface;
+    result->groups = ray_tracing_groups(desc);
+
+    const vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface(
+        interface.max_payload_size, interface.max_hit_attribute_size);
+    const vk::PipelineCreateFlags2CreateInfo flags{
+        vk::PipelineCreateFlagBits2::eDescriptorHeapEXT | vk::PipelineCreateFlagBits2::eLibraryKHR};
+    vk::RayTracingPipelineCreateInfoKHR info({}, result->groups.stages,
+        result->groups.create_infos, 1, nullptr, &library_interface, nullptr, {});
+    info.pNext = &flags;
+    result->pipeline = create_deferred_pipeline(info);
+    return result;
+}
+
+std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::link_ray_tracing(
+    const std::span<const std::shared_ptr<RayTracingLibraryImpl>> libraries) {
+    if (libraries.empty())
+        throw Error(ErrorCode::InvalidArgument, "ray-tracing pipelines require at least one library");
+    auto result = std::make_shared<RayTracingPipelineImpl>();
+    result->device = self_.lock();
+
+    const RayTracingInterface interface = libraries.front()->interface;
+    std::vector<vk::Pipeline> handles;
+    // A linked pipeline numbers its groups library by library.
+    std::vector<RayTracingGroups::Group> groups;
+    for (const auto& library : libraries) {
+        if (!library)
+            throw Error(ErrorCode::InvalidResource, "ray-tracing library is empty");
+        if (library->interface != interface)
+            throw Error(ErrorCode::InvalidArgument, "linked ray-tracing libraries must share one interface");
+        handles.push_back(*library->pipeline);
+        groups.insert(groups.end(), library->groups.groups.begin(), library->groups.groups.end());
+        result->libraries.push_back(library);
+    }
+    if (std::ranges::none_of(groups, [](const RayTracingGroups::Group& group) {
+            return group.kind == RayTracingGroups::Kind::Raygen; }))
+        throw Error(ErrorCode::InvalidArgument, "ray-tracing pipelines require a ray-generation shader");
+
+    const vk::PipelineLibraryCreateInfoKHR library_info(handles);
+    const vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface(
+        interface.max_payload_size, interface.max_hit_attribute_size);
     const auto heap_flags = pipeline_heap_flags();
-    vk::RayTracingPipelineCreateInfoKHR info({}, stages, groups, 1, nullptr, nullptr,
+    vk::RayTracingPipelineCreateInfoKHR info({}, {}, {}, 1, &library_info, &library_interface,
         nullptr, {});
     info.pNext = &heap_flags;
+    // Linking reuses the libraries' compiled stages, so there is little work
+    // to spread over threads, and NVIDIA's 610 driver faults at the first
+    // trace of a pipeline linked through a deferred operation.
     try {
-        result->pipeline = vk_device().createRayTracingPipelineKHRUnique({}, {}, info).value;
+        result->pipeline = vk_device().createRayTracingPipelineKHRUnique(
+            {}, *pipeline_cache_, info).value;
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
+    build_shader_binding_table(*result, groups);
+    return result;
+}
 
+void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
+    const std::span<const RayTracingGroups::Group> groups) {
     const std::uint32_t handle_size = ray_tracing_properties_.shaderGroupHandleSize;
     const std::uint32_t alignment = std::max(ray_tracing_properties_.shaderGroupHandleAlignment, 1u);
     const std::uint32_t base_alignment = std::max(
         ray_tracing_properties_.shaderGroupBaseAlignment, 1u);
     const std::uint32_t handle_stride = (handle_size + alignment - 1) / alignment * alignment;
-    // Each region begins at a group-base-aligned address. Since miss and hit
-    // regions follow raygen in one compact table, the record stride must also
+    // Each region begins at a group-base-aligned address. Since the regions
+    // follow each other in one compact table, the record stride must also
     // preserve that stronger alignment (handle alignment alone is commonly
     // only 32 bytes on NVIDIA hardware).
     const std::uint32_t stride = (handle_stride + base_alignment - 1)
         / base_alignment * base_alignment;
     const std::size_t group_count = groups.size();
     std::vector<std::byte> handle_bytes(group_count * handle_size);
-    if (vk_device().getRayTracingShaderGroupHandlesKHR(*result->pipeline, 0,
+    if (vk_device().getRayTracingShaderGroupHandlesKHR(*result.pipeline, 0,
             static_cast<std::uint32_t>(group_count), handle_bytes.size(), handle_bytes.data()) != vk::Result::eSuccess)
         throw Error(ErrorCode::ShaderCreationFailed, "Vulkan shader binding table handle query failed");
     // VMA does not promise that a storage allocation's device address is
@@ -1144,31 +1377,45 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::create_ray_tracing(
     // aligned address inside the allocation; using the raw allocation base
     // makes vkCmdTraceRaysKHR reject the miss/hit regions (and some drivers
     // report the resulting device loss only at queue submission time).
-    result->shader_binding_table = create_buffer(group_count * stride + base_alignment,
+    result.shader_binding_table = create_buffer(group_count * stride + base_alignment,
         vk::BufferUsageFlagBits::eShaderBindingTableKHR
             | vk::BufferUsageFlagBits::eShaderDeviceAddress,
         VMA_MEMORY_USAGE_CPU_TO_GPU, true);
-    std::memset(result->shader_binding_table->mapped, 0, result->shader_binding_table->size);
-    const vk::DeviceAddress base = (result->shader_binding_table->address
+    std::memset(result.shader_binding_table->mapped, 0, result.shader_binding_table->size);
+    const vk::DeviceAddress base = (result.shader_binding_table->address
         + base_alignment - 1) & ~(static_cast<vk::DeviceAddress>(base_alignment) - 1);
     const std::size_t table_offset = static_cast<std::size_t>(
-        base - result->shader_binding_table->address);
-    for (std::size_t i = 0; i < group_count; ++i)
-        std::memcpy(static_cast<std::byte*>(result->shader_binding_table->mapped)
-                + table_offset + i * stride,
-            handle_bytes.data() + i * handle_size, handle_size);
-    vmaFlushAllocation(allocator_, result->shader_binding_table->allocation, 0,
-        result->shader_binding_table->size);
+        base - result.shader_binding_table->address);
 
-    const std::uint32_t miss_count = static_cast<std::uint32_t>(desc.miss.size());
-    const std::uint32_t hit_group_count = static_cast<std::uint32_t>(hit_count);
-    result->raygen_region = vk::StridedDeviceAddressRegionKHR{base, stride, stride};
-    result->miss_region = miss_count ? vk::StridedDeviceAddressRegionKHR{
-        base + stride, stride, static_cast<vk::DeviceSize>(miss_count) * stride} : vk::StridedDeviceAddressRegionKHR{};
-    result->hit_region = hit_group_count ? vk::StridedDeviceAddressRegionKHR{
-        base + static_cast<vk::DeviceSize>(1 + miss_count) * stride, stride,
-        static_cast<vk::DeviceSize>(hit_group_count) * stride} : vk::StridedDeviceAddressRegionKHR{};
-    return result;
+    // Groups keep their relative order inside each region, which is what
+    // instance hit offsets and callable indices address.
+    std::size_t record = 0;
+    const auto write_region = [&](const RayTracingGroups::Kind kind) {
+        const std::size_t first = record;
+        for (std::size_t i = 0; i < group_count; ++i) {
+            if (groups[i].kind != kind)
+                continue;
+            std::memcpy(static_cast<std::byte*>(result.shader_binding_table->mapped)
+                    + table_offset + record * stride,
+                handle_bytes.data() + i * handle_size, handle_size);
+            // A trace names exactly one raygen record, so each raygen is its
+            // own single-record region.
+            if (kind == RayTracingGroups::Kind::Raygen)
+                result.raygen_regions.emplace_back(groups[i].raygen, vk::StridedDeviceAddressRegionKHR{
+                    base + static_cast<vk::DeviceSize>(record) * stride, stride, stride});
+            ++record;
+        }
+        const std::size_t count = record - first;
+        return count ? vk::StridedDeviceAddressRegionKHR{
+            base + static_cast<vk::DeviceSize>(first) * stride, stride,
+            static_cast<vk::DeviceSize>(count) * stride} : vk::StridedDeviceAddressRegionKHR{};
+    };
+    write_region(RayTracingGroups::Kind::Raygen);
+    result.miss_region = write_region(RayTracingGroups::Kind::Miss);
+    result.hit_region = write_region(RayTracingGroups::Kind::Hit);
+    result.callable_region = write_region(RayTracingGroups::Kind::Callable);
+    vmaFlushAllocation(allocator_, result.shader_binding_table->allocation, 0,
+        result.shader_binding_table->size);
 }
 
 AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeometry> geometry) {
@@ -1542,8 +1789,9 @@ void DeviceImpl::upload(const std::shared_ptr<BufferImpl>& destination, const vo
 }
 
 void DeviceImpl::download(const std::shared_ptr<BufferImpl>& source, void* data,
-    const std::size_t bytes) {
-    if (!source || source->device.get() != this || !data || bytes > source->size)
+    const std::size_t bytes, const std::size_t source_offset) {
+    if (!source || source->device.get() != this || !data
+        || source_offset > source->size || bytes > source->size - source_offset)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU download range");
     if (!bytes) return;
     if (frame_command_)
@@ -1551,7 +1799,8 @@ void DeviceImpl::download(const std::shared_ptr<BufferImpl>& source, void* data,
     auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferDst,
         VMA_MEMORY_USAGE_GPU_TO_CPU, true);
     const auto token = submit([=](vk::CommandBuffer command) {
-        command.copyBuffer(source->buffer, staging->buffer, vk::BufferCopy(0, 0, bytes));
+        command.copyBuffer(source->buffer, staging->buffer,
+            vk::BufferCopy(source_offset, 0, bytes));
     }, {source, staging});
     wait(token);
     if (vmaInvalidateAllocation(allocator_, staging->allocation, 0, bytes) != VK_SUCCESS)
@@ -1694,8 +1943,9 @@ void upload_buffer(const std::shared_ptr<BufferImpl>& destination, const void* d
     destination->device->upload(destination, data, bytes, offset);
 }
 
-void download_buffer(const std::shared_ptr<BufferImpl>& source, void* data, const std::size_t bytes) {
-    source->device->download(source, data, bytes);
+void download_buffer(const std::shared_ptr<BufferImpl>& source, void* data, const std::size_t bytes,
+    const std::size_t offset) {
+    source->device->download(source, data, bytes, offset);
 }
 
 std::uint64_t buffer_address(const std::shared_ptr<BufferImpl>& buffer) {
@@ -1750,8 +2000,19 @@ ComputePipeline Device::compute(const Shader& shader) {
 GraphicsPipeline Device::graphics(const GraphicsPipelineDesc& desc) {
     return GraphicsPipeline(impl_->create_graphics(desc));
 }
-RayTracingPipeline Device::ray_tracing(const RayTracingPipelineDesc& desc) {
-    return RayTracingPipeline(impl_->create_ray_tracing(desc));
+void Device::save_pipeline_cache() {
+    impl_->save_pipeline_cache();
+}
+RayTracingLibrary Device::ray_tracing_library(const RayTracingPipelineDesc& desc,
+    const RayTracingInterface& interface) {
+    return RayTracingLibrary(impl_->create_ray_tracing_library(desc, interface));
+}
+RayTracingPipeline Device::ray_tracing(const std::span<const RayTracingLibrary> libraries) {
+    std::vector<std::shared_ptr<detail::RayTracingLibraryImpl>> impls;
+    impls.reserve(libraries.size());
+    for (const RayTracingLibrary& library : libraries)
+        impls.push_back(library.impl_);
+    return RayTracingPipeline(impl_->link_ray_tracing(impls));
 }
 AccelerationStructure Device::build_blas(const std::span<const TriangleGeometry> geometry) {
     return impl_->build_blas(geometry);
@@ -1772,6 +2033,35 @@ Sampler Device::sampler(const SamplerDesc& desc) {
 }
 void Device::barrier(const Stage source, const Stage destination) { impl_->barrier(source, destination); }
 GpuToken Device::signal() { return impl_->signal(); }
+
+StagedArguments Device::stage_bytes(const void* args, const std::size_t size) {
+    std::uint64_t id = 0;
+    const vk::DeviceAddress address = impl_->stage_held(args, size, id);
+    return StagedArguments(impl_, id, address);
+}
+
+StagedArguments::StagedArguments(StagedArguments&& other) noexcept
+    : device_(std::move(other.device_)), id_(std::exchange(other.id_, 0))
+    , address_(std::exchange(other.address_, 0)) {}
+
+StagedArguments& StagedArguments::operator=(StagedArguments&& other) noexcept {
+    if (this != &other) {
+        release();
+        device_ = std::move(other.device_);
+        id_ = std::exchange(other.id_, 0);
+        address_ = std::exchange(other.address_, 0);
+    }
+    return *this;
+}
+
+StagedArguments::~StagedArguments() { release(); }
+
+void StagedArguments::release() noexcept {
+    if (device_ && id_ != 0)
+        device_->release_staged(id_);
+    device_.reset();
+    id_ = 0;
+}
 void Device::wait(const GpuToken token) { impl_->wait(token); }
 void Device::synchronize() { impl_->synchronize(); }
 void Device::render(const RenderTarget& target, const std::function<void()>& draw_commands) {
@@ -1788,21 +2078,6 @@ void Device::measure(const TimestampQuery& query, const std::function<void()>& c
         throw Error(ErrorCode::InvalidResource, "timestamp query is empty");
     impl_->measure(query.impl_, commands);
 }
-Swapchain Device::swapchain() { return swapchain(ImageFormat::Auto); }
-Swapchain Device::swapchain(const ImageFormat preferred) {
-    return Swapchain(impl_->create_swapchain(preferred));
-}
-Frame Device::begin_frame(Swapchain& swapchain) {
-    if (!swapchain)
-        throw Error(ErrorCode::InvalidResource, "swapchain is empty");
-    return Frame(impl_->begin_frame(swapchain.impl_));
-}
-void Device::end_frame(Frame&& frame) {
-    if (!frame.impl_)
-        throw Error(ErrorCode::InvalidResource, "cannot present an unacquired frame");
-    impl_->end_frame(*frame.impl_);
-}
-
 double TimestampQuery::milliseconds() const {
     if (!impl_ || !impl_->device)
         return 0.0;
@@ -1823,6 +2098,7 @@ void ComputePipeline::launch_indirect_bytes(const GpuPtr<DispatchArgs> groups,
 }
 
 void detail::DeviceImpl::record_ray_tracing(const detail::RayTracingPipelineImpl& pipeline,
+    const vk::StridedDeviceAddressRegionKHR& raygen,
     const vk::CommandBuffer command, const DispatchSize groups,
     const void* args, const std::size_t size) {
     if (!pipeline.pipeline || !args || size == 0
@@ -1844,24 +2120,31 @@ void detail::DeviceImpl::record_ray_tracing(const detail::RayTracingPipelineImpl
     command.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *pipeline.pipeline);
     bind_heaps(command);
     push_root(command, root);
-    command.traceRaysKHR(pipeline.raygen_region, pipeline.miss_region,
-        pipeline.hit_region, {}, groups.x, groups.y, groups.z);
+    command.traceRaysKHR(raygen, pipeline.miss_region,
+        pipeline.hit_region, pipeline.callable_region, groups.x, groups.y, groups.z);
 }
 
-void detail::RayTracingPipelineImpl::trace(const DispatchSize groups, const void* args,
-    const std::size_t size) const {
+void detail::RayTracingPipelineImpl::trace(const ShaderImpl& raygen, const DispatchSize groups,
+    const void* args, const std::size_t size) const {
     if (!device || !pipeline || !args || size == 0 || groups.x == 0 || groups.y == 0 || groups.z == 0)
         throw Error(ErrorCode::InvalidArgument, "invalid ray-tracing dispatch");
+    const auto found = std::ranges::find(raygen_regions, &raygen,
+        &std::pair<const ShaderImpl*, vk::StridedDeviceAddressRegionKHR>::first);
+    if (found == raygen_regions.end())
+        throw Error(ErrorCode::InvalidArgument, "shader is not a ray-generation shader of this pipeline");
     auto self = const_cast<RayTracingPipelineImpl*>(this)->shared_from_this();
-    device->submit([self, groups, args, size](const vk::CommandBuffer command) {
-        self->device->record_ray_tracing(*self, command, groups, args, size);
+    device->submit([self, region = found->second, groups, args, size](const vk::CommandBuffer command) {
+        self->device->record_ray_tracing(*self, region, command, groups, args, size);
     }, std::vector<std::shared_ptr<void>>{self, shader_binding_table});
 }
 
-void RayTracingPipeline::trace_bytes(const DispatchSize size, const void* args, const std::size_t bytes) const {
+void RayTracingPipeline::trace_bytes(const Shader& raygen, const DispatchSize size,
+    const void* args, const std::size_t bytes) const {
     if (!impl_)
         throw Error(ErrorCode::InvalidResource, "ray-tracing pipeline is empty");
-    impl_->trace(size, args, bytes);
+    if (!raygen.impl_)
+        throw Error(ErrorCode::InvalidResource, "ray-generation shader is empty");
+    impl_->trace(*raygen.impl_, size, args, bytes);
 }
 
 AccelerationStructureHandle AccelerationStructure::handle() const noexcept {
@@ -1883,6 +2166,23 @@ DeviceHandles device_handles(Device& device) {
     if (!device.impl_)
         throw Error(ErrorCode::InvalidResource, "cannot read handles from an empty noorrhi::Device");
     return device.impl_->native_handles();
+}
+
+void record(Device& device, const std::function<void(std::uintptr_t)>& commands) {
+    if (!device.impl_)
+        throw Error(ErrorCode::InvalidResource, "cannot record through an empty noorrhi::Device");
+    if (!commands)
+        throw Error(ErrorCode::InvalidArgument, "native command recording requires a callback");
+    device.impl_->record_native(commands);
+}
+
+std::uintptr_t image(Device& device, const ImageHandle handle) {
+    if (!device.impl_)
+        throw Error(ErrorCode::InvalidResource, "cannot inspect through an empty noorrhi::Device");
+    const auto found = device.impl_->find_image(handle);
+    if (!found)
+        throw Error(ErrorCode::InvalidResource, "GPU image handle is not live");
+    return reinterpret_cast<std::uintptr_t>(static_cast<VkImage>(found->image));
 }
 
 std::uintptr_t image_view(Device& device, const ImageHandle handle) {
