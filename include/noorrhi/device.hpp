@@ -171,8 +171,12 @@ public:
         const RayTracingInterface& interface);
     // Links the libraries into one pipeline. Each shader binding table region
     // lists its groups library by library, in the order given, so a callable's
-    // index counts the callables of every library before its own.
-    RayTracingPipeline ray_tracing(std::span<const RayTracingLibrary> libraries);
+    // index counts the callables of every library before its own. The hit
+    // region is `hit_groups` instead: record i invokes the hit group with that
+    // index, counted the same way, so one group may back many records - an
+    // instance's hit offset and a geometry's index select among them.
+    RayTracingPipeline ray_tracing(std::span<const RayTracingLibrary> libraries,
+        std::span<const std::uint32_t> hit_groups);
     // Writes every pipeline compiled so far to DeviceConfig::pipeline_cache_file.
     // Does nothing when no file was configured.
     void save_pipeline_cache();

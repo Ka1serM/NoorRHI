@@ -446,13 +446,16 @@ public:
     std::shared_ptr<RayTracingLibraryImpl> create_ray_tracing_library(
         const RayTracingPipelineDesc&, const RayTracingInterface&);
     std::shared_ptr<RayTracingPipelineImpl> link_ray_tracing(
-        std::span<const std::shared_ptr<RayTracingLibraryImpl>>);
+        std::span<const std::shared_ptr<RayTracingLibraryImpl>>,
+        std::span<const std::uint32_t> hit_groups);
     RayTracingGroups ray_tracing_groups(const RayTracingPipelineDesc&) const;
     void save_pipeline_cache();
     // Publishes the shader binding table of a created pipeline whose groups,
-    // in group-index order, are `groups`.
+    // in group-index order, are `groups`. The hit region holds one record per
+    // entry of `hit_groups`, each naming a hit group by its index among them.
     void build_shader_binding_table(RayTracingPipelineImpl&,
-        std::span<const RayTracingGroups::Group> groups);
+        std::span<const RayTracingGroups::Group> groups,
+        std::span<const std::uint32_t> hit_groups);
     AccelerationStructure build_blas(std::span<const TriangleGeometry>);
     AccelerationStructure build_tlas(std::span<const Instance>);
     void refit_blas(AccelerationStructure&);

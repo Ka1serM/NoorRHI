@@ -54,7 +54,7 @@ int main() {
 
         const auto shader = device.create_shader(read_shader(NOORRHI_RAYGEN_SHADER));
         const auto library = device.ray_tracing_library({{shader}, {}, {}, {}, {}}, {});
-        const auto pipeline = device.ray_tracing(std::span(&library, 1));
+        const auto pipeline = device.ray_tracing(std::span(&library, 1), {});
         auto output = device.buffer<std::uint32_t>(1);
         struct Args { noorrhi::GpuPtr<std::uint32_t> result_buffer; } args{output.ptr()};
         pipeline.trace(shader, {4, 3, 1}, args);

@@ -57,7 +57,10 @@ TEST_CASE("NoorRHI API traces rays against a built acceleration structure") {
     const std::array libraries{
         device.ray_tracing_library({{raygen}, {miss}, {}, {}, {}}, interface),
         device.ray_tracing_library({{}, {}, {closest_hit}, {}, {}}, interface)};
-    auto pipeline = device.ray_tracing(std::span<const noorrhi::RayTracingLibrary>(libraries));
+    // One record, for the only instance's only geometry.
+    const std::array<std::uint32_t, 1> hit_groups{0};
+    auto pipeline = device.ray_tracing(std::span<const noorrhi::RayTracingLibrary>(libraries),
+        hit_groups);
 
     constexpr std::uint32_t width = 16;
     constexpr std::uint32_t height = 16;

@@ -1311,7 +1311,8 @@ std::shared_ptr<RayTracingLibraryImpl> DeviceImpl::create_ray_tracing_library(
 }
 
 std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::link_ray_tracing(
-    const std::span<const std::shared_ptr<RayTracingLibraryImpl>> libraries) {
+    const std::span<const std::shared_ptr<RayTracingLibraryImpl>> libraries,
+    const std::span<const std::uint32_t> hit_groups) {
     if (libraries.empty())
         throw Error(ErrorCode::InvalidArgument, "ray-tracing pipelines require at least one library");
     auto result = std::make_shared<RayTracingPipelineImpl>();
@@ -1350,12 +1351,13 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::link_ray_tracing(
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
-    build_shader_binding_table(*result, groups);
+    build_shader_binding_table(*result, groups, hit_groups);
     return result;
 }
 
 void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
-    const std::span<const RayTracingGroups::Group> groups) {
+    const std::span<const RayTracingGroups::Group> groups,
+    const std::span<const std::uint32_t> hit_groups) {
     const std::uint32_t handle_size = ray_tracing_properties_.shaderGroupHandleSize;
     const std::uint32_t alignment = std::max(ray_tracing_properties_.shaderGroupHandleAlignment, 1u);
     const std::uint32_t base_alignment = std::max(
@@ -1372,12 +1374,38 @@ void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
     if (vk_device().getRayTracingShaderGroupHandlesKHR(*result.pipeline, 0,
             static_cast<std::uint32_t>(group_count), handle_bytes.size(), handle_bytes.data()) != vk::Result::eSuccess)
         throw Error(ErrorCode::ShaderCreationFailed, "Vulkan shader binding table handle query failed");
+    // The records of each region, as group indices. Groups keep their
+    // relative order inside the raygen, miss and callable regions, which is
+    // what callable indices address; the hit region is the caller's table.
+    const auto groups_of = [&](const RayTracingGroups::Kind kind) {
+        std::vector<std::size_t> result;
+        for (std::size_t i = 0; i < group_count; ++i)
+            if (groups[i].kind == kind)
+                result.push_back(i);
+        return result;
+    };
+    const std::vector<std::size_t> raygen_records = groups_of(RayTracingGroups::Kind::Raygen);
+    const std::vector<std::size_t> miss_records = groups_of(RayTracingGroups::Kind::Miss);
+    const std::vector<std::size_t> hit_group_indices = groups_of(RayTracingGroups::Kind::Hit);
+    const std::vector<std::size_t> callable_records = groups_of(RayTracingGroups::Kind::Callable);
+    std::vector<std::size_t> hit_records;
+    hit_records.reserve(hit_groups.size());
+    for (const std::uint32_t hit_group : hit_groups) {
+        if (hit_group >= hit_group_indices.size())
+            throw Error(ErrorCode::InvalidArgument,
+                "shader binding table names hit group " + std::to_string(hit_group)
+                    + " of a pipeline with " + std::to_string(hit_group_indices.size()));
+        hit_records.push_back(hit_group_indices[hit_group]);
+    }
+    const std::size_t record_count = raygen_records.size() + miss_records.size()
+        + hit_records.size() + callable_records.size();
+
     // VMA does not promise that a storage allocation's device address is
     // aligned to shaderGroupBaseAlignment. Reserve a prefix and publish an
     // aligned address inside the allocation; using the raw allocation base
     // makes vkCmdTraceRaysKHR reject the miss/hit regions (and some drivers
     // report the resulting device loss only at queue submission time).
-    result.shader_binding_table = create_buffer(group_count * stride + base_alignment,
+    result.shader_binding_table = create_buffer(record_count * stride + base_alignment,
         vk::BufferUsageFlagBits::eShaderBindingTableKHR
             | vk::BufferUsageFlagBits::eShaderDeviceAddress,
         VMA_MEMORY_USAGE_CPU_TO_GPU, true);
@@ -1387,21 +1415,17 @@ void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
     const std::size_t table_offset = static_cast<std::size_t>(
         base - result.shader_binding_table->address);
 
-    // Groups keep their relative order inside each region, which is what
-    // instance hit offsets and callable indices address.
     std::size_t record = 0;
-    const auto write_region = [&](const RayTracingGroups::Kind kind) {
+    const auto write_region = [&](const std::span<const std::size_t> group_indices) {
         const std::size_t first = record;
-        for (std::size_t i = 0; i < group_count; ++i) {
-            if (groups[i].kind != kind)
-                continue;
+        for (const std::size_t group : group_indices) {
             std::memcpy(static_cast<std::byte*>(result.shader_binding_table->mapped)
                     + table_offset + record * stride,
-                handle_bytes.data() + i * handle_size, handle_size);
+                handle_bytes.data() + group * handle_size, handle_size);
             // A trace names exactly one raygen record, so each raygen is its
             // own single-record region.
-            if (kind == RayTracingGroups::Kind::Raygen)
-                result.raygen_regions.emplace_back(groups[i].raygen, vk::StridedDeviceAddressRegionKHR{
+            if (groups[group].kind == RayTracingGroups::Kind::Raygen)
+                result.raygen_regions.emplace_back(groups[group].raygen, vk::StridedDeviceAddressRegionKHR{
                     base + static_cast<vk::DeviceSize>(record) * stride, stride, stride});
             ++record;
         }
@@ -1410,10 +1434,10 @@ void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
             base + static_cast<vk::DeviceSize>(first) * stride, stride,
             static_cast<vk::DeviceSize>(count) * stride} : vk::StridedDeviceAddressRegionKHR{};
     };
-    write_region(RayTracingGroups::Kind::Raygen);
-    result.miss_region = write_region(RayTracingGroups::Kind::Miss);
-    result.hit_region = write_region(RayTracingGroups::Kind::Hit);
-    result.callable_region = write_region(RayTracingGroups::Kind::Callable);
+    write_region(raygen_records);
+    result.miss_region = write_region(miss_records);
+    result.hit_region = write_region(hit_records);
+    result.callable_region = write_region(callable_records);
     vmaFlushAllocation(allocator_, result.shader_binding_table->allocation, 0,
         result.shader_binding_table->size);
 }
@@ -1487,10 +1511,9 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
         ranges.reserve(primitive_counts.size());
         for (const auto count : primitive_counts)
             ranges.emplace_back(count, 0, 0, 0);
-        std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_ptrs{ranges.size()};
-        for (std::size_t i = 0; i < ranges.size(); ++i)
-            range_ptrs[i] = &ranges[i];
-        command.buildAccelerationStructuresKHR(build_info, range_ptrs);
+        // One pointer per build, to that build's range for each of its geometries.
+        const vk::AccelerationStructureBuildRangeInfoKHR* geometry_ranges = ranges.data();
+        command.buildAccelerationStructuresKHR(build_info, geometry_ranges);
         const vk::MemoryBarrier2 ready{
             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
             vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -1670,10 +1693,9 @@ void DeviceImpl::refit_blas(AccelerationStructure& blas) {
         ranges.reserve(primitive_counts.size());
         for (const auto count : primitive_counts)
             ranges.emplace_back(count, 0, 0, 0);
-        std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_ptrs{ranges.size()};
-        for (std::size_t i = 0; i < ranges.size(); ++i)
-            range_ptrs[i] = &ranges[i];
-        command.buildAccelerationStructuresKHR(build_info, range_ptrs);
+        // One pointer per build, to that build's range for each of its geometries.
+        const vk::AccelerationStructureBuildRangeInfoKHR* geometry_ranges = ranges.data();
+        command.buildAccelerationStructuresKHR(build_info, geometry_ranges);
         const vk::MemoryBarrier2 ready{
             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
             vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -2007,12 +2029,13 @@ RayTracingLibrary Device::ray_tracing_library(const RayTracingPipelineDesc& desc
     const RayTracingInterface& interface) {
     return RayTracingLibrary(impl_->create_ray_tracing_library(desc, interface));
 }
-RayTracingPipeline Device::ray_tracing(const std::span<const RayTracingLibrary> libraries) {
+RayTracingPipeline Device::ray_tracing(const std::span<const RayTracingLibrary> libraries,
+    const std::span<const std::uint32_t> hit_groups) {
     std::vector<std::shared_ptr<detail::RayTracingLibraryImpl>> impls;
     impls.reserve(libraries.size());
     for (const RayTracingLibrary& library : libraries)
         impls.push_back(library.impl_);
-    return RayTracingPipeline(impl_->link_ray_tracing(impls));
+    return RayTracingPipeline(impl_->link_ray_tracing(impls, hit_groups));
 }
 AccelerationStructure Device::build_blas(const std::span<const TriangleGeometry> geometry) {
     return impl_->build_blas(geometry);
