@@ -61,6 +61,8 @@ add_library(NoorRHI STATIC
     src/swapchain.cpp
     src/image.cpp
     src/vma_impl.cpp
+    src/pipeline_cache_file.cpp
+    src/pipeline_store.cpp
     src/internal.hpp)
 add_library(NoorRHI::NoorRHI ALIAS NoorRHI)
 

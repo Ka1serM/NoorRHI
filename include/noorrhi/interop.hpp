@@ -29,8 +29,13 @@ struct DeviceHandles {
     std::uintptr_t instance = 0;         // VkInstance
     std::uintptr_t physical_device = 0;  // VkPhysicalDevice
     std::uintptr_t device = 0;           // VkDevice
-    std::uintptr_t queue = 0;            // VkQueue
+    // The Queue::Graphics VkQueue, shared with the device: a library that
+    // submits to it serializes those submissions with the device's calls.
+    std::uintptr_t queue = 0;
     std::uint32_t queue_family = 0;
+    // The VkPipelineCache the device persists across runs, or null when it
+    // keeps none; libraries creating pipelines pass it to the driver.
+    std::uintptr_t pipeline_cache = 0;
 };
 
 // A duplicated POSIX FD for an image allocation created with
@@ -64,7 +69,7 @@ std::uintptr_t command_buffer(const Frame& frame);
 
 // Records native Vulkan commands in the device's command stream: into the
 // open frame's command buffer, or into a submission of its own when no frame
-// is open, with the same ordering barriers as every other operation. The
+// is open, ordered against all work recorded before and after it. The
 // callback receives the VkCommandBuffer; it must leave no pipeline state the
 // library relies on (the library rebinds its own pipelines and heaps) and must
 // not call back into the Device. Resources the commands use must outlive their

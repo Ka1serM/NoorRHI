@@ -23,6 +23,9 @@ enum class ImageFormat {
     // encoding. Block-compressed formats are 4x4-texel blocks; their upload
     // spans must hold whole blocks.
     R8Unorm,
+    // One channel, sampled as (L, L, L, 1).
+    L8Unorm,
+    L8Srgb,
     Rg8Unorm,
     Rgba8Srgb,
     Bgra8Srgb,
@@ -108,7 +111,7 @@ private:
 
 namespace noorrhi::detail {
 std::shared_ptr<ImageImpl> make_image(const std::shared_ptr<DeviceImpl>&, std::uint32_t,
-                                      std::uint32_t, ImageUsage, ImageFormat);
+                                      std::uint32_t, ImageUsage, ImageFormat, std::uint32_t);
 std::uint32_t image_sampled_handle(const std::shared_ptr<ImageImpl>&);
 std::uint32_t image_storage_handle(const std::shared_ptr<ImageImpl>&);
 void upload_image(const std::shared_ptr<ImageImpl>&, const void*, std::size_t);
@@ -127,7 +130,7 @@ Image<T> Device::image(const std::uint32_t width, const std::uint32_t height,
 
 template<class T>
 Image<T> Device::image(const std::uint32_t width, const std::uint32_t height,
-    const ImageUsage usage, const ImageFormat format) {
+    const ImageUsage usage, const ImageFormat format, const std::uint32_t mip_levels) {
     if (width == 0 || height == 0)
         throw Error(ErrorCode::InvalidArgument, "noorrhi::Device::image requires non-zero dimensions");
     const ImageFormat actual_format = format == ImageFormat::Auto
@@ -135,7 +138,7 @@ Image<T> Device::image(const std::uint32_t width, const std::uint32_t height,
             & static_cast<std::uint32_t>(ImageUsage::DepthAttachment))
             ? ImageFormat::D32Float : ImageFormat::Rgba8Unorm)
         : format;
-    return Image<T>(detail::make_image(impl_, width, height, usage, actual_format),
+    return Image<T>(detail::make_image(impl_, width, height, usage, actual_format, mip_levels),
         width, height, actual_format);
 }
 
@@ -160,7 +163,7 @@ void Image<T>::upload(const std::span<const T> data) {
         throw Error(ErrorCode::InvalidResource, "cannot upload to an empty noorrhi::Image");
     if (data.size_bytes() != detail::image_byte_size(impl_))
         throw Error(ErrorCode::InvalidArgument,
-            "image upload must cover exactly one full mip level");
+            "image upload must cover exactly every mip level");
     detail::upload_image(impl_, data.data(), data.size_bytes());
 }
 

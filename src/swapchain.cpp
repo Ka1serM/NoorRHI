@@ -5,14 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <thread>
 
 namespace noorrhi {
 namespace detail {
 namespace {
 
 // Presentation images live in GENERAL like every other image this library
-// owns; VK_KHR_unified_image_layouts is mandatory, so a render pass, a blit
-// and a compute write all accept it. Only the handoff to the presentation
+// owns, which a render pass, a blit and a compute write all accept. Only the handoff to the presentation
 // engine needs a specific layout, and that transition is what this helper
 // exists for.
 void transition(const vk::CommandBuffer command, const vk::Image image,
@@ -156,6 +156,7 @@ std::shared_ptr<ImageImpl> DeviceImpl::wrap_presentation_image(const vk::Image i
     result->allocation = VK_NULL_HANDLE;
     result->owns_image = false;
     result->format = format;
+    result->public_format = public_format;
     result->aspect = vk::ImageAspectFlagBits::eColor;
     result->width = width;
     result->height = height;
@@ -286,7 +287,7 @@ std::shared_ptr<SwapchainImpl> DeviceImpl::create_swapchain(SurfaceProvider& pro
     surface->surface = vk::UniqueSurfaceKHR(vk::SurfaceKHR(reinterpret_cast<VkSurfaceKHR>(raw)),
         vk::detail::ObjectDestroy<vk::Instance, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>(vk_instance()));
     // Every frame is submitted and presented on the device's one queue.
-    if (!physical_device_.getSurfaceSupportKHR(queue_family_, surface->surface.get()))
+    if (!physical_device_.getSurfaceSupportKHR(queue_state(Queue::Graphics).family, surface->surface.get()))
         throw Error(ErrorCode::UnsupportedFeature,
             "the device's queue cannot present to this surface");
 
@@ -303,18 +304,20 @@ std::shared_ptr<SwapchainImpl> DeviceImpl::create_swapchain(SurfaceProvider& pro
     return chain;
 }
 
-void DeviceImpl::wait_frame_slot(SwapchainImpl& chain) {
+bool DeviceImpl::wait_frame_slot(SwapchainImpl& chain, const bool block) {
     for (;;) {
         std::uint64_t oldest = 0;
         {
             std::lock_guard lock(mutex_);
             if (shut_down_)
                 throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
-            const std::uint64_t completed = vk_device().getSemaphoreCounterValue(timeline_.get());
+            const std::uint64_t completed = completed_value(Queue::Graphics);
             while (!chain.in_flight.empty() && chain.in_flight.front().value <= completed)
                 chain.in_flight.pop_front();
             if (chain.in_flight.size() < chain.max_frames_in_flight)
-                return;
+                return true;
+            if (!block)
+                return false;
             oldest = chain.in_flight.front().value;
         }
         wait({oldest});
@@ -322,17 +325,19 @@ void DeviceImpl::wait_frame_slot(SwapchainImpl& chain) {
 }
 
 std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
-    const std::shared_ptr<SwapchainImpl>& chain) {
+    const std::shared_ptr<SwapchainImpl>& chain, const bool wait_for_slot) {
     if (!chain)
         throw Error(ErrorCode::InvalidArgument, "begin_frame requires a valid Swapchain");
     // Pace before acquiring. With one frame in flight the CPU never queues
     // work behind a busy GPU, which is where input latency would accumulate.
-    wait_frame_slot(*chain);
+    if (!wait_frame_slot(*chain, wait_for_slot))
+        return {};
     std::lock_guard lock(mutex_);
     if (shut_down_)
         throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
-    if (frame_command_)
-        throw Error(ErrorCode::InvalidState, "a frame is already open on this device");
+    QueueState& graphics = queue_state(Queue::Graphics);
+    if (graphics.recording)
+        throw Error(ErrorCode::InvalidState, "a frame or Recording is already open on Queue::Graphics");
     reap_completed();
 
     const bool size_changed = chain->width != chain->provider->width()
@@ -350,15 +355,17 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
     // waited on it has started. Frame pacing normally guarantees that already.
     const auto& slot = chain->acquire_semaphores[semaphore_index];
     if (slot.token.value) {
-        const vk::Semaphore semaphore = timeline_.get();
+        const vk::Semaphore semaphore = graphics.timeline.get();
         const vk::SemaphoreWaitInfo wait_info({}, semaphore, slot.token.value);
         if (vk_device().waitSemaphores(wait_info, UINT64_MAX) != vk::Result::eSuccess)
             throw Error(ErrorCode::DeviceLost, "swapchain acquire semaphore wait failed");
     }
     std::uint32_t image_index = 0;
     const vk::Result acquired = vk_device().acquireNextImageKHR(chain->swapchain.get(),
-        std::numeric_limits<std::uint64_t>::max(),
+        wait_for_slot ? std::numeric_limits<std::uint64_t>::max() : 0,
         chain->acquire_semaphores[semaphore_index].semaphore.get(), {}, &image_index);
+    if (!wait_for_slot && (acquired == vk::Result::eTimeout || acquired == vk::Result::eNotReady))
+        return {};
     if (acquired == vk::Result::eErrorOutOfDateKHR) {
         chain->stale = true;
         return {};
@@ -370,16 +377,11 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
     if (acquired == vk::Result::eSuboptimalKHR)
         chain->stale = true;
 
-    auto commands = vk_device().allocateCommandBuffersUnique(
-        {*command_pool_, vk::CommandBufferLevel::ePrimary, 1});
-    if (commands.empty())
-        throw Error(ErrorCode::OutOfMemory, "Vulkan command-buffer allocation failed");
-
+    CommandPool& pool = thread_command_pool(Queue::Graphics);
     auto state = std::make_shared<Frame::State>();
     state->device = self_.lock();
     state->swapchain = chain;
-    state->owned_command = std::move(commands.front());
-    state->command = state->owned_command.get();
+    state->command = allocate_command(pool);
     state->image_index = image_index;
     state->semaphore_index = semaphore_index;
     state->target = chain->images[image_index]->handle;
@@ -390,54 +392,47 @@ std::shared_ptr<Frame::State> DeviceImpl::begin_frame(
         chain->presented[image_index] ? vk::ImageLayout::ePresentSrcKHR
                                       : vk::ImageLayout::eUndefined,
         vk::ImageLayout::eGeneral);
+    // Work inside the frame is ordered explicitly, so order it once against
+    // everything submitted before the frame.
+    record_full_barrier(state->command);
 
-    frame_command_ = state->command;
-    frame_token_ = GpuToken{next_timeline_};
-    frame_resources_.clear();
+    graphics.recording = state->command;
+    graphics.recording_pool = &pool;
+    graphics.recording_value = graphics.next_timeline.load();
+    graphics.recording_thread = std::this_thread::get_id();
+    graphics.recording_resources.clear();
     return state;
 }
 
 void DeviceImpl::end_frame(Frame::State& state) {
     std::lock_guard lock(mutex_);
-    if (!state.open || !frame_command_ || frame_command_ != state.command)
+    QueueState& graphics = queue_state(Queue::Graphics);
+    if (!state.open || graphics.recording != state.command)
         throw Error(ErrorCode::InvalidState, "present called without a matching begin_frame");
     SwapchainImpl& chain = *state.swapchain;
 
+    // Publishes the frame's explicitly ordered work to later submissions.
+    record_full_barrier(state.command);
     transition(state.command, chain.images[state.image_index]->image,
         vk::ImageLayout::eGeneral, vk::ImageLayout::ePresentSrcKHR);
     state.command.end();
 
-    const GpuToken token{next_timeline_};
-    const vk::Semaphore acquire = chain.acquire_semaphores[state.semaphore_index].semaphore.get();
+    const GpuToken token{graphics.recording_value, Queue::Graphics};
     const vk::Semaphore presented = chain.present_semaphores[state.image_index].get();
-    const std::array signal_semaphores{timeline_.get(), presented};
-    // Only the timeline entry carries a value; the binary semaphore's slot is
-    // ignored but must still be present for the arrays to line up.
-    const std::array<std::uint64_t, 2> signal_values{token.value, 0};
-    constexpr vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
-
-    vk::TimelineSemaphoreSubmitInfo timeline_info{};
-    timeline_info.setSignalSemaphoreValues(signal_values);
-    vk::SubmitInfo submit_info{};
-    submit_info.setCommandBuffers(state.command)
-        .setWaitSemaphores(acquire)
-        .setWaitDstStageMask(wait_stage)
-        .setSignalSemaphores(signal_semaphores);
-    submit_info.pNext = &timeline_info;
-    pending_.push_back({token, std::move(state.owned_command), std::move(frame_resources_)});
-    try {
-        queue_.submit(submit_info);
-    } catch (...) {
-        state.owned_command = std::move(pending_.back().command);
-        frame_resources_ = std::move(pending_.back().resources);
-        pending_.pop_back();
-        throw;
-    }
-    ++next_timeline_;
+    // The binary acquire semaphore goes first, with an ignored value, ahead of
+    // the timeline waits queue_wait() asked for.
+    QueueWaits acquire;
+    acquire.semaphores.push_back(chain.acquire_semaphores[state.semaphore_index].semaphore.get());
+    acquire.values.push_back(0);
+    acquire.stages.push_back(vk::PipelineStageFlagBits::eAllCommands);
+    submit_command(graphics, token, state.command, graphics.recording_pool,
+        std::move(graphics.recording_resources), acquire, std::span(&presented, 1));
+    graphics.recording = nullptr;
+    graphics.recording_pool = nullptr;
+    graphics.recording_value = 0;
+    graphics.recording_resources.clear();
     chain.acquire_semaphores[state.semaphore_index].token = token;
     chain.in_flight.push_back(token);
-    frame_resources_.clear();
-    frame_command_ = nullptr;
     state.open = false;
     state.command = nullptr;
     chain.presented[state.image_index] = true;
@@ -449,7 +444,7 @@ void DeviceImpl::end_frame(Frame::State& state) {
     present_info.setWaitSemaphores(presented)
         .setSwapchains(raw_swapchain)
         .setPImageIndices(&state.image_index);
-    const vk::Result presented_result = queue_.presentKHR(&present_info);
+    const vk::Result presented_result = graphics.queue.presentKHR(&present_info);
     if (presented_result == vk::Result::eErrorOutOfDateKHR
         || presented_result == vk::Result::eSuboptimalKHR)
         chain.stale = true;
@@ -470,13 +465,19 @@ Swapchain::Swapchain(Device& device, SurfaceProvider& surface, const SwapchainDe
 void Swapchain::wait_until_ready() {
     if (!impl_)
         throw Error(ErrorCode::InvalidResource, "swapchain is empty");
-    impl_->device->wait_frame_slot(*impl_);
+    (void)impl_->device->wait_frame_slot(*impl_);
 }
 
 Frame Swapchain::begin_frame() {
     if (!impl_)
         throw Error(ErrorCode::InvalidResource, "swapchain is empty");
     return Frame(impl_->device->begin_frame(impl_));
+}
+
+Frame Swapchain::try_begin_frame() {
+    if (!impl_)
+        throw Error(ErrorCode::InvalidResource, "swapchain is empty");
+    return Frame(impl_->device->begin_frame(impl_, false));
 }
 
 void Swapchain::present(Frame&& frame) {

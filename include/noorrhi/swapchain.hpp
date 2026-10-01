@@ -120,6 +120,9 @@ public:
 
     // Acquires the next image and opens the frame's recording scope.
     Frame begin_frame();
+    // Like begin_frame(), but returns an empty frame instead of waiting when
+    // max_frames_in_flight has been reached.
+    Frame try_begin_frame();
     // Closes the frame, submits everything recorded into it, and queues the
     // image for presentation. The CPU does not wait for the GPU here.
     void present(Frame&& frame);

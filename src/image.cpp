@@ -4,7 +4,10 @@
 #include "internal.hpp"
 #include "noorrhi/interop.hpp"
 
+#include <algorithm>
+#include <bit>
 #include <cstring>
+#include <vector>
 
 namespace noorrhi::detail {
 
@@ -15,10 +18,16 @@ namespace noorrhi::detail {
 std::uint32_t DeviceImpl::write_image_descriptor(const ImageImpl& image,
     const vk::DescriptorType type) {
     const std::uint32_t slot = allocate_slot(texture_heap_);
+    const bool luminance = image.public_format == ImageFormat::L8Unorm
+        || image.public_format == ImageFormat::L8Srgb;
+    const vk::ComponentMapping components = luminance
+        ? vk::ComponentMapping{vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eR,
+              vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eOne}
+        : vk::ComponentMapping{};
     const vk::ImageViewUsageCreateInfo usage{type == vk::DescriptorType::eStorageImage
         ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled};
     const vk::ImageViewCreateInfo view({}, image.image, vk::ImageViewType::e2D,
-        image.format, {}, {image.aspect, 0, 1, 0, 1}, &usage);
+        image.format, components, {image.aspect, 0, image.mip_levels, 0, 1}, &usage);
     const vk::ImageDescriptorInfoEXT image_info{&view, vk::ImageLayout::eGeneral};
     const vk::ResourceDescriptorInfoEXT descriptor{type,
         vk::ResourceDescriptorDataEXT{&image_info}};
@@ -58,7 +67,8 @@ ImageImpl::~ImageImpl() {
 }
 
 std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
-    const std::uint32_t height, const ImageUsage usage, const ImageFormat requested_format) {
+    const std::uint32_t height, const ImageUsage usage, const ImageFormat requested_format,
+    const std::uint32_t mip_levels) {
     vk::ImageUsageFlags vulkan_usage = vk::ImageUsageFlagBits::eTransferSrc
         | vk::ImageUsageFlagBits::eTransferDst;
     const auto requested = static_cast<std::uint32_t>(usage);
@@ -67,6 +77,10 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
     };
     const bool depth = wants(ImageUsage::DepthAttachment);
     const bool external_memory = wants(ImageUsage::ExternalMemory);
+    if (mip_levels == 0 || (mip_levels > 1 && requested != static_cast<std::uint32_t>(ImageUsage::Sampled)))
+        throw Error(ErrorCode::InvalidArgument, "only sampled-only images have mip chains");
+    if (mip_levels > static_cast<std::uint32_t>(std::bit_width(std::max(width, height))))
+        throw Error(ErrorCode::InvalidArgument, "image has more mip levels than its extent allows");
     if (external_memory && !external_memory_fd_enabled_)
         throw Error(ErrorCode::UnsupportedFeature,
             "VK_KHR_external_memory_fd is unavailable on this Vulkan device");
@@ -93,7 +107,7 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
     vk::ExternalMemoryImageCreateInfo external_info{};
     external_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
     vk::ImageCreateInfo imageInfo({}, vk::ImageType::e2D, format,
-        {width, height, 1}, 1, 1, vk::SampleCountFlagBits::e1,
+        {width, height, 1}, mip_levels, 1, vk::SampleCountFlagBits::e1,
         vk::ImageTiling::eOptimal, vulkan_usage, vk::SharingMode::eExclusive, {},
         vk::ImageLayout::eUndefined);
     vk::Image image{};
@@ -141,10 +155,14 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
     result->external_memory = exported_memory;
     result->exportable = external_memory;
     result->format = format;
+    result->public_format = format_choice;
     result->aspect = aspect;
     result->width = width;
     result->height = height;
-    result->byte_size = format_byte_size(format_choice, width, height);
+    result->mip_levels = mip_levels;
+    for (std::uint32_t level = 0; level < mip_levels; ++level)
+        result->byte_size += format_byte_size(format_choice,
+            std::max(width >> level, 1u), std::max(height >> level, 1u));
     result->block_compressed = is_block_compressed(format_choice);
     // The identity handle names this image to render(), copy() and interop. It
     // is a weak host reference, deliberately unrelated to the heap indices
@@ -163,10 +181,10 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
     if (wants(ImageUsage::Sampled))
         result->sampled_handle = TextureHandle{
             write_image_descriptor(*result, vk::DescriptorType::eSampledImage)};
-    // Unified image layouts removes every transition between usages, but an
-    // image is still created in UNDEFINED and has to reach GENERAL once. This
-    // is the only layout transition left in the library.
-    submit([image = result->image, aspect](const vk::CommandBuffer command) {
+    // Every usage accepts GENERAL, so an image created in UNDEFINED only has
+    // to reach GENERAL once. This is the only layout transition in the
+    // library besides the presentation handoff.
+    submit([image = result->image, aspect, mip_levels](const vk::CommandBuffer command) {
         vk::ImageMemoryBarrier2 barrier{};
         barrier.setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
             .setSrcAccessMask(vk::AccessFlagBits2::eNone)
@@ -175,14 +193,14 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
             .setOldLayout(vk::ImageLayout::eUndefined)
             .setNewLayout(vk::ImageLayout::eGeneral)
             .setImage(image)
-            .setSubresourceRange({aspect, 0, 1, 0, 1});
+            .setSubresourceRange({aspect, 0, mip_levels, 0, 1});
         command.pipelineBarrier2({{}, {}, {}, barrier});
     }, {result});
     return result;
 }
 
 // Both transfer directions need the same memory dependency around the copy;
-// with unified image layouts that is all they need.
+// with every image in GENERAL that is all they need.
 void DeviceImpl::transfer_barrier(const vk::CommandBuffer command,
     const bool before) const {
     vk::MemoryBarrier2 barrier{};
@@ -206,25 +224,34 @@ void DeviceImpl::upload_image(const std::shared_ptr<ImageImpl>& image, const voi
     const std::size_t bytes) {
     if (!image || image->device.get() != this || !data || bytes != image->byte_size)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU image upload");
-    if (frame_command_)
+    if (recording_frame())
         throw Error(ErrorCode::InvalidState, "upload images before beginning a frame");
     auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferSrc,
         VMA_MEMORY_USAGE_CPU_TO_GPU, true);
     std::memcpy(staging->mapped, data, bytes);
     if (vmaFlushAllocation(allocator_, staging->allocation, 0, bytes) != VK_SUCCESS)
         throw Error(ErrorCode::DeviceLost, "flushing image upload failed");
+    std::vector<vk::BufferImageCopy> copies;
+    vk::DeviceSize offset = 0;
+    for (std::uint32_t level = 0; level < image->mip_levels; ++level) {
+        const std::uint32_t width = std::max(image->width >> level, 1u);
+        const std::uint32_t height = std::max(image->height >> level, 1u);
+        copies.emplace_back(offset, 0, 0, vk::ImageSubresourceLayers{image->aspect, level, 0, 1},
+            vk::Offset3D{0, 0, 0}, vk::Extent3D{width, height, 1});
+        offset += format_byte_size(image->public_format, width, height);
+    }
     submit([=](vk::CommandBuffer command) {
         command.copyBufferToImage(staging->buffer, image->image, vk::ImageLayout::eGeneral,
-            vk::BufferImageCopy(0, 0, 0, {image->aspect, 0, 0, 1}, {0, 0, 0},
-                {image->width, image->height, 1}));
+            copies);
     }, {staging, image});
 }
 
 void DeviceImpl::download_image(const std::shared_ptr<ImageImpl>& image, void* data,
     const std::size_t bytes) {
-    if (!image || image->device.get() != this || !data || bytes != image->byte_size)
+    if (!image || image->device.get() != this || !data || bytes != image->byte_size
+        || image->mip_levels != 1)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU image download");
-    if (frame_command_)
+    if (recording_frame())
         throw Error(ErrorCode::InvalidState, "read back images after ending a frame");
     auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferDst,
         VMA_MEMORY_USAGE_GPU_TO_CPU, true);
@@ -244,7 +271,7 @@ void DeviceImpl::download_image_region(const std::shared_ptr<ImageImpl>& image,
     const std::uint32_t height, void* data, const std::size_t bytes) {
     if (!image || image->device.get() != this || !data || width == 0 || height == 0
         || x >= image->width || y >= image->height
-        || width > image->width - x || height > image->height - y)
+        || width > image->width - x || height > image->height - y || image->mip_levels != 1)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU image region download");
     if (image->block_compressed)
         throw Error(ErrorCode::InvalidArgument, "block-compressed images have no texel regions");
@@ -253,7 +280,7 @@ void DeviceImpl::download_image_region(const std::shared_ptr<ImageImpl>& image,
     if (bytes != texel_bytes * width * height)
         throw Error(ErrorCode::InvalidArgument,
             "image region download must match the region's size exactly");
-    if (frame_command_)
+    if (recording_frame())
         throw Error(ErrorCode::InvalidState, "read back images after ending a frame");
     // Staging only holds the region, so a one-texel pick copies a few bytes.
     auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferDst,
@@ -272,8 +299,8 @@ void DeviceImpl::download_image_region(const std::shared_ptr<ImageImpl>& image,
 
 std::shared_ptr<ImageImpl> make_image(const std::shared_ptr<DeviceImpl>& device,
     const std::uint32_t width, const std::uint32_t height, const ImageUsage usage,
-    const ImageFormat format) {
-    return device->create_image(width, height, usage, format);
+    const ImageFormat format, const std::uint32_t mip_levels) {
+    return device->create_image(width, height, usage, format, mip_levels);
 }
 
 interop::ExternalImageMemory DeviceImpl::export_image_memory(const ImageHandle handle) {
@@ -297,10 +324,10 @@ interop::ExternalImageMemory DeviceImpl::export_image_memory(const ImageHandle h
 
 interop::ExternalSemaphore DeviceImpl::signal_external()
 {
-    std::lock_guard lock(mutex_);
-    if (frame_command_)
+    if (recording_frame())
         throw Error(ErrorCode::InvalidState,
             "external semaphore export requires a completed standalone submission");
+    std::lock_guard lock(mutex_);
     if (!external_semaphore_fd_enabled_)
         throw Error(ErrorCode::UnsupportedFeature,
             "VK_KHR_external_semaphore_fd is unavailable on this Vulkan device");
@@ -315,21 +342,22 @@ interop::ExternalSemaphore DeviceImpl::signal_external()
     // standalone dispatch.  GL_EXT_semaphore_fd consumes the FD and waits on
     // the same binary payload before accessing the shared allocation.
     vk::SubmitInfo submitInfo{};
-    const GpuToken token{next_timeline_};
-    const std::array signals{semaphore->get(), timeline_.get()};
+    QueueState& queue = queue_state(current_queue());
+    const GpuToken token{queue.next_timeline, current_queue()};
+    const std::array signals{semaphore->get(), queue.timeline.get()};
     const std::array<std::uint64_t, 2> values{0, token.value};
     vk::TimelineSemaphoreSubmitInfo timelineInfo{};
     timelineInfo.setSignalSemaphoreValues(values);
     submitInfo.setSignalSemaphores(signals);
     submitInfo.pNext = &timelineInfo;
-    pending_.push_back({token, {}, {semaphore}});
+    queue.pending.push_back({token, {}, nullptr, {semaphore}});
     try {
-        queue_.submit(submitInfo);
+        queue.queue.submit(submitInfo);
     } catch (...) {
-        pending_.pop_back();
+        queue.pending.pop_back();
         throw;
     }
-    ++next_timeline_;
+    ++queue.next_timeline;
     vk::SemaphoreGetFdInfoKHR fdInfo{};
     fdInfo.semaphore = semaphore->get();
     fdInfo.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;

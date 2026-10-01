@@ -96,7 +96,10 @@ std::shared_ptr<GraphicsPipelineImpl> DeviceImpl::create_graphics(const Graphics
         .setPDynamicState(&dynamic)
         .setPNext(&heap_flags);
     try {
-        result->pipeline = vk_device().createGraphicsPipelineUnique(*pipeline_cache_, info).value;
+        result->pipeline = create_pipeline<vk::GraphicsPipelineCreateInfo>(info, true,
+            [this](const vk::GraphicsPipelineCreateInfo& pipeline, vk::PipelineCache cache) {
+                return vk_device().createGraphicsPipelineUnique(cache, pipeline).value;
+            });
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }

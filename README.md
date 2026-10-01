@@ -159,8 +159,8 @@ external API to finish using exported objects before their owners are destroyed.
 
 ## Requirements and verification
 
-Vulkan 1.3 with buffer device addresses, timeline semaphores, synchronization2,
-dynamic rendering and unified image layouts is mandatory, as are
+Vulkan 1.3 with buffer device addresses, timeline semaphores, synchronization2
+and dynamic rendering is mandatory, as are
 `VK_EXT_descriptor_heap` (`descriptorHeap`), `VK_KHR_shader_untyped_pointers`
 (`shaderUntypedPointers`) and maintenance5 (core in 1.4, or the extension).
 Devices without them are skipped at selection. None of these is vendor-specific,

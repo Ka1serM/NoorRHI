@@ -26,10 +26,11 @@ struct TriangleGeometry {
     GpuPtr<float3> positions;
     GpuPtr<std::uint32_t> indices;
     std::uint32_t triangle_count = 0;
-    // Byte distance between consecutive positions.
-    std::uint32_t stride = sizeof(float3);
+    // Byte distance between consecutive positions; tightly packed by default.
+    std::uint32_t stride = 3 * sizeof(float);
     // Opaque geometry skips any-hit invocation. Gaussian proxy triangles set
     // this to false so their stochastic acceptance shader can reject hits.
+    // Non-opaque geometry invokes any-hit at most once per primitive and ray.
     bool opaque = true;
 };
 
@@ -70,6 +71,8 @@ static_assert(sizeof(InstanceRecord) == 64);
 // Matches VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR, which is
 // what the host-span overloads below apply to every instance they build.
 inline constexpr std::uint32_t InstanceFlagTriangleFacingCullDisable = 0x1u;
+// Matches VK_GEOMETRY_INSTANCE_TRIANGLE_FRONT_COUNTERCLOCKWISE_BIT_KHR.
+inline constexpr std::uint32_t InstanceFlagTriangleFrontCounterClockwise = 0x2u;
 
 struct Instance {
     AccelerationStructure blas{};
@@ -90,6 +93,8 @@ struct RayTracingPipelineDesc {
     std::vector<Shader> intersection;
     // Callable shaders, invoked by index with CallShader().
     std::vector<Shader> callable;
+    // Disable persistent pipeline binaries for libraries built from imported shaders.
+    bool use_pipeline_cache = true;
 };
 
 // What every stage of a pipeline built from libraries agrees on. Libraries

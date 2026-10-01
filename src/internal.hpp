@@ -12,8 +12,11 @@
 #include "noorrhi/swapchain.hpp"
 #include "noorrhi/raytracing.hpp"
 #include "noorrhi/sampler.hpp"
+#include "pipeline_cache_file.hpp"
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -22,8 +25,10 @@
 #include <memory>
 #include <span>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -35,21 +40,27 @@ struct TimestampQuery::State {
     std::shared_ptr<detail::DeviceImpl> device;
     // Two consecutive query-pool slots: begin and end.
     std::uint32_t first_query = ~0u;
+    // The queue the last measurement ran on, whose family sets the valid bits.
+    Queue queue = Queue::Graphics;
     double milliseconds = 0.0;
 };
 
-// A frame is an open recording scope. While `command` is set, DeviceImpl
-// batches every dispatch, trace and render scope into it rather than
-// submitting each one on its own.
+// A frame is the Graphics recording of the thread that began it, plus the
+// swapchain image it draws into and presents.
 struct Frame::State {
     std::shared_ptr<detail::DeviceImpl> device;
     std::shared_ptr<detail::SwapchainImpl> swapchain;
     vk::CommandBuffer command;
-    vk::UniqueCommandBuffer owned_command;
     std::uint32_t image_index = 0;
     std::uint32_t semaphore_index = 0;
     ImageHandle target{};
     bool open = false;
+};
+
+struct Recording::State {
+    std::shared_ptr<detail::DeviceImpl> device;
+    Queue queue = Queue::Graphics;
+    vk::CommandBuffer command;
 };
 
 } // namespace noorrhi
@@ -58,6 +69,10 @@ namespace noorrhi::detail {
 
 class DeviceImpl;
 struct SamplerImpl;
+
+// One value per queue timeline, indexed by Queue. Work is covered once every
+// queue has reached its value; a zero value covers nothing on that queue.
+using Timelines = std::array<std::uint64_t, queue_count>;
 
 
 // The library renders depth into a single format; RenderTarget depth images
@@ -80,6 +95,8 @@ inline FormatLayout format_layout(const ImageFormat format) {
     case ImageFormat::R32Float: return {vk::Format::eR32Sfloat, 1, 4};
     case ImageFormat::D32Float: return {depth_format, 1, 4};
     case ImageFormat::R8Unorm: return {vk::Format::eR8Unorm, 1, 1};
+    case ImageFormat::L8Unorm: return {vk::Format::eR8Unorm, 1, 1};
+    case ImageFormat::L8Srgb: return {vk::Format::eR8Srgb, 1, 1};
     case ImageFormat::Rg8Unorm: return {vk::Format::eR8G8Unorm, 1, 2};
     case ImageFormat::Rgba8Srgb: return {vk::Format::eR8G8B8A8Srgb, 1, 4};
     case ImageFormat::Bgra8Srgb: return {vk::Format::eB8G8R8A8Srgb, 1, 4};
@@ -157,11 +174,13 @@ struct ImageImpl {
     TextureHandle sampled_handle{};
     TextureHandle storage_handle{};
     vk::Format format = vk::Format::eR8G8B8A8Unorm;
+    ImageFormat public_format = ImageFormat::Rgba8Unorm;
     vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor;
     std::size_t byte_size = 0;
     bool block_compressed = false;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    std::uint32_t mip_levels = 1;
     // False for swapchain images: the presentation engine owns the VkImage and
     // there is no VMA allocation, but the view and descriptors are still ours.
     bool owns_image = true;
@@ -170,8 +189,6 @@ struct ImageImpl {
     ~ImageImpl();
 };
 
-// A sampler exists only as its encoded descriptor in the sampler heap; there is
-// no VkSampler object behind it.
 struct SamplerImpl {
     std::shared_ptr<DeviceImpl> device;
     SamplerHandle handle{};
@@ -263,6 +280,7 @@ struct RayTracingLibraryImpl {
     vk::UniquePipeline pipeline;
     RayTracingInterface interface;
     RayTracingGroups groups;
+    bool use_pipeline_cache = true;
 };
 
 class RayTracingPipelineImpl : public std::enable_shared_from_this<RayTracingPipelineImpl> {
@@ -270,7 +288,10 @@ public:
     std::shared_ptr<DeviceImpl> device;
     // Linked pipelines keep their libraries alive.
     std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries;
-    vk::UniquePipeline pipeline;
+    // Shared by every pipeline that only differs in its hit-group table.
+    std::shared_ptr<const vk::UniquePipeline> pipeline;
+    // What the linked libraries define, in pipeline order.
+    std::vector<RayTracingGroups::Group> groups;
     std::shared_ptr<BufferImpl> shader_binding_table;
     // One region per ray-generation shader, keyed by that shader.
     std::vector<std::pair<const ShaderImpl*, vk::StridedDeviceAddressRegionKHR>> raygen_regions;
@@ -337,12 +358,17 @@ public:
     void shutdown() noexcept;
     void initialize_resources();
     DeviceFeatures features() const noexcept { return features_; }
+    DeviceInfo info() const {
+        const auto properties = physical_device_.getProperties();
+        return {properties.deviceName.data(), properties.vendorID, properties.deviceID,
+            properties.driverVersion};
+    }
     bool acceleration_structure_supported() const noexcept { return acceleration_structure_supported_; }
 
     std::shared_ptr<BufferImpl> create_buffer(std::size_t size, vk::BufferUsageFlags usage,
                                                VmaMemoryUsage memory_usage, bool mapped, std::size_t alignment = 1);
     std::shared_ptr<ImageImpl> create_image(std::uint32_t width, std::uint32_t height,
-        ImageUsage usage, ImageFormat format);
+        ImageUsage usage, ImageFormat format, std::uint32_t mip_levels);
     std::shared_ptr<ShaderImpl> create_shader(std::span<const std::byte> spirv,
                                               std::string_view entry_point);
     std::shared_ptr<ComputePipelineImpl> create_compute(const Shader& shader);
@@ -361,14 +387,27 @@ public:
     void record_copy_image(vk::CommandBuffer, ImageImpl& source, ImageImpl& destination);
     void transfer_barrier(vk::CommandBuffer, bool before) const;
     void record_barrier(vk::CommandBuffer, Stage source, Stage destination) const;
+    static void record_full_barrier(vk::CommandBuffer);
     void barrier(Stage source, Stage destination);
     GpuToken signal();
     void wait(GpuToken token);
+    void queue_wait(GpuToken token);
+    bool finished(GpuToken token) const;
     void synchronize();
+
+    // The queue the calling thread submits to; see noorrhi::QueueScope.
+    Queue current_queue() const;
+    // Whether the calling thread's work is batched into a recording it opened.
+    bool recording_frame() const;
+    // Opens the calling thread's recording on its queue; see noorrhi::Recording.
+    std::shared_ptr<Recording::State> begin_recording();
+    GpuToken end_recording(Recording::State&);
+    void abandon_recording(Recording::State&);
+    void bind_queue(Queue queue) const;
+    void unbind_queue() const;
 
     vk::Device device() const noexcept { return vk_device(); }
     vk::PhysicalDevice physical_device() const noexcept { return physical_device_; }
-    vk::Queue queue() const noexcept { return queue_; }
     vk::DeviceAddress buffer_address(vk::Buffer buffer) const;
     std::shared_ptr<BufferImpl> find_buffer_resource(vk::DeviceAddress address) const;
     std::pair<vk::Buffer, vk::DeviceSize> find_buffer(vk::DeviceAddress address) const;
@@ -381,20 +420,14 @@ public:
     vk::DeviceAddress stage_held(const void* args, std::size_t size, std::uint64_t& id);
     void release_staged(std::uint64_t id) noexcept;
     MemoryReport memory_report() const;
-    // Root arguments are one 8-byte pointer delivered with vkCmdPushDataEXT;
-    // shaders read it through their [[vk::push_constant]] block.
+    // Root arguments are one 8-byte device address in a Vulkan push constant.
     void push_root(vk::CommandBuffer, vk::DeviceAddress root) const;
-    // Bind the resource and sampler heaps. Every launch calls this right before
-    // its push: legacy descriptor-set commands recorded into the same command
-    // buffer (the ImGui backend's, for one) invalidate heap bindings, so
-    // binding once per command buffer is not enough.
+    // Bind the global bindless descriptor set used by every pipeline.
     void bind_heaps(vk::CommandBuffer) const;
-    // Every pipeline is layout-free and reads descriptors from the heaps.
     static vk::PipelineCreateFlags2CreateInfo pipeline_heap_flags(const void* next = nullptr) {
         return vk::PipelineCreateFlags2CreateInfo{
             vk::PipelineCreateFlagBits2::eDescriptorHeapEXT, next};
     }
-    // Allocate a resource-heap slot and encode a view of `image` into it.
     std::uint32_t write_image_descriptor(const ImageImpl&, vk::DescriptorType);
     std::shared_ptr<ImageImpl> find_image(ImageHandle handle) const;
     void render(const RenderTarget&, const std::function<void()>&);
@@ -431,8 +464,8 @@ public:
     void retire_chain(SwapchainImpl&);
     // Blocks until the chain has fewer than max_frames_in_flight frames still
     // running on the GPU. Must be called without mutex_ held.
-    void wait_frame_slot(SwapchainImpl&);
-    std::shared_ptr<Frame::State> begin_frame(const std::shared_ptr<SwapchainImpl>&);
+    bool wait_frame_slot(SwapchainImpl&, bool block = true);
+    std::shared_ptr<Frame::State> begin_frame(const std::shared_ptr<SwapchainImpl>&, bool wait_for_slot = true);
     void end_frame(Frame::State&);
     // Discard a frame that was never ended: release its command buffer and
     // referenced resources without submitting or presenting.
@@ -442,14 +475,37 @@ public:
     interop::ExternalSemaphore signal_external();
     // interop::record: native commands batched like any other submission.
     void record_native(const std::function<void(std::uintptr_t)>& commands);
-    vk::UniquePipeline create_deferred_pipeline(const vk::RayTracingPipelineCreateInfoKHR&);
+    vk::UniquePipeline create_ray_tracing_pipeline(const vk::RayTracingPipelineCreateInfoKHR&,
+        vk::PipelineCache);
     std::shared_ptr<RayTracingLibraryImpl> create_ray_tracing_library(
         const RayTracingPipelineDesc&, const RayTracingInterface&);
     std::shared_ptr<RayTracingPipelineImpl> link_ray_tracing(
         std::span<const std::shared_ptr<RayTracingLibraryImpl>>,
         std::span<const std::uint32_t> hit_groups);
+    std::shared_ptr<RayTracingPipelineImpl> rebind_hit_groups(
+        const RayTracingPipelineImpl& linked, std::span<const std::uint32_t> hit_groups);
     RayTracingGroups ray_tracing_groups(const RayTracingPipelineDesc&) const;
-    void save_pipeline_cache();
+    // Creates a pipeline with the persistent file-backed VkPipelineCache when
+    // requested. Imported material libraries pass use_cache=false so their
+    // runtime-generated pipelines never enter pipeline.cache.
+    template <class CreateInfo>
+    vk::UniquePipeline create_pipeline(const CreateInfo& info, bool use_cache,
+        const std::function<vk::UniquePipeline(const CreateInfo&, vk::PipelineCache)>& create) {
+        if (!use_cache)
+            return create(info, {});
+        if (!pipeline_cache_)
+            return create(info, {});
+        // Vulkan requires external synchronization for concurrent access to a
+        // shared VkPipelineCache.
+        std::lock_guard lock(pipeline_creation_mutex_);
+        return create(info, pipeline_cache());
+    }
+    // The persisted file cache, or null when caching is disabled.
+    vk::PipelineCache pipeline_cache() const noexcept {
+        return pipeline_cache_ ? pipeline_cache_->handle() : vk::PipelineCache{};
+    }
+    void retain_linked_pipeline(std::shared_ptr<const vk::UniquePipeline> pipeline,
+        std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries);
     // Publishes the shader binding table of a created pipeline whose groups,
     // in group-index order, are `groups`. The hit region holds one record per
     // entry of `hit_groups`, each naming a hit group by its index among them.
@@ -481,22 +537,85 @@ private:
     friend struct ImageImpl;
     friend struct SamplerImpl;
     friend struct AccelerationStructureImpl;
+    // Vulkan requires a command pool to be externally synchronized while any
+    // of its buffers records, so every thread records from pools of its own.
+    // Buffers whose submission completed return to `free` (under mutex_) and
+    // are reused, and reset, only by the owning thread.
+    struct CommandPool {
+        vk::UniqueCommandPool pool;
+        std::vector<vk::CommandBuffer> free;
+    };
     struct Pending {
         GpuToken token;
-        vk::UniqueCommandBuffer command;
+        vk::CommandBuffer command;
+        CommandPool* pool = nullptr;
         std::vector<std::shared_ptr<void>> resources;
     };
+    // `size` bytes of launch records in a queue's argument ring.
+    struct ArgumentRegion { std::size_t begin = 0, end = 0; Timelines timelines{}; std::uint64_t held = 0; };
+    // One Vulkan queue and the submissions made to it. Both entries may name
+    // the same VkQueue; each still keeps its own timeline.
+    struct QueueState {
+        vk::Queue queue;
+        std::uint32_t family = 0;
+        vk::UniqueSemaphore timeline;
+        // Read without mutex_ by retire(), which destructors call.
+        std::atomic<std::uint64_t> next_timeline = 1;
+        std::deque<Pending> pending;
+        std::uint32_t timestamp_valid_bits = 64;
+        // Values of the other queues' timelines the next submission waits for.
+        Timelines waits{};
+        // The one open recording on this queue, if any. Only its thread
+        // records into `recording` or appends to `recording_resources`; the
+        // value the submission will signal is reserved when it opens.
+        vk::CommandBuffer recording;
+        CommandPool* recording_pool = nullptr;
+        std::atomic<std::uint64_t> recording_value = 0;
+        std::thread::id recording_thread;
+        std::vector<std::shared_ptr<void>> recording_resources;
+        // Launch records of this queue's submissions only, so a queue running
+        // behind never makes another queue's recording wait for it.
+        std::shared_ptr<BufferImpl> argument_arena;
+        std::size_t argument_offset = 0;
+        std::deque<ArgumentRegion> argument_pending;
+        std::mutex argument_mutex;
+    };
+    // The semaphore waits a submission to `queue` takes on; clears them.
+    struct QueueWaits {
+        std::vector<vk::Semaphore> semaphores;
+        std::vector<std::uint64_t> values;
+        std::vector<vk::PipelineStageFlags> stages;
+    };
+    QueueWaits take_queue_waits(QueueState& queue);
+    // The calling thread's pool for `queue`. Called with mutex_ held.
+    CommandPool& thread_command_pool(Queue queue);
+    vk::CommandBuffer allocate_command(CommandPool&);
+    // Submits a finished command buffer to `queue`, signalling `token` and
+    // any extra binary semaphores, after `extra_waits` and the queue_wait()
+    // values. Called with mutex_ held.
+    void submit_command(QueueState& queue, GpuToken token, vk::CommandBuffer command, CommandPool* pool,
+        std::vector<std::shared_ptr<void>> resources, const QueueWaits& extra_waits = {},
+        std::span<const vk::Semaphore> extra_signals = {});
     // A resource destroyed while the GPU may still be reading it is retired
-    // here and released once the timeline passes the value it was retired at.
+    // here and released once every queue passes the value it was retired at.
     struct Retired {
-        std::uint64_t timeline = 0;
+        Timelines timelines{};
         std::function<void()> release;
     };
+    QueueState& queue_state(Queue queue) { return queues_[static_cast<std::size_t>(queue)]; }
+    const QueueState& queue_state(Queue queue) const { return queues_[static_cast<std::size_t>(queue)]; }
+    std::uint64_t completed_value(Queue queue) const;
+    bool completed(const Timelines& timelines) const;
+    // For each queue, the submission that ends the work recorded so far: the
+    // open frame on Graphics, the last submission otherwise.
+    Timelines recorded_timelines() const;
+    // The submission being recorded on the calling thread's queue.
+    Timelines recording_timelines() const;
 
     struct Capabilities {
         bool mandatory = false;   // BDA, timeline, sync2, dynamic rendering,
                                   // descriptor heaps, untyped pointers,
-                                  // maintenance5, unified image layouts
+                                  // maintenance5
         bool acceleration_structure = false;
         bool ray_query = false;
         bool ray_tracing = false;
@@ -528,8 +647,14 @@ public:
     // every submission that could reference the resource has completed.
     void retire(std::function<void()> release);
 private:
+    // Serialized work is ordered against everything recorded before and after
+    // it. Inside an open frame, Explicit work (dispatches, traces, barriers)
+    // is ordered only by the caller's barrier() calls, so independent passes
+    // can overlap on the GPU. A standalone submission is always serialized.
+    enum class Ordering { Serialized, Explicit };
     GpuToken submit(const std::function<void(vk::CommandBuffer)>& record,
-                    std::vector<std::shared_ptr<void>> resources = {});
+                    std::vector<std::shared_ptr<void>> resources = {},
+                    Ordering ordering = Ordering::Serialized);
     static vk::PipelineStageFlags2 stage_mask(Stage stage);
     vk::Instance vk_instance() const noexcept { return instance_.get(); }
     vk::Device vk_device() const noexcept { return device_.get(); }
@@ -540,47 +665,45 @@ private:
     vk::UniqueDebugUtilsMessengerEXT messenger_;
     vk::PhysicalDevice physical_device_;
     vk::UniqueDevice device_;
-    vk::Queue queue_;
+    std::array<QueueState, queue_count> queues_;
     bool presentation_enabled_ = false;
     bool fifo_latest_ready_enabled_ = false;
     // Exists only during construction, to select a GPU and queue that can
     // present to the host's window. Swapchains create their own surfaces.
     vk::UniqueSurfaceKHR probe_surface_;
-    // Set between begin_frame and end_frame. Its presence is what makes
-    // submit() batch into the frame instead of submitting immediately.
-    vk::CommandBuffer frame_command_;
-    GpuToken frame_token_{};
-    std::vector<std::shared_ptr<void>> frame_resources_;
-    std::uint32_t queue_family_ = 0;
+    // Keyed by thread and queue; see CommandPool. Guarded by mutex_.
+    std::map<std::pair<std::thread::id, Queue>, std::unique_ptr<CommandPool>> command_pools_;
     bool acceleration_structure_supported_ = false;
     bool ray_query_supported_ = false;
     bool ray_tracing_supported_ = false;
     bool external_memory_fd_enabled_ = false;
     bool external_semaphore_fd_enabled_ = false;
+    bool nvidia_610_driver_ = false;
+    bool pipeline_binaries_enabled_ = false;
     VmaAllocator allocator_ = VK_NULL_HANDLE;
 
-    // Shared by every pipeline creation: the ray-tracing pipelines differ
-    // only in their ray-generation shader, so the cache spares the driver
-    // from recompiling the identical hit, miss and material stages once per
-    // pipeline.
-    vk::UniquePipelineCache pipeline_cache_;
-    std::filesystem::path pipeline_cache_file_;
-    vk::UniqueCommandPool command_pool_;
-    vk::UniqueSemaphore timeline_;
+    // File-backed cache used by ordinary/static pipelines. Runtime material
+    // libraries and links explicitly bypass it.
+    std::optional<PipelineCacheFile> pipeline_cache_;
+    std::mutex pipeline_creation_mutex_;
+    // NVIDIA 610 may keep compiling a linked pipeline after the create call
+    // returns. Retain it until device shutdown; an elapsed-time grace period
+    // cannot establish when the driver's background work is finished.
+    struct RetainedLinkedPipeline {
+        std::shared_ptr<const vk::UniquePipeline> pipeline;
+        std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries;
+    };
+    std::mutex linked_pipelines_mutex_;
+    std::vector<RetainedLinkedPipeline> retained_linked_pipelines_;
     vk::UniqueQueryPool timestamp_query_pool_;
     std::uint32_t next_timestamp_query_ = 0;
     float timestamp_period_ns_ = 1.0f;
-    std::uint32_t timestamp_valid_bits_ = 64;
-    std::uint64_t next_timeline_ = 1;
-    std::shared_ptr<BufferImpl> argument_arena_;
     std::size_t argument_arena_size_ = 0;
     std::size_t host_alignment_ = 16;
-    // `held` is the StagedArguments id while its owner lives, and 0 once the
-    // region only waits for `token` to retire.
-    struct ArgumentRegion { std::size_t begin = 0, end = 0; GpuToken token{}; std::uint64_t held = 0; };
+    // Places a record in the calling thread's queue's ring. `held` is the
+    // StagedArguments id while its owner lives, and 0 once the region only
+    // waits for its submissions to retire.
     vk::DeviceAddress place_arguments(const void* args, std::size_t size, std::uint64_t held);
-    // Every pipeline in the library is layout-free: textures and samplers come
-    // from these two heaps, everything else through the 8-byte root pointer.
     vk::PhysicalDeviceDescriptorHeapPropertiesEXT heap_properties_{};
     std::uint32_t texture_descriptor_capacity_ = 0;
     std::uint32_t sampler_descriptor_capacity_ = 0;
@@ -591,26 +714,33 @@ private:
     mutable std::mutex heap_mutex_;
     vk::PhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties_{};
     vk::PhysicalDeviceRayTracingPipelinePropertiesKHR ray_tracing_properties_{};
-    // Ring offset into argument_arena_; see DeviceImpl::stage_arguments.
-    std::size_t argument_offset_ = 0;
-    std::deque<ArgumentRegion> argument_pending_;
-    std::uint64_t next_staged_id_ = 1;
-    std::mutex argument_mutex_;
+    std::atomic<std::uint64_t> next_staged_id_ = 1;
     std::map<vk::DeviceAddress, std::weak_ptr<BufferImpl>> buffers_;
-    std::deque<Pending> pending_;
+    // Recording threads resolve addresses while others create buffers.
+    mutable std::mutex buffers_mutex_;
     // Guarded by its own mutex: retiring happens inside resource destructors,
     // which can run while mutex_ is already held (a completed submission
     // dropping its last reference to a buffer, for instance).
-    std::vector<Retired> retired_;
+    // In submission order, so every queue's timeline is non-decreasing along
+    // it: the completed entries are always a prefix.
+    std::deque<Retired> retired_;
+    // Dead entries of buffers_ are swept once it doubles, which keeps the
+    // sweep amortized constant per buffer instead of linear per submission.
+    std::size_t buffer_sweep_size_ = 64;
     std::mutex retire_mutex_;
-    vk::CommandBuffer active_command_;
-    vk::Format active_color_format_ = vk::Format::eUndefined;
-    bool active_has_depth_ = false;
-    bool active_flip_y_ = false;
-    std::vector<std::shared_ptr<void>> active_resources_;
+    // What the calling thread is recording. submit() runs its callback
+    // without mutex_, so every recording thread keeps its own render scope
+    // and the resources its commands reference.
+    static thread_local vk::CommandBuffer active_command_;
+    static thread_local vk::Format active_color_format_;
+    static thread_local bool active_has_depth_;
+    static thread_local bool active_flip_y_;
+    static thread_local std::uint32_t active_width_;
+    static thread_local std::uint32_t active_height_;
+    static thread_local std::vector<std::shared_ptr<void>> active_resources_;
     bool shut_down_ = false;
-    std::uint32_t active_width_ = 0;
-    std::uint32_t active_height_ = 0;
+    // Guards the queues' submission state, the command pools and presentation.
+    // Never held while commands are recorded or while waiting for the GPU.
     mutable std::mutex mutex_;
 };
 
@@ -619,7 +749,7 @@ void upload_buffer(const std::shared_ptr<BufferImpl>&, const void*, std::size_t,
 void download_buffer(const std::shared_ptr<BufferImpl>&, void*, std::size_t, std::size_t);
 std::uint64_t buffer_address(const std::shared_ptr<BufferImpl>&);
 std::shared_ptr<ImageImpl> make_image(const std::shared_ptr<DeviceImpl>&, std::uint32_t,
-                                      std::uint32_t, ImageUsage, ImageFormat);
+                                      std::uint32_t, ImageUsage, ImageFormat, std::uint32_t);
 std::uint32_t image_sampled_handle(const std::shared_ptr<ImageImpl>&);
 std::uint32_t image_storage_handle(const std::shared_ptr<ImageImpl>&);
 AccelerationStructureHandle acceleration_structure_handle(

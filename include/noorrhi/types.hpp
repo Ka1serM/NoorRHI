@@ -74,7 +74,19 @@ template<class T, class U> constexpr T lerp(const T a, const T b, const U t) { r
 
 enum class Stage { Copy, Compute, Vertex, Fragment, RayTracing, AccelerationStructure, Present };
 
-struct GpuToken { std::uint64_t value = 0; };
+// The queues work is submitted to; see noorrhi::QueueScope. Async is a second
+// queue of the graphics family, so it can do everything Graphics does except
+// present, and runs beside it: work that takes long, such as rendering an image
+// the UI shows later, goes there so it never holds up the UI's frames. A family
+// with a single queue shares it between the two.
+enum class Queue { Graphics, Async };
+inline constexpr std::size_t queue_count = 2;
+
+// A point on one queue's timeline. Tokens of different queues are unordered.
+struct GpuToken {
+    std::uint64_t value = 0;
+    Queue queue = Queue::Graphics;
+};
 
 struct DispatchSize { std::uint32_t x = 1, y = 1, z = 1; };
 struct DispatchArgs { std::uint32_t x = 1, y = 1, z = 1; };

@@ -8,8 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
+#include <cstdlib>
 #include <iterator>
 #include <cstring>
 #include <limits>
@@ -72,6 +71,16 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
                 "argument budget must be a multiple of the device host alignment");
         create_device(config);
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_device());
+        // Only now does the dispatcher hold the device's own functions.
+        // Keep ordinary/static pipelines in one Vulkan pipeline cache persisted
+        // to pipeline.cache. Material ray-tracing libraries opt out explicitly,
+        // so large imported material sets never grow this startup cache.
+        if (!config.pipeline_directory.empty()
+            && std::getenv("NOORRHI_DISABLE_PIPELINE_CACHE") == nullptr) {
+            pipeline_cache_.emplace(vk_device(), config.pipeline_directory);
+        } else if (!config.pipeline_directory.empty()) {
+            std::fprintf(stderr, "[NoorRHI] pipeline cache disabled by NOORRHI_DISABLE_PIPELINE_CACHE\n");
+        }
         create_allocator();
         create_command_state();
         probe_surface_.reset();
@@ -83,8 +92,8 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
 // The mandatory set is what the whole library is built on: buffer device
 // addresses for every buffer, a timeline semaphore for all synchronization,
 // synchronization2 and dynamic rendering for command recording, descriptor
-// heaps for textures and samplers, and unified image layouts so no image ever
-// needs a layout transition.
+// heaps for textures and samplers. Every image lives in GENERAL, which core
+// Vulkan accepts for every usage this library records.
 //
 // VK_EXT_descriptor_heap is what keeps pipelines layout-free: images and
 // samplers are encoded into device-owned heaps that shaders index directly
@@ -105,8 +114,6 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
         VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
     const bool has_maintenance5 = properties.apiVersion >= VK_API_VERSION_1_4
         || has_extension(extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
-    const bool has_unified_layouts = has_extension(
-        extensions, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
     const bool has_as = has_extension(extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
         && has_extension(extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     const bool has_query = has_as && has_extension(extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
@@ -117,7 +124,6 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
     vk::PhysicalDeviceVulkan11Features supported11{};
     vk::PhysicalDeviceVulkan12Features supported12{};
     vk::PhysicalDeviceVulkan13Features supported13{};
-    vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR supported_unified{};
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR supported_as{};
     vk::PhysicalDeviceRayQueryFeaturesKHR supported_query{};
     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR supported_rt{};
@@ -130,8 +136,7 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
     supported.pNext = &supported11;
     supported11.pNext = &supported12;
     supported12.pNext = &supported13;
-    supported13.pNext = &supported_unified;
-    supported_unified.pNext = &supported_as;
+    supported13.pNext = &supported_as;
     supported_as.pNext = &supported_query;
     supported_query.pNext = &supported_rt;
     supported_rt.pNext = &supported_heap;
@@ -151,8 +156,7 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
         && supported13.synchronization2 && supported13.dynamicRendering
         && has_descriptor_heap && supported_heap.descriptorHeap
         && has_untyped_pointers && supported_untyped.shaderUntypedPointers
-        && has_maintenance5 && supported_maintenance5.maintenance5
-        && has_unified_layouts && supported_unified.unifiedImageLayouts;
+        && has_maintenance5 && supported_maintenance5.maintenance5;
     capabilities.acceleration_structure = has_as && supported_as.accelerationStructure;
     capabilities.ray_query = has_query && capabilities.acceleration_structure
         && supported_query.rayQuery;
@@ -171,17 +175,17 @@ void DeviceImpl::adopt_capabilities(const Capabilities& capabilities) {
 
 void DeviceImpl::initialize_resources() {
     create_descriptor_heaps();
-    argument_arena_ = create_buffer(argument_arena_size_,
-        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-        VMA_MEMORY_USAGE_CPU_TO_GPU, true);
-
+    for (QueueState& queue : queues_)
+        queue.argument_arena = create_buffer(argument_arena_size_,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+            VMA_MEMORY_USAGE_CPU_TO_GPU, true);
 }
 
 MemoryReport DeviceImpl::memory_report() const {
     VmaTotalStatistics statistics{};
     vmaCalculateStatistics(allocator_, &statistics);
     return {statistics.total.statistics.allocationBytes, statistics.total.statistics.blockBytes,
-        statistics.total.statistics.allocationCount, argument_arena_size_};
+        statistics.total.statistics.allocationCount, argument_arena_size_ * queue_count};
 }
 
 void DeviceImpl::create_instance(const DeviceConfig& config) {
@@ -259,6 +263,7 @@ void DeviceImpl::select_physical_device() {
     Capabilities best_capabilities{};
     vk::DeviceSize best_memory = 0;
     bool best_is_discrete = false;
+    bool best_is_cpu = false;
     for (const auto candidate : devices) {
         const Capabilities capabilities = probe(candidate);
         if (!capabilities.mandatory)
@@ -274,22 +279,27 @@ void DeviceImpl::select_physical_device() {
             if (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)
                 memory += heap.size;
         }
-        const bool is_discrete =
-            candidate.getProperties().deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
-        if (!best || (is_discrete && !best_is_discrete)
-            || (is_discrete == best_is_discrete && memory > best_memory)) {
+        const auto properties = candidate.getProperties();
+        const bool is_discrete = properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+        // CPU Vulkan implementations such as lavapipe/llvmpipe can report the
+        // host's RAM as device-local memory. Never let that heap size make a
+        // software device outrank an eligible GPU; keep it only as a fallback.
+        const bool is_cpu = properties.deviceType == vk::PhysicalDeviceType::eCpu;
+        if (!best || (best_is_cpu && !is_cpu)
+            || (best_is_cpu == is_cpu && ((is_discrete && !best_is_discrete)
+                || (is_discrete == best_is_discrete && memory > best_memory)))) {
             best = candidate;
             best_capabilities = capabilities;
             best_memory = memory;
             best_is_discrete = is_discrete;
+            best_is_cpu = is_cpu;
         }
     }
     if (!best)
         throw Error(ErrorCode::UnsupportedFeature,
             "No Vulkan 1.3 device supports buffer device address, timeline semaphores, "
             "synchronization2, dynamic rendering, VK_EXT_descriptor_heap, "
-            "VK_KHR_shader_untyped_pointers, maintenance5 and "
-            "VK_KHR_unified_image_layouts");
+            "VK_KHR_shader_untyped_pointers and maintenance5");
     physical_device_ = best;
     adopt_capabilities(best_capabilities);
 }
@@ -319,15 +329,23 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
         throw Error(ErrorCode::UnsupportedFeature, probe_surface_
             ? "Selected Vulkan device has no queue that supports both compute and presentation"
             : "Selected Vulkan device has no compute queue");
-    queue_family_ = *selected;
-    constexpr float priority = 1.0f;
-    const vk::DeviceQueueCreateInfo queueInfo({}, queue_family_, 1, &priority);
+    QueueState& graphics = queue_state(Queue::Graphics);
+    QueueState& async = queue_state(Queue::Async);
+    graphics.family = *selected;
+    async.family = graphics.family;
+    // Async is the graphics family's second queue, not a compute-only family,
+    // because the work it carries includes raster passes and blits.
+    const std::uint32_t async_index = queues[graphics.family].queueCount > 1 ? 1 : 0;
+    // Graphics carries the frames the user waits on, so it takes precedence
+    // where the driver honours queue priorities.
+    constexpr std::array priorities{1.0f, 0.5f};
+    const std::vector<vk::DeviceQueueCreateInfo> queue_infos{
+        {{}, graphics.family, async_index + 1, priorities.data()}};
 
     const auto extensions = physical_device_.enumerateDeviceExtensionProperties();
     std::vector<const char*> enabled_extensions{
         VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
         VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
-        VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
     };
     if (physical_device_.getProperties().apiVersion < VK_API_VERSION_1_4)
         enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -346,6 +364,10 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     vk::PhysicalDeviceFeatures base{};
     if (supported_base.shaderInt64)
         base.shaderInt64 = VK_TRUE;
+    // RTXDI's path tracer declares Int16; without the feature the module is
+    // invalid and the driver's results undefined.
+    if (supported_base.shaderInt16)
+        base.shaderInt16 = VK_TRUE;
 
     // shaderDrawParameters is declared by Slang-compiled vertex shaders; the
     // validation layers reject the module without it.
@@ -362,7 +384,7 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     features12.shaderFloat16 = supported_numeric
         .get<vk::PhysicalDeviceVulkan12Features>().shaderFloat16;
     // Atomic compare-exchange on 64-bit keys in storage buffers, used by
-    // lock-free GPU hash tables (NoorRay's SHaRC radiance cache).
+    // lock-free GPU hash tables.
     features12.shaderBufferInt64Atomics = supported_numeric
         .get<vk::PhysicalDeviceVulkan12Features>().shaderBufferInt64Atomics;
     features12.bufferDeviceAddress = VK_TRUE;
@@ -375,23 +397,37 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     features13.synchronization2 = VK_TRUE;
     features13.dynamicRendering = VK_TRUE;
     features13.shaderIntegerDotProduct = VK_TRUE;
-    vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_layouts{};
-    unified_layouts.unifiedImageLayouts = VK_TRUE;
     features11.pNext = &features12;
     features12.pNext = &features13;
-    // Slang lowers ResourceDescriptorHeap[i] through untyped pointers, so any
-    // heap-using shader needs shaderUntypedPointers next to descriptorHeap.
     vk::PhysicalDeviceDescriptorHeapFeaturesEXT heap_features{};
     heap_features.descriptorHeap = VK_TRUE;
     vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers{};
     untyped_pointers.shaderUntypedPointers = VK_TRUE;
     vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5{};
     maintenance5.maintenance5 = VK_TRUE;
-    features13.pNext = &unified_layouts;
-    unified_layouts.pNext = &heap_features;
+    features13.pNext = &heap_features;
     heap_features.pNext = &untyped_pointers;
     untyped_pointers.pNext = &maintenance5;
     void** tail = &maintenance5.pNext;
+
+    vk::PhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features{};
+    const vk::PhysicalDeviceProperties properties = physical_device_.getProperties();
+    // NVIDIA 610's vkGetPipelineKeyKHR returns with RBX clobbered on Linux,
+    // corrupting callers that use the register for a live pointer.
+    nvidia_610_driver_ = properties.vendorID == 0x10de
+        && (properties.driverVersion >> 22) == 610;
+    pipeline_binaries_enabled_ =
+        !nvidia_610_driver_
+        && has_extension(extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)
+        && physical_device_.getFeatures2<vk::PhysicalDeviceFeatures2,
+               vk::PhysicalDevicePipelineBinaryFeaturesKHR>()
+               .get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries;
+    if (pipeline_binaries_enabled_) {
+        pipeline_binary_features.pipelineBinaries = VK_TRUE;
+        *tail = &pipeline_binary_features;
+        tail = &pipeline_binary_features.pNext;
+        enabled_extensions.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+    }
 
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR as_features{};
     vk::PhysicalDeviceRayQueryFeaturesKHR query_features{};
@@ -443,40 +479,12 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
 
     vk::DeviceCreateInfo createInfo{};
     createInfo.setPEnabledFeatures(&base)
-        .setQueueCreateInfos(queueInfo)
+        .setQueueCreateInfos(queue_infos)
         .setPEnabledExtensionNames(enabled_extensions)
         .setPNext(&features11);
     device_ = physical_device_.createDeviceUnique(createInfo);
-    queue_ = vk_device().getQueue(queue_family_, 0);
-    pipeline_cache_file_ = config.pipeline_cache_file;
-    std::vector<char> cached;
-    // A missing file is the first run. The driver validates the header of the
-    // data it is given and starts empty on a mismatch, such as a new driver.
-    if (!pipeline_cache_file_.empty() && std::filesystem::exists(pipeline_cache_file_)) {
-        std::ifstream file(pipeline_cache_file_, std::ios::binary);
-        cached.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-        if (!file.eof() && file.fail())
-            throw Error(ErrorCode::InvalidArgument,
-                "cannot read pipeline cache " + pipeline_cache_file_.string());
-    }
-    pipeline_cache_ = vk_device().createPipelineCacheUnique({{}, cached.size(), cached.data()});
-}
-
-void DeviceImpl::save_pipeline_cache() {
-    if (pipeline_cache_file_.empty())
-        return;
-    const std::vector<std::uint8_t> data = vk_device().getPipelineCacheData(*pipeline_cache_);
-    // Written beside the cache and renamed over it, so an interrupted write
-    // never leaves a truncated cache behind.
-    std::filesystem::path partial = pipeline_cache_file_;
-    partial += ".partial";
-    {
-        std::ofstream file(partial, std::ios::binary | std::ios::trunc);
-        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-        if (!file)
-            throw Error(ErrorCode::InvalidArgument, "cannot write pipeline cache " + partial.string());
-    }
-    std::filesystem::rename(partial, pipeline_cache_file_);
+    graphics.queue = vk_device().getQueue(graphics.family, 0);
+    async.queue = vk_device().getQueue(async.family, async_index);
 }
 
 void DeviceImpl::create_allocator() {
@@ -496,19 +504,19 @@ void DeviceImpl::create_allocator() {
 }
 
 void DeviceImpl::create_command_state() {
-    command_pool_ = vk_device().createCommandPoolUnique({vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-                                                        queue_family_});
-    vk::SemaphoreTypeCreateInfo timelineInfo(vk::SemaphoreType::eTimeline, 0);
-    timeline_ = vk_device().createSemaphoreUnique({{}, &timelineInfo});
+    const auto queue_properties = physical_device_.getQueueFamilyProperties();
+    for (QueueState& queue : queues_) {
+        vk::SemaphoreTypeCreateInfo timelineInfo(vk::SemaphoreType::eTimeline, 0);
+        queue.timeline = vk_device().createSemaphoreUnique({{}, &timelineInfo});
+        queue.timestamp_valid_bits = queue_properties[queue.family].timestampValidBits;
+    }
     timestamp_query_pool_ = vk_device().createQueryPoolUnique(
         {{}, vk::QueryType::eTimestamp, 256});
     timestamp_period_ns_ = physical_device_.getProperties().limits.timestampPeriod;
-    const auto queue_properties = physical_device_.getQueueFamilyProperties();
-    if (queue_family_ < queue_properties.size())
-        timestamp_valid_bits_ = queue_properties[queue_family_].timestampValidBits;
 }
 
 std::shared_ptr<TimestampQuery::State> DeviceImpl::create_timestamp() {
+    std::lock_guard lock(mutex_);
     if (!timestamp_query_pool_ || next_timestamp_query_ + 2u > 256u)
         throw Error(ErrorCode::OutOfMemory, "GPU timestamp query capacity exhausted");
     auto state = std::make_shared<TimestampQuery::State>();
@@ -523,6 +531,7 @@ void DeviceImpl::measure(const std::shared_ptr<TimestampQuery::State>& state,
     if (!state || !timestamp_query_pool_ || state->first_query + 1u >= 256u)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU timestamp query");
     const std::uint32_t first = state->first_query;
+    state->queue = current_queue();
     // The bracket is recorded into whatever command buffer the enclosed work
     // goes into, so a measured scope inside a frame times only that scope
     // rather than the whole frame.
@@ -549,11 +558,9 @@ double DeviceImpl::timestamp_milliseconds(TimestampQuery::State& query) {
     if (result != VK_SUCCESS)
         throw Error(ErrorCode::InvalidState, "failed to read GPU timestamps");
     std::uint64_t ticks = values[1] - values[0];
-    if (timestamp_valid_bits_ != 0u && timestamp_valid_bits_ < 64u)
-    {
-        const std::uint64_t mask = (std::uint64_t{1} << timestamp_valid_bits_) - 1u;
-        ticks = (values[1] - values[0]) & mask;
-    }
+    const std::uint32_t valid_bits = queue_state(query.queue).timestamp_valid_bits;
+    if (valid_bits != 0u && valid_bits < 64u)
+        ticks &= (std::uint64_t{1} << valid_bits) - 1u;
     query.milliseconds = static_cast<double>(ticks) * timestamp_period_ns_ * 1.0e-6;
     return query.milliseconds;
 }
@@ -582,8 +589,6 @@ void DeviceImpl::create_descriptor_heaps() {
     if (heap_properties_.maxPushDataSize < sizeof(vk::DeviceAddress))
         throw Error(ErrorCode::UnsupportedFeature,
             "descriptor heap push data cannot hold an 8-byte root pointer");
-    // Shaders index the resource heap with the image descriptor size as the
-    // array stride (Slang's default), and the heap holds nothing but images.
     create_heap(texture_heap_, texture_descriptor_capacity_,
         heap_properties_.imageDescriptorSize,
         std::max(heap_properties_.imageDescriptorAlignment,
@@ -645,7 +650,7 @@ void DeviceImpl::bind_heaps(const vk::CommandBuffer command) const {
 
 std::uint32_t DeviceImpl::allocate_slot(DescriptorHeap& heap) {
     std::lock_guard lock(heap_mutex_);
-    if (!heap.buffer)
+    if (heap.capacity == 0)
         throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
     if (!heap.free.empty()) {
         const std::uint32_t slot = heap.free.back();
@@ -662,8 +667,8 @@ void DeviceImpl::release_slot(DescriptorHeap& heap, const std::uint32_t slot) no
     if (slot == 0)
         return;
     std::lock_guard lock(heap_mutex_);
-    // After shutdown the heap is gone and there is nothing to return to.
-    if (heap.buffer)
+    // After shutdown the allocator is inactive and there is nothing to return to.
+    if (heap.capacity != 0)
         heap.free.push_back(slot);
 }
 
@@ -693,13 +698,15 @@ void DeviceImpl::shutdown() noexcept {
     } catch (...) {
         // Destructors cannot report device-loss errors.
     }
-    frame_command_ = nullptr;
-    frame_resources_.clear();
-    argument_pending_.clear();
     active_resources_.clear();
-    pending_.clear();
+    for (QueueState& queue : queues_) {
+        queue.recording = nullptr;
+        queue.recording_resources.clear();
+        queue.argument_pending.clear();
+        queue.pending.clear();
+    }
     // The queue is idle, so everything still deferred can be released.
-    std::vector<Retired> retired;
+    std::deque<Retired> retired;
     {
         std::lock_guard retire_lock(retire_mutex_);
         retired.swap(retired_);
@@ -711,7 +718,18 @@ void DeviceImpl::shutdown() noexcept {
     // These internal buffers own VMA allocations and are destroyed before the
     // allocator itself. External resource objects keep DeviceImpl alive, so
     // no user-visible resource should remain here.
-    argument_arena_.reset();
+    for (QueueState& queue : queues_)
+        queue.argument_arena.reset();
+    {
+        std::lock_guard lock(mutex_);
+        command_pools_.clear();
+    }
+    {
+        // Break the intentional DeviceImpl -> retained library -> DeviceImpl
+        // ownership cycle once the device is idle.
+        std::lock_guard lock(linked_pipelines_mutex_);
+        retained_linked_pipelines_.clear();
+    }
     std::lock_guard heap_lock(heap_mutex_);
     texture_heap_ = {};
     sampler_heap_ = {};
@@ -728,6 +746,7 @@ std::shared_ptr<BufferImpl> DeviceImpl::create_buffer(const std::size_t size,
     if (size == 0)
         throw Error(ErrorCode::InvalidArgument, "GPU buffers cannot have zero bytes");
     auto result = std::make_shared<BufferImpl>();
+    // Both queues belong to one family, so exclusive ownership covers them.
     vk::BufferCreateInfo bufferInfo({}, size, usage, vk::SharingMode::eExclusive);
     VmaAllocationCreateInfo allocationInfo{};
     allocationInfo.usage = memory_usage;
@@ -757,6 +776,7 @@ std::shared_ptr<BufferImpl> DeviceImpl::create_buffer(const std::size_t size,
         // A freed buffer's device address can be handed straight back to the
         // next allocation, so the new owner must replace any dead entry rather
         // than losing to it.
+        std::lock_guard lock(buffers_mutex_);
         buffers_.insert_or_assign(result->address, result);
     }
     return result;
@@ -774,13 +794,18 @@ std::pair<vk::Buffer, vk::DeviceSize> DeviceImpl::find_buffer(const vk::DeviceAd
 }
 
 std::shared_ptr<BufferImpl> DeviceImpl::find_buffer_resource(const vk::DeviceAddress address) const {
-    // buffers_ is keyed by base address, so the candidate is the last buffer
-    // that starts at or before `address`.
-    const auto candidate = buffers_.upper_bound(address);
-    if (candidate != buffers_.begin()) {
-        const auto buffer = std::prev(candidate)->second.lock();
-        if (buffer && address >= buffer->address && address < buffer->address + buffer->size)
+    // buffers_ is keyed by base address, so the candidate is the last live
+    // buffer that starts at or before `address`. Dead entries linger until
+    // the next sweep, and freed memory can be reused by a buffer starting
+    // below them, so they must be skipped rather than end the search.
+    std::lock_guard lock(buffers_mutex_);
+    for (auto entry = buffers_.upper_bound(address); entry != buffers_.begin();) {
+        const auto buffer = (--entry)->second.lock();
+        if (!buffer)
+            continue;
+        if (address < buffer->address + buffer->size)
             return buffer;
+        break;
     }
     throw Error(ErrorCode::InvalidResource, "GPU address does not refer to a live buffer");
 }
@@ -790,8 +815,9 @@ interop::DeviceHandles DeviceImpl::native_handles() const noexcept {
         reinterpret_cast<std::uintptr_t>(static_cast<VkInstance>(vk_instance())),
         reinterpret_cast<std::uintptr_t>(static_cast<VkPhysicalDevice>(physical_device_)),
         reinterpret_cast<std::uintptr_t>(static_cast<VkDevice>(vk_device())),
-        reinterpret_cast<std::uintptr_t>(static_cast<VkQueue>(queue_)),
-        queue_family_,
+        reinterpret_cast<std::uintptr_t>(static_cast<VkQueue>(queue_state(Queue::Graphics).queue)),
+        queue_state(Queue::Graphics).family,
+        reinterpret_cast<std::uintptr_t>(static_cast<VkPipelineCache>(pipeline_cache())),
     };
 }
 
@@ -836,7 +862,16 @@ std::shared_ptr<ComputePipelineImpl> DeviceImpl::create_compute(const Shader& sh
     vk::ComputePipelineCreateInfo pipelineInfo{{}, stage, {}};
     pipelineInfo.pNext = &heap_flags;
     try {
-        result->pipeline = vk_device().createComputePipelineUnique(*pipeline_cache_, pipelineInfo).value;
+        result->pipeline = create_pipeline<vk::ComputePipelineCreateInfo>(pipelineInfo, true,
+            [this, entry = shader.impl_->entry_point](const vk::ComputePipelineCreateInfo& info, vk::PipelineCache cache) {
+                try {
+                    return vk_device().createComputePipelineUnique(cache, info).value;
+                } catch (const vk::SystemError& error) {
+                    std::fprintf(stderr, "[NoorRHI] compute pipeline creation failed for entry '%s': %s\n",
+                        entry.c_str(), error.what());
+                    throw;
+                }
+            });
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
@@ -855,10 +890,9 @@ std::shared_ptr<SamplerImpl> DeviceImpl::create_sampler(const SamplerDesc& desc)
     };
     vk::SamplerCreateInfo info({}, filter, filter, vk::SamplerMipmapMode::eLinear,
         address(desc.address_u), address(desc.address_v), address(desc.address_w));
+    info.maxLod = vk::LodClampNone;
     auto result = std::make_shared<SamplerImpl>();
     result->device = self_.lock();
-    // The descriptor is encoded straight from the create info; shaders pair
-    // this slot with any sampled texture handle.
     const std::uint32_t slot = allocate_slot(sampler_heap_);
     const vk::HostAddressRangeEXT destination = slot_range(sampler_heap_, slot);
     if (vk_device().writeSamplerDescriptorsEXT(1, &info, &destination) != vk::Result::eSuccess) {
@@ -876,100 +910,270 @@ void DeviceImpl::record_native(const std::function<void(std::uintptr_t)>& comman
     });
 }
 
-GpuToken DeviceImpl::submit(const std::function<void(vk::CommandBuffer)>& record,
-    std::vector<std::shared_ptr<void>> resources) {
+namespace {
+// The queues each thread is bound to, innermost last; see noorrhi::QueueScope.
+struct QueueBinding {
+    const DeviceImpl* device;
+    Queue queue;
+};
+thread_local std::vector<QueueBinding> queue_bindings;
+}
+
+thread_local vk::CommandBuffer DeviceImpl::active_command_;
+thread_local vk::Format DeviceImpl::active_color_format_ = vk::Format::eUndefined;
+thread_local bool DeviceImpl::active_has_depth_ = false;
+thread_local bool DeviceImpl::active_flip_y_ = false;
+thread_local std::uint32_t DeviceImpl::active_width_ = 0;
+thread_local std::uint32_t DeviceImpl::active_height_ = 0;
+thread_local std::vector<std::shared_ptr<void>> DeviceImpl::active_resources_;
+
+Queue DeviceImpl::current_queue() const {
+    for (auto binding = queue_bindings.rbegin(); binding != queue_bindings.rend(); ++binding)
+        if (binding->device == this)
+            return binding->queue;
+    return Queue::Graphics;
+}
+
+void DeviceImpl::bind_queue(const Queue queue) const {
+    queue_bindings.push_back({this, queue});
+}
+
+void DeviceImpl::unbind_queue() const {
+    if (queue_bindings.empty() || queue_bindings.back().device != this)
+        throw Error(ErrorCode::InvalidState, "QueueScopes must end in reverse order on their own thread");
+    queue_bindings.pop_back();
+}
+
+bool DeviceImpl::recording_frame() const {
+    const QueueState& queue = queue_state(current_queue());
     std::lock_guard lock(mutex_);
-    if (shut_down_)
-        throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
-    if (frame_command_) {
-        // A frame is open: batch into its command buffer instead of opening a
-        // submission of our own. Every dispatch, trace and render scope issued
-        // between begin_frame and end_frame therefore lands in one submission.
-        //
-        // The ordering barriers around the recorded work are the same ones a
-        // standalone submission gets, so batching does not weaken the implicit
-        // ordering callers already rely on between consecutive operations.
-        vk::MemoryBarrier2 ordering{};
-        ordering.setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-            .setSrcAccessMask(vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite)
-            .setDstStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-            .setDstAccessMask(vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
-        frame_command_.pipelineBarrier2({{}, ordering, {}, {}});
-        active_resources_.clear();
-        record(frame_command_);
-        frame_command_.pipelineBarrier2({{}, ordering, {}, {}});
-        // The frame's submission is what will retire these, so they are held
-        // until end_frame hands them to the pending queue.
-        frame_resources_.insert(frame_resources_.end(),
-            std::make_move_iterator(resources.begin()), std::make_move_iterator(resources.end()));
-        frame_resources_.insert(frame_resources_.end(),
-            active_resources_.begin(), active_resources_.end());
-        active_resources_.clear();
-        return frame_token_;
+    return queue.recording && queue.recording_thread == std::this_thread::get_id();
+}
+
+DeviceImpl::CommandPool& DeviceImpl::thread_command_pool(const Queue queue) {
+    auto& pool = command_pools_[{std::this_thread::get_id(), queue}];
+    if (!pool) {
+        pool = std::make_unique<CommandPool>();
+        pool->pool = vk_device().createCommandPoolUnique(
+            {vk::CommandPoolCreateFlagBits::eResetCommandBuffer, queue_state(queue).family});
     }
-    reap_completed();
-    auto commands = vk_device().allocateCommandBuffersUnique(
-        {*command_pool_, vk::CommandBufferLevel::ePrimary, 1});
+    return *pool;
+}
+
+vk::CommandBuffer DeviceImpl::allocate_command(CommandPool& pool) {
+    // A recycled buffer is reset implicitly when it begins again.
+    if (!pool.free.empty()) {
+        const vk::CommandBuffer command = pool.free.back();
+        pool.free.pop_back();
+        return command;
+    }
+    const auto commands = vk_device().allocateCommandBuffers(
+        {*pool.pool, vk::CommandBufferLevel::ePrimary, 1});
     if (commands.empty())
         throw Error(ErrorCode::OutOfMemory, "Vulkan command-buffer allocation failed");
-    auto command = std::move(commands.front());
-    command->begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-    vk::MemoryBarrier2 ordering{};
-    ordering.setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-        .setSrcAccessMask(vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite)
-        .setDstStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-        .setDstAccessMask(vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
-    command->pipelineBarrier2({{}, ordering, {}, {}});
-    active_resources_.clear();
-    record(command.get());
+    return commands.front();
+}
+
+void DeviceImpl::submit_command(QueueState& queue, const GpuToken token, const vk::CommandBuffer command,
+    CommandPool* const pool, std::vector<std::shared_ptr<void>> resources, const QueueWaits& extra_waits,
+    const std::span<const vk::Semaphore> extra_signals) {
+    QueueWaits waits = take_queue_waits(queue);
+    waits.semaphores.insert(waits.semaphores.begin(), extra_waits.semaphores.begin(), extra_waits.semaphores.end());
+    waits.values.insert(waits.values.begin(), extra_waits.values.begin(), extra_waits.values.end());
+    waits.stages.insert(waits.stages.begin(), extra_waits.stages.begin(), extra_waits.stages.end());
+    // Only the timeline entry carries a value; binary semaphores' slots are
+    // ignored but must be present for the arrays to line up.
+    std::vector<vk::Semaphore> signals{queue.timeline.get()};
+    signals.insert(signals.end(), extra_signals.begin(), extra_signals.end());
+    std::vector<std::uint64_t> signal_values(signals.size(), 0);
+    signal_values.front() = token.value;
+    vk::TimelineSemaphoreSubmitInfo timeline_info{};
+    timeline_info.setWaitSemaphoreValues(waits.values).setSignalSemaphoreValues(signal_values);
+    vk::SubmitInfo submit_info{};
+    submit_info.setCommandBuffers(command).setSignalSemaphores(signals)
+        .setWaitSemaphores(waits.semaphores).setWaitDstStageMask(waits.stages);
+    submit_info.pNext = &timeline_info;
+    queue.queue.submit(submit_info);
+    queue.pending.push_back({token, command, pool, std::move(resources)});
+    queue.next_timeline = token.value + 1;
+}
+
+std::uint64_t DeviceImpl::completed_value(const Queue queue) const {
+    return vk_device().getSemaphoreCounterValue(queue_state(queue).timeline.get());
+}
+
+bool DeviceImpl::completed(const Timelines& timelines) const {
+    for (std::size_t queue = 0; queue < queue_count; ++queue)
+        if (timelines[queue] > completed_value(static_cast<Queue>(queue)))
+            return false;
+    return true;
+}
+
+Timelines DeviceImpl::recorded_timelines() const {
+    Timelines timelines{};
+    for (std::size_t queue = 0; queue < queue_count; ++queue) {
+        const std::uint64_t recording = queues_[queue].recording_value;
+        timelines[queue] = recording != 0 ? recording : queues_[queue].next_timeline - 1;
+    }
+    return timelines;
+}
+
+Timelines DeviceImpl::recording_timelines() const {
+    const Queue queue = current_queue();
+    Timelines timelines{};
+    timelines[static_cast<std::size_t>(queue)] = queue_state(queue).next_timeline;
+    return timelines;
+}
+
+GpuToken DeviceImpl::submit(const std::function<void(vk::CommandBuffer)>& record,
+    std::vector<std::shared_ptr<void>> resources, const Ordering ordering) {
+    const Queue queue = current_queue();
+    QueueState& target = queue_state(queue);
+    vk::CommandBuffer command;
+    CommandPool* pool = nullptr;
+    bool batched = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (shut_down_)
+            throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
+        if (target.recording) {
+            // The recording reserved the queue's next timeline value, so no
+            // other thread's submission may go in front of it.
+            if (std::this_thread::get_id() != target.recording_thread)
+                throw Error(ErrorCode::InvalidState,
+                    "another thread has a frame or Recording open on this queue");
+            command = target.recording;
+            batched = true;
+        } else {
+            reap_completed();
+            pool = &thread_command_pool(queue);
+            command = allocate_command(*pool);
+        }
+    }
+    // Recording needs no lock: the command buffer and its pool belong to
+    // this thread, and the render scope state is thread-local.
+    struct ActiveResources {
+        ActiveResources() { active_resources_.clear(); }
+        ~ActiveResources() { active_resources_.clear(); }
+    } active_resources_scope;
+    if (batched) {
+        // Serialized work gets the same ordering barriers a standalone
+        // submission gets. Explicit work gets none: consecutive dispatches and
+        // traces overlap unless the caller orders them with barrier().
+        const bool serialized = ordering == Ordering::Serialized;
+        if (serialized)
+            record_full_barrier(command);
+        record(command);
+        if (serialized)
+            record_full_barrier(command);
+        // The recording's submission is what will retire these, so they are
+        // held until it is submitted.
+        target.recording_resources.insert(target.recording_resources.end(),
+            std::make_move_iterator(resources.begin()), std::make_move_iterator(resources.end()));
+        target.recording_resources.insert(target.recording_resources.end(),
+            active_resources_.begin(), active_resources_.end());
+        return {target.recording_value, queue};
+    }
+    command.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+    record_full_barrier(command);
+    record(command);
     resources.insert(resources.end(), active_resources_.begin(), active_resources_.end());
-    active_resources_.clear();
     // Publish writes made by this submission to later queue submissions. This
     // is required for upload copies consumed by externally recorded NoorRay
     // commands, which are submitted directly to the same queue after this
     // API-owned command buffer.
-    command->pipelineBarrier2({{}, ordering, {}, {}});
-    command->end();
+    record_full_barrier(command);
+    command.end();
 
-    const GpuToken token{next_timeline_};
-    vk::TimelineSemaphoreSubmitInfo timelineInfo{};
-    timelineInfo.setSignalSemaphoreValues(token.value);
-    vk::SubmitInfo submitInfo{};
-    const vk::CommandBuffer raw_command = command.get();
-    submitInfo.setCommandBuffers(raw_command).setSignalSemaphores(timeline_.get());
-    submitInfo.pNext = &timelineInfo;
-    pending_.push_back({token, std::move(command), std::move(resources)});
-    try {
-        queue_.submit(submitInfo);
-    } catch (...) {
-        pending_.pop_back();
-        throw;
-    }
-    ++next_timeline_;
+    std::lock_guard lock(mutex_);
+    const GpuToken token{target.next_timeline, queue};
+    submit_command(target, token, command, pool, std::move(resources));
     return token;
 }
 
-void DeviceImpl::abandon_frame(Frame::State& state) {
+std::shared_ptr<Recording::State> DeviceImpl::begin_recording() {
+    const Queue queue = current_queue();
+    QueueState& target = queue_state(queue);
+    auto state = std::make_shared<Recording::State>();
+    state->device = self_.lock();
+    state->queue = queue;
+    {
+        std::lock_guard lock(mutex_);
+        if (shut_down_)
+            throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
+        if (target.recording)
+            throw Error(ErrorCode::InvalidState, "a frame or Recording is already open on this queue");
+        reap_completed();
+        CommandPool& pool = thread_command_pool(queue);
+        state->command = allocate_command(pool);
+        target.recording = state->command;
+        target.recording_pool = &pool;
+        target.recording_value = target.next_timeline.load();
+        target.recording_thread = std::this_thread::get_id();
+        target.recording_resources.clear();
+    }
+    state->command.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+    // Work inside the recording is ordered explicitly, so order it once
+    // against everything submitted before it.
+    record_full_barrier(state->command);
+    return state;
+}
+
+GpuToken DeviceImpl::end_recording(Recording::State& state) {
+    QueueState& target = queue_state(state.queue);
+    if (!state.command || target.recording != state.command)
+        throw Error(ErrorCode::InvalidState, "the Recording was already submitted");
+    // Publishes the recording's explicitly ordered work to later submissions.
+    record_full_barrier(state.command);
+    state.command.end();
     std::lock_guard lock(mutex_);
-    if (frame_command_ == state.command)
-        frame_command_ = nullptr;
-    std::erase_if(argument_pending_, [this](const auto& region) {
-        return region.token.value == next_timeline_;
-    });
-    // Nothing was submitted, so nothing is in flight: the command buffer and
-    // the resources it referenced can be released as soon as the GPU is idle
-    // with respect to earlier work, which the ordinary retire path handles.
-    frame_resources_.clear();
+    const GpuToken token{target.recording_value, state.queue};
+    submit_command(target, token, state.command, target.recording_pool,
+        std::move(target.recording_resources));
+    target.recording = nullptr;
+    target.recording_pool = nullptr;
+    target.recording_value = 0;
+    target.recording_resources.clear();
+    state.command = nullptr;
+    return token;
+}
+
+void DeviceImpl::abandon_recording(Recording::State& state) {
+    QueueState& target = queue_state(state.queue);
+    std::lock_guard lock(mutex_);
+    if (!state.command || target.recording != state.command)
+        return;
+    const auto index = static_cast<std::size_t>(state.queue);
+    const std::uint64_t value = target.recording_value;
+    // Nothing was submitted, so the reserved value never signals: records
+    // and resources protected for it are protected for the last one instead.
+    {
+        std::lock_guard argument_lock(target.argument_mutex);
+        std::erase_if(target.argument_pending, [index, value](const auto& region) {
+            return region.held == 0 && region.timelines[index] == value;
+        });
+    }
     {
         std::lock_guard retire_lock(retire_mutex_);
         for (auto& entry : retired_)
-            if (entry.timeline == next_timeline_)
-                entry.timeline = next_timeline_ - 1;
+            if (entry.timelines[index] == value)
+                entry.timelines[index] = value - 1;
     }
+    state.command.reset();
+    target.recording_pool->free.push_back(state.command);
+    target.recording = nullptr;
+    target.recording_pool = nullptr;
+    target.recording_value = 0;
+    target.recording_resources.clear();
+    state.command = nullptr;
+}
+
+void DeviceImpl::abandon_frame(Frame::State& state) {
+    Recording::State recording{state.device, Queue::Graphics, state.command};
+    abandon_recording(recording);
     state.swapchain->stale = true;
     state.open = false;
     state.command = nullptr;
-    state.owned_command.reset();
 }
 
 void DeviceImpl::retire(std::function<void()> release) {
@@ -979,66 +1183,121 @@ void DeviceImpl::retire(std::function<void()> release) {
         std::lock_guard lock(retire_mutex_);
         if (!shut_down_) {
             // Include commands recorded into the current, not-yet-submitted frame.
-            retired_.push_back({frame_command_ ? next_timeline_ : next_timeline_ - 1, std::move(release)});
+            retired_.push_back({recorded_timelines(), std::move(release)});
             return;
         }
     }
-    // After shutdown the queue is idle, so releasing immediately is safe.
+    // After shutdown the queues are idle, so releasing immediately is safe.
     release();
 }
 
 void DeviceImpl::reap_completed() {
-    if (!timeline_)
+    if (!queues_.front().timeline)
         return;
-    const std::uint64_t completed = vk_device().getSemaphoreCounterValue(timeline_.get());
-    while (!pending_.empty() && pending_.front().token.value <= completed)
-        pending_.pop_front();
+    Timelines completed_values{};
+    for (std::size_t index = 0; index < queue_count; ++index) {
+        QueueState& queue = queues_[index];
+        completed_values[index] = completed_value(static_cast<Queue>(index));
+        while (!queue.pending.empty() && queue.pending.front().token.value <= completed_values[index]) {
+            // The owning thread resets and reuses the buffer; see CommandPool.
+            if (Pending& done = queue.pending.front(); done.pool)
+                done.pool->free.push_back(done.command);
+            queue.pending.pop_front();
+        }
+    }
+    const auto is_completed = [&completed_values](const Timelines& timelines) {
+        for (std::size_t index = 0; index < queue_count; ++index)
+            if (timelines[index] > completed_values[index])
+                return false;
+        return true;
+    };
 
     // Collect first, then release with no lock held: a release can drop the
     // last reference to another resource and re-enter retire().
     std::vector<std::function<void()>> releases;
     {
         std::lock_guard retire_lock(retire_mutex_);
-        const auto ready = std::partition(retired_.begin(), retired_.end(),
-            [completed](const Retired& entry) { return entry.timeline > completed; });
-        for (auto it = ready; it != retired_.end(); ++it)
-            releases.push_back(std::move(it->release));
-        retired_.erase(ready, retired_.end());
+        while (!retired_.empty() && is_completed(retired_.front().timelines)) {
+            releases.push_back(std::move(retired_.front().release));
+            retired_.pop_front();
+        }
     }
     for (auto& release : releases)
         release();
 
-    if (buffers_.size() > 64) {
+    std::lock_guard buffers_lock(buffers_mutex_);
+    if (buffers_.size() > buffer_sweep_size_) {
         std::erase_if(buffers_, [](const auto& entry) { return entry.second.expired(); });
+        buffer_sweep_size_ = std::max<std::size_t>(64, buffers_.size() * 2);
     }
 }
 
 void DeviceImpl::wait(const GpuToken token) {
     if (token.value == 0)
         return;
-    std::lock_guard lock(mutex_);
-    if (frame_command_ && token.value >= frame_token_.value)
-        throw Error(ErrorCode::InvalidState,
-            "cannot wait for an open frame; finish it before reusing staging storage");
-    vk::SemaphoreWaitInfo info({}, timeline_.get(), token.value);
+    {
+        const QueueState& queue = queue_state(token.queue);
+        std::lock_guard lock(mutex_);
+        if (queue.recording && queue.recording_thread == std::this_thread::get_id()
+            && token.value >= queue.recording_value)
+            throw Error(ErrorCode::InvalidState,
+                "cannot wait for the calling thread's open frame or Recording; submit it first");
+    }
+    // Blocks without mutex_, so other threads keep submitting meanwhile.
+    vk::SemaphoreWaitInfo info({}, queue_state(token.queue).timeline.get(), token.value);
     const auto result = vk_device().waitSemaphores(info, std::numeric_limits<std::uint64_t>::max());
     if (result != vk::Result::eSuccess)
         throw Error(ErrorCode::DeviceLost, "waiting for the GPU timeline failed");
+    std::lock_guard lock(mutex_);
     reap_completed();
 }
 
+bool DeviceImpl::finished(const GpuToken token) const {
+    return token.value <= completed_value(token.queue);
+}
+
 GpuToken DeviceImpl::signal() {
-    return submit([](vk::CommandBuffer) {});
+    std::lock_guard lock(mutex_);
+    const Queue queue = current_queue();
+    const QueueState& state = queue_state(queue);
+    // Every submission signals its queue's timeline, so the last one's value
+    // already covers everything submitted so far.
+    if (state.recording && state.recording_thread == std::this_thread::get_id())
+        return {state.recording_value, queue};
+    return {state.next_timeline - 1, queue};
+}
+
+void DeviceImpl::queue_wait(const GpuToken token) {
+    std::lock_guard lock(mutex_);
+    const Queue queue = current_queue();
+    // Submission order already covers the calling thread's own queue.
+    if (token.queue == queue || token.value <= completed_value(token.queue))
+        return;
+    std::uint64_t& wait = queue_state(queue).waits[static_cast<std::size_t>(token.queue)];
+    wait = std::max(wait, token.value);
+}
+
+DeviceImpl::QueueWaits DeviceImpl::take_queue_waits(QueueState& queue) {
+    QueueWaits waits;
+    for (std::size_t index = 0; index < queue_count; ++index) {
+        if (queue.waits[index] == 0)
+            continue;
+        waits.semaphores.push_back(queues_[index].timeline.get());
+        waits.values.push_back(std::exchange(queue.waits[index], 0));
+        waits.stages.push_back(vk::PipelineStageFlagBits::eAllCommands);
+    }
+    return waits;
 }
 
 void DeviceImpl::synchronize() {
-    std::uint64_t value = 0;
+    Timelines submitted{};
     {
         std::lock_guard lock(mutex_);
-        value = next_timeline_ - 1;
+        for (std::size_t queue = 0; queue < queue_count; ++queue)
+            submitted[queue] = queues_[queue].next_timeline - 1;
     }
-    if (value)
-        wait({value});
+    for (std::size_t queue = 0; queue < queue_count; ++queue)
+        wait({submitted[queue], static_cast<Queue>(queue)});
 }
 
 vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_t size) {
@@ -1047,71 +1306,74 @@ vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_
 
 vk::DeviceAddress DeviceImpl::stage_held(const void* args, const std::size_t size,
     std::uint64_t& id) {
-    std::lock_guard lock(mutex_);
     id = next_staged_id_++;
     return place_arguments(args, size, id);
 }
 
 void DeviceImpl::release_staged(const std::uint64_t id) noexcept {
-    std::lock_guard lock(mutex_);
-    std::lock_guard argument_lock(argument_mutex_);
-    for (ArgumentRegion& region : argument_pending_) {
-        if (region.held != id)
-            continue;
-        // Every launch that read the record was recorded before this call:
-        // into the open frame, or into submissions already made.
-        region.held = 0;
-        region.token = GpuToken{frame_command_ ? next_timeline_ : next_timeline_ - 1};
-        return;
+    for (QueueState& queue : queues_) {
+        std::lock_guard argument_lock(queue.argument_mutex);
+        for (ArgumentRegion& region : queue.argument_pending) {
+            if (region.held != id)
+                continue;
+            // Every launch that read the record was recorded before this
+            // call: into an open recording, or into submissions already made.
+            region.held = 0;
+            region.timelines = recorded_timelines();
+            return;
+        }
     }
 }
 
-// Called with mutex_ held, so next_timeline_ names the submission the record
-// is protected for.
+// Places the record in the calling thread's queue's ring, protected for the
+// submission it is being recorded into. Waiting for ring space only ever
+// waits for that queue's own earlier work, and holds no device-wide lock.
 vk::DeviceAddress DeviceImpl::place_arguments(const void* args, const std::size_t size,
     const std::uint64_t held) {
     if (!args || size == 0)
         return 0;
-    std::lock_guard lock(argument_mutex_);
-    if (!argument_arena_)
+    QueueState& queue = queue_state(current_queue());
+    std::lock_guard lock(queue.argument_mutex);
+    const std::shared_ptr<BufferImpl>& arena = queue.argument_arena;
+    if (!arena)
         throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
-    if (size > argument_arena_->size)
+    if (size > arena->size)
         throw Error(ErrorCode::OutOfMemory,
             "root arguments do not fit in the GPU argument arena");
     const std::size_t alignment = host_alignment_;
-    std::size_t offset = (argument_offset_ + alignment - 1) & ~(alignment - 1);
-    // Protect every launch record until its submission retires, including
-    // records recorded in an open frame, and every staged record until its
-    // owner releases it.
-    if (offset + size > argument_arena_->size)
+    std::size_t offset = (queue.argument_offset + alignment - 1) & ~(alignment - 1);
+    if (offset + size > arena->size)
         offset = 0;
-    std::uint64_t overlap = 0;
-    const auto completed = vk_device().getSemaphoreCounterValue(timeline_.get());
-    while (!argument_pending_.empty() && argument_pending_.front().held == 0
-        && argument_pending_.front().token.value <= completed)
-        argument_pending_.pop_front();
-    for (const auto& region : argument_pending_) {
+    Timelines overlap{};
+    while (!queue.argument_pending.empty() && queue.argument_pending.front().held == 0
+        && completed(queue.argument_pending.front().timelines))
+        queue.argument_pending.pop_front();
+    for (const auto& region : queue.argument_pending) {
         if (region.end <= offset || region.begin >= offset + size)
             continue;
         if (region.held != 0)
             throw Error(ErrorCode::OutOfMemory,
                 "argument arena is full of staged records still in use");
-        overlap = std::max(overlap, region.token.value);
+        for (std::size_t index = 0; index < queue_count; ++index)
+            overlap[index] = std::max(overlap[index], region.timelines[index]);
     }
-    if (overlap >= next_timeline_)
-        throw Error(ErrorCode::OutOfMemory,
-            "open submission exceeds argument arena capacity");
-    if (overlap > completed) {
-        const vk::SemaphoreWaitInfo wait_info({}, timeline_.get(), overlap);
+    const Timelines recording = recording_timelines();
+    for (std::size_t index = 0; index < queue_count; ++index) {
+        if (recording[index] != 0 && overlap[index] >= recording[index])
+            throw Error(ErrorCode::OutOfMemory,
+                "open submission exceeds argument arena capacity");
+        if (overlap[index] == 0)
+            continue;
+        const vk::SemaphoreWaitInfo wait_info({}, queues_[index].timeline.get(), overlap[index]);
         if (vk_device().waitSemaphores(wait_info,
             std::numeric_limits<std::uint64_t>::max()) != vk::Result::eSuccess)
             throw Error(ErrorCode::DeviceLost, "waiting for argument storage failed");
     }
-    argument_pending_.push_back({offset, offset + size, GpuToken{next_timeline_}, held});
-    std::memcpy(static_cast<std::byte*>(argument_arena_->mapped) + offset, args, size);
-    vmaFlushAllocation(allocator_, argument_arena_->allocation, offset, size);
-    argument_offset_ = offset + size;
-    return argument_arena_->address + offset;
+    queue.argument_pending.push_back({offset, offset + size, recording, held});
+    std::memcpy(static_cast<std::byte*>(arena->mapped) + offset, args, size);
+    vmaFlushAllocation(allocator_, arena->allocation, offset, size);
+    queue.argument_offset = offset + size;
+    return arena->address + offset;
 }
 
 void DeviceImpl::push_root(const vk::CommandBuffer command,
@@ -1126,21 +1388,6 @@ void DeviceImpl::record_compute(const ComputePipelineImpl& pipeline,
     if (!pipeline.pipeline || !args || size == 0
         || groups.x == 0 || groups.y == 0 || groups.z == 0)
         throw Error(ErrorCode::InvalidArgument, "invalid compute dispatch");
-
-    // NoorRay records dispatches into a command buffer it owns, while uploads
-    // and acceleration-structure builds are submitted by this API on the same
-    // queue. Make those earlier writes visible at the consuming dispatch;
-    // queue submission order alone is not a memory dependency for shader reads.
-    vk::MemoryBarrier2 ordering{};
-    ordering.setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-        .setSrcAccessMask(vk::AccessFlagBits2::eMemoryRead
-            | vk::AccessFlagBits2::eMemoryWrite
-            | vk::AccessFlagBits2::eAccelerationStructureWriteKHR)
-        .setDstStageMask(vk::PipelineStageFlagBits2::eComputeShader)
-        .setDstAccessMask(vk::AccessFlagBits2::eShaderRead
-            | vk::AccessFlagBits2::eShaderWrite
-            | vk::AccessFlagBits2::eAccelerationStructureReadKHR);
-    command.pipelineBarrier2({{}, ordering, {}, {}});
     command.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline.pipeline);
     bind_heaps(command);
     push_root(command, stage_arguments(args, size));
@@ -1172,63 +1419,37 @@ void DeviceImpl::record_barrier(const vk::CommandBuffer command, const Stage sou
     command.pipelineBarrier2({{}, memory, {}, {}});
 }
 
+void DeviceImpl::record_full_barrier(const vk::CommandBuffer command) {
+    vk::MemoryBarrier2 memory{};
+    memory.setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
+        .setSrcAccessMask(vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite)
+        .setDstStageMask(vk::PipelineStageFlagBits2::eAllCommands)
+        .setDstAccessMask(vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+    command.pipelineBarrier2({{}, memory, {}, {}});
+}
+
 void DeviceImpl::barrier(const Stage source, const Stage destination) {
     submit([this, source, destination](const vk::CommandBuffer command) {
         record_barrier(command, source, destination);
-    });
+    }, {}, Ordering::Explicit);
 }
 
-// Compiling a ray-tracing library costs up to seconds of driver work. A
-// deferred operation lets worker threads share it; without one the driver
-// also moves part of the compile into the link.
-vk::UniquePipeline DeviceImpl::create_deferred_pipeline(
-    const vk::RayTracingPipelineCreateInfoKHR& info) {
-    vk::UniqueDeferredOperationKHR operation;
+// Ray-tracing pipeline creation is intentionally non-deferred. NoorRay keeps
+// CPU-side material work parallel, but uncached runtime material libraries must
+// not enter the driver's ray-tracing compiler concurrently: some drivers keep
+// compiler work alive internally after vkCreateRayTracingPipelinesKHR returns.
+// Cached calls are already serialized by create_pipeline(); uncached calls take
+// the same mutex here.
+vk::UniquePipeline DeviceImpl::create_ray_tracing_pipeline(
+    const vk::RayTracingPipelineCreateInfoKHR& info, vk::PipelineCache cache) {
+    std::unique_lock<std::mutex> creation_lock;
+    if (!cache)
+        creation_lock = std::unique_lock<std::mutex>(pipeline_creation_mutex_);
     try {
-        operation = vk_device().createDeferredOperationKHRUnique();
+        return vk_device().createRayTracingPipelineKHRUnique({}, cache, info).value;
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
-
-    vk::Pipeline pipeline;
-    const vk::Result deferred = static_cast<vk::Result>(
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateRayTracingPipelinesKHR(vk_device(), *operation,
-            *pipeline_cache_, 1, reinterpret_cast<const VkRayTracingPipelineCreateInfoKHR*>(&info),
-            nullptr, reinterpret_cast<VkPipeline*>(&pipeline)));
-    if (deferred != vk::Result::eSuccess && deferred != vk::Result::eOperationDeferredKHR
-        && deferred != vk::Result::eOperationNotDeferredKHR)
-        throw Error(ErrorCode::ShaderCreationFailed,
-            "Vulkan ray-tracing pipeline creation failed: " + vk::to_string(deferred));
-
-    if (deferred == vk::Result::eOperationDeferredKHR) {
-        const auto join = [this, handle = *operation] {
-            // eThreadDoneKHR means this thread is no longer needed; only
-            // eThreadIdleKHR asks it to come back for more work.
-            for (;;) {
-                const vk::Result result = static_cast<vk::Result>(
-                    VULKAN_HPP_DEFAULT_DISPATCHER.vkDeferredOperationJoinKHR(vk_device(), handle));
-                if (result != vk::Result::eThreadIdleKHR)
-                    return;
-                std::this_thread::yield();
-            }
-        };
-        const std::uint32_t concurrency = std::min<std::uint32_t>(
-            vk_device().getDeferredOperationMaxConcurrencyKHR(*operation),
-            std::max(std::thread::hardware_concurrency(), 1u));
-        std::vector<std::thread> workers;
-        workers.reserve(concurrency > 0 ? concurrency - 1 : 0);
-        for (std::uint32_t i = 1; i < concurrency; ++i)
-            workers.emplace_back(join);
-        join();
-        for (std::thread& worker : workers)
-            worker.join();
-        const vk::Result result = vk_device().getDeferredOperationResultKHR(*operation);
-        if (result != vk::Result::eSuccess)
-            throw Error(ErrorCode::ShaderCreationFailed,
-                "Vulkan ray-tracing pipeline creation failed: " + vk::to_string(result));
-    }
-    return vk::UniquePipeline(pipeline,
-        vk::detail::ObjectDestroy<vk::Device, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>(vk_device()));
 }
 
 RayTracingGroups DeviceImpl::ray_tracing_groups(const RayTracingPipelineDesc& desc) const {
@@ -1301,12 +1522,22 @@ std::shared_ptr<RayTracingLibraryImpl> DeviceImpl::create_ray_tracing_library(
 
     const vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface(
         interface.max_payload_size, interface.max_hit_attribute_size);
-    const vk::PipelineCreateFlags2CreateInfo flags{
+    vk::PipelineCreateFlags2CreateInfo flags{
         vk::PipelineCreateFlagBits2::eDescriptorHeapEXT | vk::PipelineCreateFlagBits2::eLibraryKHR};
     vk::RayTracingPipelineCreateInfoKHR info({}, result->groups.stages,
         result->groups.create_infos, 1, nullptr, &library_interface, nullptr, {});
     info.pNext = &flags;
-    result->pipeline = create_deferred_pipeline(info);
+    result->pipeline = create_pipeline<vk::RayTracingPipelineCreateInfoKHR>(info,
+        desc.use_pipeline_cache,
+        [this](const vk::RayTracingPipelineCreateInfoKHR& library, vk::PipelineCache cache) {
+            return create_ray_tracing_pipeline(library, cache);
+        });
+    result->use_pipeline_cache = desc.use_pipeline_cache;
+    // Libraries take seconds to compile; keep them even if the process dies.
+    if (desc.use_pipeline_cache && pipeline_cache_) {
+        std::lock_guard lock(pipeline_creation_mutex_);
+        pipeline_cache_->save();
+    }
     return result;
 }
 
@@ -1335,23 +1566,50 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::link_ray_tracing(
             return group.kind == RayTracingGroups::Kind::Raygen; }))
         throw Error(ErrorCode::InvalidArgument, "ray-tracing pipelines require a ray-generation shader");
 
-    const vk::PipelineLibraryCreateInfoKHR library_info(handles);
     const vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface(
         interface.max_payload_size, interface.max_hit_attribute_size);
+    const vk::PipelineLibraryCreateInfoKHR library_info(handles);
     const auto heap_flags = pipeline_heap_flags();
     vk::RayTracingPipelineCreateInfoKHR info({}, {}, {}, 1, &library_info, &library_interface,
         nullptr, {});
     info.pNext = &heap_flags;
-    // Linking reuses the libraries' compiled stages, so there is little work
-    // to spread over threads, and NVIDIA's 610 driver faults at the first
-    // trace of a pipeline linked through a deferred operation.
     try {
-        result->pipeline = vk_device().createRayTracingPipelineKHRUnique(
-            {}, *pipeline_cache_, info).value;
+        std::lock_guard lock(pipeline_creation_mutex_);
+        result->pipeline = std::make_shared<const vk::UniquePipeline>(
+            vk_device().createRayTracingPipelineKHRUnique({},
+                std::ranges::all_of(libraries, [](const auto& library) {
+                    return library->use_pipeline_cache;
+                }) ? pipeline_cache() : vk::PipelineCache{}, info).value);
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
-    build_shader_binding_table(*result, groups, hit_groups);
+    if (nvidia_610_driver_)
+        retain_linked_pipeline(result->pipeline, result->libraries);
+    result->groups = std::move(groups);
+    build_shader_binding_table(*result, result->groups, hit_groups);
+    return result;
+}
+
+// NVIDIA 610 keeps compiling a linked pipeline on its own threads after
+// vkCreateRayTracingPipelinesKHR returns, so the pipeline and every library it
+// links must stay alive until the driver is quiescent.
+void DeviceImpl::retain_linked_pipeline(std::shared_ptr<const vk::UniquePipeline> pipeline,
+    std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries) {
+    std::lock_guard lock(linked_pipelines_mutex_);
+    retained_linked_pipelines_.push_back(
+        RetainedLinkedPipeline{std::move(pipeline), std::move(libraries)});
+}
+
+std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::rebind_hit_groups(
+    const RayTracingPipelineImpl& linked, const std::span<const std::uint32_t> hit_groups) {
+    if (!linked.pipeline)
+        throw Error(ErrorCode::InvalidResource, "ray-tracing pipeline is empty");
+    auto result = std::make_shared<RayTracingPipelineImpl>();
+    result->device = self_.lock();
+    result->libraries = linked.libraries;
+    result->pipeline = linked.pipeline;
+    result->groups = linked.groups;
+    build_shader_binding_table(*result, result->groups, hit_groups);
     return result;
 }
 
@@ -1371,7 +1629,7 @@ void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
         / base_alignment * base_alignment;
     const std::size_t group_count = groups.size();
     std::vector<std::byte> handle_bytes(group_count * handle_size);
-    if (vk_device().getRayTracingShaderGroupHandlesKHR(*result.pipeline, 0,
+    if (vk_device().getRayTracingShaderGroupHandlesKHR(**result.pipeline, 0,
             static_cast<std::uint32_t>(group_count), handle_bytes.size(), handle_bytes.data()) != vk::Result::eSuccess)
         throw Error(ErrorCode::ShaderCreationFailed, "Vulkan shader binding table handle query failed");
     // The records of each region, as group indices. Groups keep their
@@ -1458,7 +1716,9 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
         if (!item.positions.address || !item.indices.address || item.triangle_count == 0)
             throw Error(ErrorCode::InvalidArgument, "BLAS geometry contains an empty GPU address or triangle count");
         const auto positions_buffer = find_buffer_resource(item.positions.address);
-        if (item.stride < sizeof(float3) || positions_buffer->size < item.stride)
+        // The positions are read as R32G32B32, which needs three floats, not
+        // the padded size of noorrhi::float3.
+        if (item.stride < 3 * sizeof(float) || positions_buffer->size < item.stride)
             throw Error(ErrorCode::InvalidArgument,
                 "BLAS position buffer is smaller than one strided vertex");
         const std::size_t vertex_count = positions_buffer->size / item.stride;
@@ -1474,7 +1734,7 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
             vk::DeviceOrHostAddressConstKHR{item.indices.address}, {}};
         geometries.emplace_back(vk::GeometryTypeKHR::eTriangles, triangles,
             item.opaque ? vk::GeometryFlagBitsKHR::eOpaque
-                        : vk::GeometryFlagsKHR{});
+                        : vk::GeometryFlagBitsKHR::eNoDuplicateAnyHitInvocation);
         primitive_counts.push_back(item.triangle_count);
     }
 
@@ -1499,7 +1759,10 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
         VMA_MEMORY_USAGE_GPU_ONLY, false,
         acceleration_structure_properties_.minAccelerationStructureScratchOffsetAlignment);
     const auto acceleration_structure = *result->acceleration_structure;
-    const GpuToken token = submit([acceleration_structure, scratch, geometries, primitive_counts]
+    // Not waited for: queue order and the full barriers around every
+    // submission put the build before any later build or trace, and the
+    // submission holds the storage and scratch until it retires.
+    submit([acceleration_structure, scratch, geometries, primitive_counts]
         (const vk::CommandBuffer command) mutable {
         const vk::AccelerationStructureBuildGeometryInfoKHR build_info{
             vk::AccelerationStructureTypeKHR::eBottomLevel,
@@ -1522,7 +1785,6 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
                 | vk::AccessFlagBits2::eAccelerationStructureWriteKHR};
         command.pipelineBarrier2({{}, ready, {}, {}});
     }, {result->storage, scratch});
-    wait(token);
     result->updateable = true;
     result->update_scratch = create_buffer(sizes.updateScratchSize,
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
@@ -1566,8 +1828,7 @@ AccelerationStructure DeviceImpl::build_tlas(const std::span<const Instance> ins
             instance.custom_index, instance.mask,
             instance.shader_binding_table_offset,
             vk::GeometryInstanceFlagBitsKHR::eTriangleFacingCullDisable,
-            vk_device().getAccelerationStructureAddressKHR(
-                {*instance.blas.impl_->acceleration_structure}));
+            instance.blas.impl_->address);
     }
 
     auto instance_buffer = create_buffer(records.size() * sizeof(records[0]),
@@ -1637,7 +1898,7 @@ AccelerationStructure DeviceImpl::build_tlas_at(const vk::DeviceAddress records,
         VMA_MEMORY_USAGE_GPU_ONLY, false,
         acceleration_structure_properties_.minAccelerationStructureScratchOffsetAlignment);
     const auto acceleration_structure = *result->acceleration_structure;
-    const GpuToken token = submit([acceleration_structure, scratch, geometry, count]
+    submit([acceleration_structure, scratch, geometry, count]
         (const vk::CommandBuffer command) mutable {
         const vk::AccelerationStructureBuildGeometryInfoKHR build_info{
             vk::AccelerationStructureTypeKHR::eTopLevel,
@@ -1657,7 +1918,8 @@ AccelerationStructure DeviceImpl::build_tlas_at(const vk::DeviceAddress records,
         command.pipelineBarrier2({{}, ready, {}, {}});
     }, owned_input ? std::vector<std::shared_ptr<void>>{result->storage, scratch, owned_input}
                    : std::vector<std::shared_ptr<void>>{result->storage, scratch});
-    wait(token);
+    // Not waited for: like a BLAS build, queue order and the barrier above
+    // order it before every trace that reads it.
     result->address = vk_device().getAccelerationStructureAddressKHR({acceleration_structure});
     result->storage_size = result->storage->size;
     // The shader-facing handle for an acceleration structure is simply its
@@ -1733,8 +1995,7 @@ void DeviceImpl::update_tlas(AccelerationStructure& tlas,
         records.emplace_back(vk::TransformMatrixKHR{matrix}, instance.custom_index,
             instance.mask, instance.shader_binding_table_offset,
             vk::GeometryInstanceFlagBitsKHR::eTriangleFacingCullDisable,
-            vk_device().getAccelerationStructureAddressKHR(
-                {*instance.blas.impl_->acceleration_structure}));
+            instance.blas.impl_->address);
     }
 
     auto instance_buffer = target->update_input;
@@ -1797,7 +2058,7 @@ void DeviceImpl::upload(const std::shared_ptr<BufferImpl>& destination, const vo
         || destination_offset > destination->size || bytes > destination->size - destination_offset)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU upload range");
     if (!bytes) return;
-    if (frame_command_)
+    if (recording_frame())
         throw Error(ErrorCode::InvalidState, "upload resources before beginning a frame");
     auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferSrc,
         VMA_MEMORY_USAGE_CPU_TO_GPU, true);
@@ -1816,7 +2077,7 @@ void DeviceImpl::download(const std::shared_ptr<BufferImpl>& source, void* data,
         || source_offset > source->size || bytes > source->size - source_offset)
         throw Error(ErrorCode::InvalidArgument, "invalid GPU download range");
     if (!bytes) return;
-    if (frame_command_)
+    if (recording_frame())
         throw Error(ErrorCode::InvalidState, "read back resources after ending a frame");
     auto staging = create_buffer(bytes, vk::BufferUsageFlagBits::eTransferDst,
         VMA_MEMORY_USAGE_GPU_TO_CPU, true);
@@ -1832,8 +2093,8 @@ void DeviceImpl::download(const std::shared_ptr<BufferImpl>& source, void* data,
 
 void DeviceImpl::record_copy_image(const vk::CommandBuffer command,
     ImageImpl& source, ImageImpl& destination) {
-    // VK_KHR_unified_image_layouts lets both images stay in GENERAL for the
-    // copy, so only the memory dependency has to be expressed.
+    // Both images stay in GENERAL for the copy, so only the memory dependency
+    // has to be expressed.
     const auto memory_dependency = [&command](const vk::PipelineStageFlags2 source_stage,
         const vk::AccessFlags2 source_access, const vk::PipelineStageFlags2 destination_stage,
         const vk::AccessFlags2 destination_access) {
@@ -1892,7 +2153,7 @@ void ComputePipelineImpl::launch(const DispatchSize groups, const void* args,
     auto self = const_cast<ComputePipelineImpl*>(this)->shared_from_this();
     device->submit([self, groups, args, size](const vk::CommandBuffer command) {
         self->device->record_compute(*self, command, groups, args, size);
-    }, {self});
+    }, {self}, DeviceImpl::Ordering::Explicit);
 }
 
 void ComputePipelineImpl::launch_indirect(const GpuPtr<DispatchArgs> args,
@@ -2007,6 +2268,7 @@ Device& Device::operator=(Device&& other) noexcept {
 }
 
 DeviceFeatures Device::features() const { return impl_->features(); }
+DeviceInfo Device::info() const { return impl_->info(); }
 MemoryReport Device::memory_report() const { return impl_->memory_report(); }
 
 Shader Device::create_shader(const std::span<const std::byte> spirv) {
@@ -2022,9 +2284,6 @@ ComputePipeline Device::compute(const Shader& shader) {
 GraphicsPipeline Device::graphics(const GraphicsPipelineDesc& desc) {
     return GraphicsPipeline(impl_->create_graphics(desc));
 }
-void Device::save_pipeline_cache() {
-    impl_->save_pipeline_cache();
-}
 RayTracingLibrary Device::ray_tracing_library(const RayTracingPipelineDesc& desc,
     const RayTracingInterface& interface) {
     return RayTracingLibrary(impl_->create_ray_tracing_library(desc, interface));
@@ -2036,6 +2295,13 @@ RayTracingPipeline Device::ray_tracing(const std::span<const RayTracingLibrary> 
     for (const RayTracingLibrary& library : libraries)
         impls.push_back(library.impl_);
     return RayTracingPipeline(impl_->link_ray_tracing(impls, hit_groups));
+}
+
+RayTracingPipeline Device::ray_tracing(const RayTracingPipeline& linked,
+    const std::span<const std::uint32_t> hit_groups) {
+    if (!linked.impl_)
+        throw Error(ErrorCode::InvalidResource, "ray-tracing pipeline is empty");
+    return RayTracingPipeline(impl_->rebind_hit_groups(*linked.impl_, hit_groups));
 }
 AccelerationStructure Device::build_blas(const std::span<const TriangleGeometry> geometry) {
     return impl_->build_blas(geometry);
@@ -2050,6 +2316,14 @@ AccelerationStructure Device::build_tlas(const std::span<const Instance> instanc
 void Device::update_tlas(AccelerationStructure& tlas,
     const std::span<const Instance> instances) {
     impl_->update_tlas(tlas, instances);
+}
+AccelerationStructure Device::build_tlas(const GpuPtr<InstanceRecord> records,
+    const std::uint32_t count, const std::span<const AccelerationStructure> referenced) {
+    return impl_->build_tlas(records, count, referenced);
+}
+void Device::update_tlas(AccelerationStructure& tlas, const GpuPtr<InstanceRecord> records,
+    const std::uint32_t count) {
+    impl_->update_tlas(tlas, records, count);
 }
 Sampler Device::sampler(const SamplerDesc& desc) {
     return Sampler(impl_->create_sampler(desc));
@@ -2086,7 +2360,28 @@ void StagedArguments::release() noexcept {
     id_ = 0;
 }
 void Device::wait(const GpuToken token) { impl_->wait(token); }
+void Device::queue_wait(const GpuToken token) { impl_->queue_wait(token); }
+bool Device::finished(const GpuToken token) const { return impl_->finished(token); }
 void Device::synchronize() { impl_->synchronize(); }
+
+QueueScope::QueueScope(Device& device, const Queue queue) : device_(device.impl_.get()) {
+    device_->bind_queue(queue);
+}
+
+QueueScope::~QueueScope() {
+    device_->unbind_queue();
+}
+
+Recording::Recording(Device& device) : impl_(device.impl_->begin_recording()) {}
+
+Recording::~Recording() {
+    if (impl_->command)
+        impl_->device->abandon_recording(*impl_);
+}
+
+GpuToken Recording::submit() {
+    return impl_->device->end_recording(*impl_);
+}
 void Device::render(const RenderTarget& target, const std::function<void()>& draw_commands) {
     impl_->render(target, draw_commands);
 }
@@ -2128,19 +2423,7 @@ void detail::DeviceImpl::record_ray_tracing(const detail::RayTracingPipelineImpl
         || groups.x == 0 || groups.y == 0 || groups.z == 0)
         throw Error(ErrorCode::InvalidArgument, "invalid ray-tracing dispatch");
     const vk::DeviceAddress root = stage_arguments(args, size);
-    vk::MemoryBarrier2 ordering{};
-    ordering.setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands
-            | vk::PipelineStageFlagBits2::eHost)
-        .setSrcAccessMask(vk::AccessFlagBits2::eMemoryRead
-            | vk::AccessFlagBits2::eMemoryWrite
-            | vk::AccessFlagBits2::eHostWrite
-            | vk::AccessFlagBits2::eAccelerationStructureWriteKHR)
-        .setDstStageMask(vk::PipelineStageFlagBits2::eRayTracingShaderKHR)
-        .setDstAccessMask(vk::AccessFlagBits2::eShaderRead
-            | vk::AccessFlagBits2::eShaderWrite
-            | vk::AccessFlagBits2::eAccelerationStructureReadKHR);
-    command.pipelineBarrier2({{}, ordering, {}, {}});
-    command.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *pipeline.pipeline);
+    command.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, **pipeline.pipeline);
     bind_heaps(command);
     push_root(command, root);
     command.traceRaysKHR(raygen, pipeline.miss_region,
@@ -2158,7 +2441,8 @@ void detail::RayTracingPipelineImpl::trace(const ShaderImpl& raygen, const Dispa
     auto self = const_cast<RayTracingPipelineImpl*>(this)->shared_from_this();
     device->submit([self, region = found->second, groups, args, size](const vk::CommandBuffer command) {
         self->device->record_ray_tracing(*self, region, command, groups, args, size);
-    }, std::vector<std::shared_ptr<void>>{self, shader_binding_table});
+    }, std::vector<std::shared_ptr<void>>{self, shader_binding_table},
+        DeviceImpl::Ordering::Explicit);
 }
 
 void RayTracingPipeline::trace_bytes(const Shader& raygen, const DispatchSize size,

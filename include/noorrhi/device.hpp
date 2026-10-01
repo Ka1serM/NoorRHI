@@ -9,6 +9,7 @@
 #include <memory>
 #include <type_traits>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace noorrhi {
@@ -101,12 +102,20 @@ private:
 };
 
 // Buffer device addresses, dynamic rendering, descriptor heaps, untyped shader
-// pointers and unified image layouts are mandatory: a device that lacks any of
+// pointers and maintenance5 are mandatory: a device that lacks any of
 // them is rejected at construction, so only the optional ray-tracing
 // capabilities are reported.
 struct DeviceFeatures {
     bool ray_query = false;
     bool ray_tracing = false;
+};
+
+// Vulkan driver identity, for diagnostics and driver-specific workarounds.
+struct DeviceInfo {
+    std::string name;
+    std::uint32_t vendor_id = 0;
+    std::uint32_t device_id = 0;
+    std::uint32_t driver_version = 0;
 };
 
 // VMA totals include allocations awaiting GPU completion and allocator slack.
@@ -138,11 +147,11 @@ struct DeviceConfig {
     // its own; each Swapchain creates one. Leaving it null gives a headless
     // device, which is what offline rendering and the tests want.
     SurfaceProvider* presentation = nullptr;
-    // Optional. The driver's compiled pipelines are loaded from this file at
-    // construction and written back by save_pipeline_cache(). Drivers do not
-    // all persist pipeline libraries themselves; without a file the cache only
-    // lives as long as the device.
-    std::filesystem::path pipeline_cache_file;
+    // Optional. A folder owned by the device, where every compiled pipeline is
+    // stored once and loaded instead of compiled on later runs. Needs driver
+    // support for VK_KHR_pipeline_binary; without it, or without a folder,
+    // pipelines are compiled every run.
+    std::filesystem::path pipeline_directory;
 };
 
 class Device {
@@ -155,13 +164,16 @@ public:
     Device& operator=(const Device&) = delete;
 
     DeviceFeatures features() const;
+    DeviceInfo info() const;
     // Current allocation totals, broken down by category.
     MemoryReport memory_report() const;
 
     template<class T> Buffer<T> buffer(std::size_t count);
     template<class T> Image<T> image(std::uint32_t width, std::uint32_t height, ImageUsage usage);
+    // A sampled-only image may have a mip chain; its upload holds every level,
+    // largest first, tightly packed.
     template<class T> Image<T> image(std::uint32_t width, std::uint32_t height,
-        ImageUsage usage, ImageFormat format);
+        ImageUsage usage, ImageFormat format, std::uint32_t mip_levels = 1);
 
     Shader create_shader(std::span<const std::byte> spirv);
     Shader create_shader(std::span<const std::byte> spirv, std::string_view entry_point);
@@ -177,9 +189,10 @@ public:
     // instance's hit offset and a geometry's index select among them.
     RayTracingPipeline ray_tracing(std::span<const RayTracingLibrary> libraries,
         std::span<const std::uint32_t> hit_groups);
-    // Writes every pipeline compiled so far to DeviceConfig::pipeline_cache_file.
-    // Does nothing when no file was configured.
-    void save_pipeline_cache();
+    // The linked pipeline with another hit-group table. Only the shader
+    // binding table is rebuilt; the pipeline itself is shared.
+    RayTracingPipeline ray_tracing(const RayTracingPipeline& linked,
+        std::span<const std::uint32_t> hit_groups);
     AccelerationStructure build_blas(std::span<const TriangleGeometry> geometry);
     // Refits a BLAS in place against the current contents of the vertex and
     // index buffers it was built from. Much cheaper than a rebuild, but only
@@ -201,9 +214,23 @@ public:
     // internal, as everywhere else in this API.
     void copy(ImageHandle source, ImageHandle destination);
 
+    // Inside an open frame or Recording, compute launches and ray-tracing
+    // traces are not ordered with each other: a pass that reads what an
+    // earlier launch or trace wrote needs a barrier between them. Every other
+    // operation (copies, builds, render scopes, interop recording, timestamps)
+    // is ordered against all work before and after it, and so is everything
+    // submitted outside one.
     void barrier(Stage source, Stage destination);
+    // A token for the work submitted so far on the calling thread's queue.
     GpuToken signal();
     void wait(GpuToken token);
+    // Makes the calling thread's queue wait on the GPU for the token before it
+    // runs the work submitted after this call. The CPU does not wait. A queue
+    // waiting on the GPU also holds back everything queued behind the wait.
+    void queue_wait(GpuToken token);
+    // Whether the work up to the token has completed, without waiting for it.
+    bool finished(GpuToken token) const;
+    // Waits for the work submitted so far on every queue.
     void synchronize();
 
     // Draw into `target`. Draws issued by the callback are recorded into the
@@ -227,6 +254,8 @@ public:
 
 private:
     friend class Swapchain;
+    friend class QueueScope;
+    friend class Recording;
     friend interop::DeviceHandles interop::device_handles(Device&);
     friend std::uintptr_t interop::image_view(Device&, ImageHandle);
     friend std::uintptr_t interop::image(Device&, ImageHandle);
@@ -234,6 +263,51 @@ private:
     friend interop::ExternalImageMemory interop::export_image_memory(Device&, ImageHandle);
     friend interop::ExternalSemaphore interop::signal_external(Device&);
     std::shared_ptr<detail::DeviceImpl> impl_;
+};
+
+// Threads may use one Device concurrently. Each records its commands into
+// command buffers of its own without holding any device-wide lock; only
+// submitting takes one briefly. A queue with an open frame or Recording belongs
+// to the thread that opened it until it is submitted: other threads' work for
+// that queue is rejected meanwhile.
+
+// Routes the device work the calling thread issues to `queue` until the scope
+// ends; a thread outside any scope submits to Queue::Graphics. Scopes nest and
+// end in reverse order on the thread that began them.
+//
+// The queues run concurrently on the GPU, but nothing orders one queue's work
+// against the other's: a thread that hands results across waits for their
+// token first, with wait() or queue_wait().
+class QueueScope {
+public:
+    QueueScope(Device& device, Queue queue);
+    ~QueueScope();
+    QueueScope(const QueueScope&) = delete;
+    QueueScope& operator=(const QueueScope&) = delete;
+
+private:
+    const detail::DeviceImpl* device_;
+};
+
+// Batches the work the calling thread issues to its queue into one submission,
+// as a swapchain Frame does on Graphics: open one per unit of work, such as a
+// rendered image, rather than submitting every launch on its own. Uploads and
+// readbacks belong before or after it. Destroying an unsubmitted Recording
+// discards its work.
+class Recording {
+public:
+    explicit Recording(Device& device);
+    ~Recording();
+    Recording(const Recording&) = delete;
+    Recording& operator=(const Recording&) = delete;
+
+    // Submits the recorded work; the token completes when it has run.
+    GpuToken submit();
+
+    struct State;
+
+private:
+    std::shared_ptr<State> impl_;
 };
 
 } // namespace noorrhi
