@@ -30,6 +30,10 @@ struct RayTracingPipelineDesc;
 struct RayTracingInterface;
 class RayTracingLibrary;
 struct TriangleGeometry;
+enum class AccelerationStructureBuildMode : std::uint8_t {
+    Static,
+    Dynamic,
+};
 struct Instance;
 struct InstanceRecord;
 class Sampler;
@@ -193,7 +197,8 @@ public:
     // binding table is rebuilt; the pipeline itself is shared.
     RayTracingPipeline ray_tracing(const RayTracingPipeline& linked,
         std::span<const std::uint32_t> hit_groups);
-    AccelerationStructure build_blas(std::span<const TriangleGeometry> geometry);
+    AccelerationStructure build_blas(std::span<const TriangleGeometry> geometry,
+        AccelerationStructureBuildMode mode = AccelerationStructureBuildMode::Dynamic);
     // Refits a BLAS in place against the current contents of the vertex and
     // index buffers it was built from. Much cheaper than a rebuild, but only
     // valid while those buffers keep their allocation and triangle count --
@@ -249,6 +254,9 @@ public:
     TimestampQuery timestamp();
     // Bracket `commands` with GPU timestamps written into `query`.
     void measure(const TimestampQuery& query, const std::function<void()>& commands);
+    // Names the GPU work `commands` records, for profilers and debuggers such
+    // as Nsight. Adds no ordering; labels nest.
+    void label(std::string_view name, const std::function<void()>& commands);
 
     // Presentation is not part of the device: see noorrhi::Swapchain.
 

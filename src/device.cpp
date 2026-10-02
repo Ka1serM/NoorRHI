@@ -216,8 +216,18 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
         }
         if (layers.empty())
             throw Error(ErrorCode::UnsupportedFeature, "Vulkan validation was requested but is unavailable");
-        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
+    // Debug labels name passes for profilers and debuggers; without the
+    // extension label() records nothing.
+    for (const auto& extension : vk::enumerateInstanceExtensionProperties()) {
+        if (std::string_view(extension.extensionName) == VK_EXT_DEBUG_UTILS_EXTENSION_NAME) {
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            debug_labels_supported_ = true;
+            break;
+        }
+    }
+    if (config.enable_validation && !debug_labels_supported_)
+        throw Error(ErrorCode::UnsupportedFeature, "Vulkan validation needs VK_EXT_debug_utils");
 
     const std::string application_name(config.application_name);
     // 1.4 so that a 1.4 device exposes maintenance5 as core; 1.3 devices
@@ -230,10 +240,8 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
     instance_ = vk::createInstanceUnique(createInfo);
 
     if (!layers.empty()) {
-        // VK_EXT_debug_utils is requested only with the validation layer. Do
-        // not infer this from the platform surface extensions above.
         VULKAN_HPP_DEFAULT_DISPATCHER.init(instance_.get());
-        messenger_ = instance_->createDebugUtilsMessengerEXTUnique({{},
+        messenger_= instance_->createDebugUtilsMessengerEXTUnique({{},
             vk::DebugUtilsMessageSeverityFlagBitsEXT::eError
                 | vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning,
             vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral
@@ -545,6 +553,33 @@ void DeviceImpl::measure(const std::shared_ptr<TimestampQuery::State>& state,
         command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe,
             *timestamp_query_pool_, first + 1u);
     });
+}
+
+// Explicit ordering: a label must not add barriers, or it would change the
+// overlap of the passes it names.
+void DeviceImpl::label(const std::string_view name, const std::function<void()>& commands) {
+    if (!debug_labels_supported_) {
+        commands();
+        return;
+    }
+    const std::string text(name);
+    submit([this, &text](const vk::CommandBuffer command) {
+        begin_label(command, text.c_str());
+    }, {}, Ordering::Explicit);
+    commands();
+    submit([this](const vk::CommandBuffer command) {
+        end_label(command);
+    }, {}, Ordering::Explicit);
+}
+
+void DeviceImpl::begin_label(const vk::CommandBuffer command, const char* name) const {
+    if (debug_labels_supported_)
+        command.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{name});
+}
+
+void DeviceImpl::end_label(const vk::CommandBuffer command) const {
+    if (debug_labels_supported_)
+        command.endDebugUtilsLabelEXT();
 }
 
 double DeviceImpl::timestamp_milliseconds(TimestampQuery::State& query) {
@@ -1434,22 +1469,52 @@ void DeviceImpl::barrier(const Stage source, const Stage destination) {
     }, {}, Ordering::Explicit);
 }
 
-// Ray-tracing pipeline creation is intentionally non-deferred. NoorRay keeps
-// CPU-side material work parallel, but uncached runtime material libraries must
-// not enter the driver's ray-tracing compiler concurrently: some drivers keep
+namespace {
+// Joins threads to a deferred operation until it completes, as many as the
+// driver can use, and returns the operation's result.
+VkResult join_deferred_operation(const vk::Device device, const vk::DeferredOperationKHR operation) {
+    const auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
+    const auto join = [&dispatch, device, operation] {
+        while (dispatch.vkDeferredOperationJoinKHR(device, operation) == VK_THREAD_IDLE_KHR)
+            std::this_thread::yield();
+    };
+    const std::uint32_t concurrency = std::min(
+        dispatch.vkGetDeferredOperationMaxConcurrencyKHR(device, operation),
+        std::max(std::thread::hardware_concurrency(), 1u));
+    {
+        std::vector<std::jthread> helpers;
+        for (std::uint32_t i = 1; i < concurrency; ++i)
+            helpers.emplace_back(join);
+        join();
+    }
+    return dispatch.vkGetDeferredOperationResultKHR(device, operation);
+}
+} // namespace
+
+// Ray-tracing pipelines are created one at a time. NoorRay keeps CPU-side
+// material work parallel, but uncached runtime material libraries must not
+// enter the driver's ray-tracing compiler concurrently: some drivers keep
 // compiler work alive internally after vkCreateRayTracingPipelinesKHR returns.
 // Cached calls are already serialized by create_pipeline(); uncached calls take
-// the same mutex here.
+// the same mutex here. Each creation is deferred instead, so the one compile in
+// flight runs on every core the driver can use.
 vk::UniquePipeline DeviceImpl::create_ray_tracing_pipeline(
     const vk::RayTracingPipelineCreateInfoKHR& info, vk::PipelineCache cache) {
     std::unique_lock<std::mutex> creation_lock;
     if (!cache)
         creation_lock = std::unique_lock<std::mutex>(pipeline_creation_mutex_);
-    try {
-        return vk_device().createRayTracingPipelineKHRUnique({}, cache, info).value;
-    } catch (const vk::SystemError& error) {
-        throw Error(ErrorCode::ShaderCreationFailed, error.what());
-    }
+    const vk::Device device = vk_device();
+    const vk::UniqueDeferredOperationKHR operation = device.createDeferredOperationKHRUnique();
+    // Written by the driver once the deferred operation completes.
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateRayTracingPipelinesKHR(device, *operation,
+        cache, 1, reinterpret_cast<const VkRayTracingPipelineCreateInfoKHR*>(&info), nullptr, &pipeline);
+    if (result == VK_OPERATION_DEFERRED_KHR)
+        result = join_deferred_operation(device, *operation);
+    if (result != VK_SUCCESS && result != VK_OPERATION_NOT_DEFERRED_KHR)
+        throw Error(ErrorCode::ShaderCreationFailed,
+            "vkCreateRayTracingPipelinesKHR: " + vk::to_string(static_cast<vk::Result>(result)));
+    return vk::UniquePipeline(pipeline, device);
 }
 
 RayTracingGroups DeviceImpl::ray_tracing_groups(const RayTracingPipelineDesc& desc) const {
@@ -1700,7 +1765,8 @@ void DeviceImpl::build_shader_binding_table(RayTracingPipelineImpl& result,
         result.shader_binding_table->size);
 }
 
-AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeometry> geometry) {
+AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeometry> geometry,
+    const AccelerationStructureBuildMode mode) {
     if (!acceleration_structure_supported_)
         throw Error(ErrorCode::UnsupportedFeature,
             "acceleration structures are not enabled on this noorrhi::Device");
@@ -1738,15 +1804,22 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
         primitive_counts.push_back(item.triangle_count);
     }
 
+    vk::BuildAccelerationStructureFlagsKHR build_flags{};
+    const bool allow_update = mode == AccelerationStructureBuildMode::Dynamic;
+    if (allow_update)
+        build_flags |= vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
+    build_flags |= allow_update
+        ? vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild
+        : vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
     const vk::AccelerationStructureBuildGeometryInfoKHR size_info{
         vk::AccelerationStructureTypeKHR::eBottomLevel,
-        vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
-            | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate,
+        build_flags,
         vk::BuildAccelerationStructureModeKHR::eBuild, {}, {}, geometries, {}, {}};
     const auto sizes = vk_device().getAccelerationStructureBuildSizesKHR(
         vk::AccelerationStructureBuildTypeKHR::eDevice, size_info, primitive_counts);
     auto result = std::make_shared<AccelerationStructureImpl>();
     result->device = self_.lock();
+    result->blas_build_flags = build_flags;
     result->storage = create_buffer(sizes.accelerationStructureSize,
         vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR
             | vk::BufferUsageFlagBits::eShaderDeviceAddress,
@@ -1762,12 +1835,11 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
     // Not waited for: queue order and the full barriers around every
     // submission put the build before any later build or trace, and the
     // submission holds the storage and scratch until it retires.
-    submit([acceleration_structure, scratch, geometries, primitive_counts]
+    submit([this, acceleration_structure, scratch, geometries, primitive_counts, build_flags]
         (const vk::CommandBuffer command) mutable {
         const vk::AccelerationStructureBuildGeometryInfoKHR build_info{
             vk::AccelerationStructureTypeKHR::eBottomLevel,
-            vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
-            | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate,
+            build_flags,
             vk::BuildAccelerationStructureModeKHR::eBuild, {}, acceleration_structure,
             geometries, {}, vk::DeviceOrHostAddressKHR{scratch->address}};
         std::vector<vk::AccelerationStructureBuildRangeInfoKHR> ranges;
@@ -1776,7 +1848,9 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
             ranges.emplace_back(count, 0, 0, 0);
         // One pointer per build, to that build's range for each of its geometries.
         const vk::AccelerationStructureBuildRangeInfoKHR* geometry_ranges = ranges.data();
+        begin_label(command, "BLAS Build");
         command.buildAccelerationStructuresKHR(build_info, geometry_ranges);
+        end_label(command);
         const vk::MemoryBarrier2 ready{
             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
             vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -1785,11 +1859,12 @@ AccelerationStructure DeviceImpl::build_blas(const std::span<const TriangleGeome
                 | vk::AccessFlagBits2::eAccelerationStructureWriteKHR};
         command.pipelineBarrier2({{}, ready, {}, {}});
     }, {result->storage, scratch});
-    result->updateable = true;
-    result->update_scratch = create_buffer(sizes.updateScratchSize,
-        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-        VMA_MEMORY_USAGE_GPU_ONLY, false,
-        acceleration_structure_properties_.minAccelerationStructureScratchOffsetAlignment);
+    result->updateable = allow_update;
+    if (allow_update)
+        result->update_scratch = create_buffer(sizes.updateScratchSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+            VMA_MEMORY_USAGE_GPU_ONLY, false,
+            acceleration_structure_properties_.minAccelerationStructureScratchOffsetAlignment);
     result->blas_geometries = geometries;
     result->blas_primitive_counts = primitive_counts;
     result->blas_sources = source_buffers;
@@ -1898,7 +1973,7 @@ AccelerationStructure DeviceImpl::build_tlas_at(const vk::DeviceAddress records,
         VMA_MEMORY_USAGE_GPU_ONLY, false,
         acceleration_structure_properties_.minAccelerationStructureScratchOffsetAlignment);
     const auto acceleration_structure = *result->acceleration_structure;
-    submit([acceleration_structure, scratch, geometry, count]
+    submit([this, acceleration_structure, scratch, geometry, count]
         (const vk::CommandBuffer command) mutable {
         const vk::AccelerationStructureBuildGeometryInfoKHR build_info{
             vk::AccelerationStructureTypeKHR::eTopLevel,
@@ -1909,7 +1984,9 @@ AccelerationStructure DeviceImpl::build_tlas_at(const vk::DeviceAddress records,
         const vk::AccelerationStructureBuildRangeInfoKHR range{count, 0, 0, 0};
         const vk::AccelerationStructureBuildRangeInfoKHR* range_ptr = &range;
         const std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> ranges{range_ptr};
+        begin_label(command, "TLAS Build");
         command.buildAccelerationStructuresKHR(build_info, ranges);
+        end_label(command);
         const vk::MemoryBarrier2 ready{
             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
             vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -1942,12 +2019,12 @@ void DeviceImpl::refit_blas(AccelerationStructure& blas) {
     const auto acceleration_structure = *target->acceleration_structure;
     const auto geometries = target->blas_geometries;
     const auto primitive_counts = target->blas_primitive_counts;
-    submit([acceleration_structure, scratch, geometries, primitive_counts]
+    const auto build_flags = target->blas_build_flags;
+    submit([this, acceleration_structure, scratch, geometries, primitive_counts, build_flags]
         (const vk::CommandBuffer command) mutable {
         const vk::AccelerationStructureBuildGeometryInfoKHR build_info{
             vk::AccelerationStructureTypeKHR::eBottomLevel,
-            vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
-                | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate,
+            build_flags,
             vk::BuildAccelerationStructureModeKHR::eUpdate, acceleration_structure,
             acceleration_structure, geometries, {},
             vk::DeviceOrHostAddressKHR{scratch->address}};
@@ -1957,7 +2034,9 @@ void DeviceImpl::refit_blas(AccelerationStructure& blas) {
             ranges.emplace_back(count, 0, 0, 0);
         // One pointer per build, to that build's range for each of its geometries.
         const vk::AccelerationStructureBuildRangeInfoKHR* geometry_ranges = ranges.data();
+        begin_label(command, "BLAS Refit");
         command.buildAccelerationStructuresKHR(build_info, geometry_ranges);
+        end_label(command);
         const vk::MemoryBarrier2 ready{
             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
             vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -2032,7 +2111,7 @@ void DeviceImpl::update_tlas_at(AccelerationStructure& tlas,
     if (!scratch)
         throw Error(ErrorCode::InvalidResource, "TLAS update scratch storage is invalid");
     const auto acceleration_structure = *target->acceleration_structure;
-    const GpuToken token = submit([acceleration_structure, scratch,
+    const GpuToken token = submit([this, acceleration_structure, scratch,
         geometry, flags, count](const vk::CommandBuffer command) mutable {
         const vk::AccelerationStructureBuildGeometryInfoKHR build_info{
             vk::AccelerationStructureTypeKHR::eTopLevel, flags,
@@ -2041,7 +2120,9 @@ void DeviceImpl::update_tlas_at(AccelerationStructure& tlas,
             vk::DeviceOrHostAddressKHR{scratch->address}};
         const vk::AccelerationStructureBuildRangeInfoKHR range{count, 0, 0, 0};
         const vk::AccelerationStructureBuildRangeInfoKHR* range_ptr = &range;
+        begin_label(command, "TLAS Update");
         command.buildAccelerationStructuresKHR(build_info, range_ptr);
+        end_label(command);
         const vk::MemoryBarrier2 ready{
             vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR,
             vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
@@ -2303,8 +2384,9 @@ RayTracingPipeline Device::ray_tracing(const RayTracingPipeline& linked,
         throw Error(ErrorCode::InvalidResource, "ray-tracing pipeline is empty");
     return RayTracingPipeline(impl_->rebind_hit_groups(*linked.impl_, hit_groups));
 }
-AccelerationStructure Device::build_blas(const std::span<const TriangleGeometry> geometry) {
-    return impl_->build_blas(geometry);
+AccelerationStructure Device::build_blas(const std::span<const TriangleGeometry> geometry,
+    const AccelerationStructureBuildMode mode) {
+    return impl_->build_blas(geometry, mode);
 }
 
 void Device::refit_blas(AccelerationStructure& blas) {
@@ -2395,6 +2477,9 @@ void Device::measure(const TimestampQuery& query, const std::function<void()>& c
     if (!query.impl_)
         throw Error(ErrorCode::InvalidResource, "timestamp query is empty");
     impl_->measure(query.impl_, commands);
+}
+void Device::label(const std::string_view name, const std::function<void()>& commands) {
+    impl_->label(name, commands);
 }
 double TimestampQuery::milliseconds() const {
     if (!impl_ || !impl_->device)

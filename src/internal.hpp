@@ -225,6 +225,7 @@ struct AccelerationStructureImpl {
     AccelerationStructureHandle handle{};
     std::uint32_t primitive_count = 0;
     bool updateable = false;
+    vk::BuildAccelerationStructureFlagsKHR blas_build_flags{};
     std::vector<std::shared_ptr<AccelerationStructureImpl>> references;
     std::shared_ptr<BufferImpl> update_input;
     std::shared_ptr<BufferImpl> update_scratch;
@@ -450,6 +451,11 @@ public:
         const std::function<void()>&);
     double timestamp_milliseconds(TimestampQuery::State&);
 
+    // --- Debug labels
+    void label(std::string_view name, const std::function<void()>&);
+    void begin_label(vk::CommandBuffer, const char* name) const;
+    void end_label(vk::CommandBuffer) const;
+
     // --- Presentation
     bool presenting() const noexcept { return presentation_enabled_; }
     std::shared_ptr<SwapchainImpl> create_swapchain(SurfaceProvider&, const SwapchainDesc&);
@@ -512,7 +518,7 @@ public:
     void build_shader_binding_table(RayTracingPipelineImpl&,
         std::span<const RayTracingGroups::Group> groups,
         std::span<const std::uint32_t> hit_groups);
-    AccelerationStructure build_blas(std::span<const TriangleGeometry>);
+    AccelerationStructure build_blas(std::span<const TriangleGeometry>, AccelerationStructureBuildMode);
     AccelerationStructure build_tlas(std::span<const Instance>);
     void refit_blas(AccelerationStructure&);
     void update_tlas(AccelerationStructure&, std::span<const Instance>);
@@ -673,6 +679,7 @@ private:
     vk::UniqueSurfaceKHR probe_surface_;
     // Keyed by thread and queue; see CommandPool. Guarded by mutex_.
     std::map<std::pair<std::thread::id, Queue>, std::unique_ptr<CommandPool>> command_pools_;
+    bool debug_labels_supported_ = false;
     bool acceleration_structure_supported_ = false;
     bool ray_query_supported_ = false;
     bool ray_tracing_supported_ = false;
