@@ -105,11 +105,15 @@ private:
     std::uint64_t address_ = 0;
 };
 
-// Buffer device addresses, dynamic rendering, descriptor heaps, untyped shader
-// pointers and maintenance5 are mandatory: a device that lacks any of
-// them is rejected at construction, so only the optional ray-tracing
-// capabilities are reported.
+// Buffer device addresses, timeline semaphores, synchronization2 and dynamic
+// rendering are mandatory: a device that lacks any of them is rejected at
+// construction. The rest are reported. `descriptor_heap` covers descriptor
+// heaps, untyped shader pointers, maintenance5, shaderInt64, shaderDrawParameters
+// and scalarBlockLayout. Without it the device can still allocate
+// buffers, present and share handles, but creating a pipeline, a sampler or an
+// image that shaders read throws ErrorCode::UnsupportedFeature.
 struct DeviceFeatures {
+    bool descriptor_heap = false;
     bool ray_query = false;
     bool ray_tracing = false;
 };
@@ -134,10 +138,11 @@ struct MemoryReport {
 struct DeviceConfig {
     bool enable_validation = false;
     std::string_view application_name = "NoorRHI";
-    // Ring holding the per-launch root argument records. Records are tens to
-    // a few hundred bytes; this only has to outlast the command buffers that
-    // still reference a given offset.
-    std::size_t argument_arena_bytes = 256u * 1024u;
+    // Size of each chunk of the arena holding the per-launch root argument
+    // records. Records are tens to a few hundred bytes. Chunks are added as
+    // submissions need them and reused once those submissions complete, so this
+    // sets the granularity, not a limit.
+    std::size_t argument_arena_bytes = 1024u * 1024u;
     // Slots in the device-owned descriptor heaps. Every sampled or storage
     // image view takes one texture slot and every sampler one sampler slot;
     // slot 0 of each is reserved. The heaps never grow, so exhausting either

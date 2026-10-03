@@ -17,6 +17,7 @@ namespace noorrhi::detail {
 // and ImageImpl's retire path returns the slot only after the GPU is done.
 std::uint32_t DeviceImpl::write_image_descriptor(const ImageImpl& image,
     const vk::DescriptorType type) {
+    require_descriptor_heaps();
     const std::uint32_t slot = allocate_slot(texture_heap_);
     const bool luminance = image.public_format == ImageFormat::L8Unorm
         || image.public_format == ImageFormat::L8Srgb;

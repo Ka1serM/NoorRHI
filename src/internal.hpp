@@ -22,6 +22,7 @@
 #include <deque>
 #include <map>
 #include <functional>
+#include <list>
 #include <memory>
 #include <span>
 #include <mutex>
@@ -425,7 +426,9 @@ public:
     void push_root(vk::CommandBuffer, vk::DeviceAddress root) const;
     // Bind the global bindless descriptor set used by every pipeline.
     void bind_heaps(vk::CommandBuffer) const;
-    static vk::PipelineCreateFlags2CreateInfo pipeline_heap_flags(const void* next = nullptr) {
+    void require_descriptor_heaps() const;
+    vk::PipelineCreateFlags2CreateInfo pipeline_heap_flags(const void* next = nullptr) const {
+        require_descriptor_heaps();
         return vk::PipelineCreateFlags2CreateInfo{
             vk::PipelineCreateFlagBits2::eDescriptorHeapEXT, next};
     }
@@ -510,8 +513,6 @@ public:
     vk::PipelineCache pipeline_cache() const noexcept {
         return pipeline_cache_ ? pipeline_cache_->handle() : vk::PipelineCache{};
     }
-    void retain_linked_pipeline(std::shared_ptr<const vk::UniquePipeline> pipeline,
-        std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries);
     // Publishes the shader binding table of a created pipeline whose groups,
     // in group-index order, are `groups`. The hit region holds one record per
     // entry of `hit_groups`, each naming a hit group by its index among them.
@@ -557,8 +558,17 @@ private:
         CommandPool* pool = nullptr;
         std::vector<std::shared_ptr<void>> resources;
     };
-    // `size` bytes of launch records in a queue's argument ring.
-    struct ArgumentRegion { std::size_t begin = 0, end = 0; Timelines timelines{}; std::uint64_t held = 0; };
+    // Launch records bump-allocated into one mapped buffer. `timelines` is the
+    // latest submission of each queue that may read any record in it, so the
+    // whole chunk is rewritten only once all of them have completed. A
+    // dedicated chunk holds a single record, `held` is its StagedArguments id
+    // while the owner lives, and it is freed when it retires.
+    struct ArgumentChunk {
+        std::shared_ptr<BufferImpl> arena;
+        std::size_t offset = 0;
+        Timelines timelines{};
+        std::uint64_t held = 0;
+    };
     // One Vulkan queue and the submissions made to it. Both entries may name
     // the same VkQueue; each still keeps its own timeline.
     struct QueueState {
@@ -581,10 +591,12 @@ private:
         std::vector<std::shared_ptr<void>> recording_resources;
         // Launch records of this queue's submissions only, so a queue running
         // behind never makes another queue's recording wait for it.
-        std::shared_ptr<BufferImpl> argument_arena;
-        std::size_t argument_offset = 0;
-        std::deque<ArgumentRegion> argument_pending;
-        std::mutex argument_mutex;
+        // The last pooled chunk is the one being filled; a chunk whose
+        // submissions have completed is moved there when it is full. Pooled
+        // chunks are kept, so the pool holds the most that was ever in flight.
+        std::list<ArgumentChunk> argument_chunks;
+        std::list<ArgumentChunk> argument_dedicated;
+        mutable std::mutex argument_mutex;
     };
     // The semaphore waits a submission to `queue` takes on; clears them.
     struct QueueWaits {
@@ -619,9 +631,10 @@ private:
     Timelines recording_timelines() const;
 
     struct Capabilities {
-        bool mandatory = false;   // BDA, timeline, sync2, dynamic rendering,
-                                  // descriptor heaps, untyped pointers,
-                                  // maintenance5
+        bool mandatory = false;   // BDA, timeline, sync2, dynamic rendering
+        bool descriptor_heap = false;  // descriptor heaps, untyped pointers,
+                                       // maintenance5, int64, draw parameters,
+                                       // scalar layout
         bool acceleration_structure = false;
         bool ray_query = false;
         bool ray_tracing = false;
@@ -635,6 +648,7 @@ private:
     void create_device(const DeviceConfig& config);
     void create_allocator();
     void create_command_state();
+    void query_properties();
     void create_descriptor_heaps();
     void create_heap(DescriptorHeap&, std::uint32_t capacity, vk::DeviceSize descriptor_size,
         vk::DeviceSize descriptor_alignment, vk::DeviceSize heap_alignment,
@@ -683,9 +697,9 @@ private:
     bool acceleration_structure_supported_ = false;
     bool ray_query_supported_ = false;
     bool ray_tracing_supported_ = false;
+    bool descriptor_heap_supported_ = false;
     bool external_memory_fd_enabled_ = false;
     bool external_semaphore_fd_enabled_ = false;
-    bool nvidia_610_driver_ = false;
     bool pipeline_binaries_enabled_ = false;
     VmaAllocator allocator_ = VK_NULL_HANDLE;
 
@@ -693,19 +707,13 @@ private:
     // libraries and links explicitly bypass it.
     std::optional<PipelineCacheFile> pipeline_cache_;
     std::mutex pipeline_creation_mutex_;
-    // NVIDIA 610 may keep compiling a linked pipeline after the create call
-    // returns. Retain it until device shutdown; an elapsed-time grace period
-    // cannot establish when the driver's background work is finished.
-    struct RetainedLinkedPipeline {
-        std::shared_ptr<const vk::UniquePipeline> pipeline;
-        std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries;
-    };
-    std::mutex linked_pipelines_mutex_;
-    std::vector<RetainedLinkedPipeline> retained_linked_pipelines_;
     vk::UniqueQueryPool timestamp_query_pool_;
     std::uint32_t next_timestamp_query_ = 0;
     float timestamp_period_ns_ = 1.0f;
     std::size_t argument_arena_size_ = 0;
+    std::shared_ptr<BufferImpl> create_argument_arena(std::size_t size);
+    ArgumentChunk& pooled_argument_chunk(QueueState& queue, std::size_t size);
+    ArgumentChunk& dedicated_argument_chunk(QueueState& queue, std::size_t size, std::uint64_t held);
     std::size_t host_alignment_ = 16;
     // Places a record in the calling thread's queue's ring. `held` is the
     // StagedArguments id while its owner lives, and 0 once the region only

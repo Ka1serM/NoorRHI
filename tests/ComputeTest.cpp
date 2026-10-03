@@ -153,7 +153,7 @@ TEST_CASE("NoorRHI shared records publish their data on commit") {
     CHECK(record.ptr().address != 0);
 }
 
-TEST_CASE("NoorRHI argument arena preserves launches across wraparound") {
+TEST_CASE("NoorRHI argument arena preserves launches across chunks") {
     noorrhi::Device device({.enable_validation = true, .application_name = "arena tests",
         .argument_arena_bytes = 4096});
     auto input = device.buffer<float>(1);
@@ -174,6 +174,50 @@ TEST_CASE("NoorRHI argument arena preserves launches across wraparound") {
     }
     output.download(std::span(actual));
     CHECK(actual == std::vector<float>(400, 2.0f));
+}
+
+TEST_CASE("NoorRHI argument arena holds more than a chunk in one open recording") {
+    noorrhi::Device device({.enable_validation = true, .application_name = "arena tests",
+        .argument_arena_bytes = 4096});
+    auto input = device.buffer<float>(1);
+    auto output = device.buffer<float>(2000);
+    const float one = 1.0f;
+    input.upload(std::span(&one, 1));
+    std::vector<float> actual(2000, 0.0f);
+    output.upload(std::span<const float>(actual));
+    auto pipeline = device.compute(device.create_shader(read_shader(NOORRHI_TEST_SHADER)));
+    struct Args {
+        noorrhi::GpuPtr<float> a, b, output;
+        std::uint32_t count;
+    };
+    struct LargeArgs : Args {
+        std::byte padding[8192];
+    };
+    {
+        noorrhi::Recording recording(device);
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            const Args args{input.ptr(), input.ptr(),
+                noorrhi::GpuPtr<float>{output.ptr().address + i * sizeof(float)}, 1};
+            pipeline.launch({1, 1, 1}, args);
+        }
+        recording.submit();
+    }
+    output.download(std::span(actual));
+    CHECK(actual == std::vector<float>(2000, 2.0f));
+
+    std::fill(actual.begin(), actual.end(), 0.0f);
+    output.upload(std::span<const float>(actual));
+    for (std::size_t i = 0; i < 8; ++i) {
+        LargeArgs args{};
+        args.a = input.ptr();
+        args.b = input.ptr();
+        args.output = noorrhi::GpuPtr<float>{output.ptr().address + i * sizeof(float)};
+        args.count = 1;
+        pipeline.launch({1, 1, 1}, args);
+    }
+    output.download(std::span(actual));
+    for (std::size_t i = 0; i < 8; ++i)
+        CHECK(actual[i] == 2.0f);
 }
 
 TEST_CASE("NoorRHI API round-trips image contents") {

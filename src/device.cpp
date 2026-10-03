@@ -68,7 +68,7 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
             physical_device_.getProperties().limits.nonCoherentAtomSize);
         if (argument_arena_size_ < host_alignment_ || argument_arena_size_ % host_alignment_)
             throw Error(ErrorCode::InvalidArgument,
-                "argument budget must be a multiple of the device host alignment");
+                "argument chunk size must be a multiple of the device host alignment");
         create_device(config);
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_device());
         // Only now does the dispatcher hold the device's own functions.
@@ -149,11 +149,10 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
         has_compute |= static_cast<bool>(queue.queueFlags & vk::QueueFlagBits::eCompute);
 
     capabilities.mandatory = has_compute
-        && supported.features.shaderInt64 && supported11.shaderDrawParameters
-        && supported13.shaderIntegerDotProduct
         && supported12.bufferDeviceAddress && supported12.timelineSemaphore
-        && supported12.runtimeDescriptorArray && supported12.scalarBlockLayout
-        && supported13.synchronization2 && supported13.dynamicRendering
+        && supported13.synchronization2 && supported13.dynamicRendering;
+    capabilities.descriptor_heap = supported.features.shaderInt64 && supported11.shaderDrawParameters
+        && supported12.scalarBlockLayout
         && has_descriptor_heap && supported_heap.descriptorHeap
         && has_untyped_pointers && supported_untyped.shaderUntypedPointers
         && has_maintenance5 && supported_maintenance5.maintenance5;
@@ -169,23 +168,38 @@ void DeviceImpl::adopt_capabilities(const Capabilities& capabilities) {
     acceleration_structure_supported_ = capabilities.acceleration_structure;
     ray_query_supported_ = capabilities.ray_query;
     ray_tracing_supported_ = capabilities.ray_tracing;
+    descriptor_heap_supported_ = capabilities.descriptor_heap;
+    features_.descriptor_heap = descriptor_heap_supported_;
     features_.ray_query = ray_query_supported_;
     features_.ray_tracing = ray_tracing_supported_;
 }
 
+std::shared_ptr<BufferImpl> DeviceImpl::create_argument_arena(const std::size_t size) {
+    return create_buffer(size,
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        VMA_MEMORY_USAGE_CPU_TO_GPU, true);
+}
+
 void DeviceImpl::initialize_resources() {
-    create_descriptor_heaps();
+    query_properties();
+    if (descriptor_heap_supported_)
+        create_descriptor_heaps();
     for (QueueState& queue : queues_)
-        queue.argument_arena = create_buffer(argument_arena_size_,
-            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-            VMA_MEMORY_USAGE_CPU_TO_GPU, true);
+        queue.argument_chunks.push_back({create_argument_arena(argument_arena_size_)});
 }
 
 MemoryReport DeviceImpl::memory_report() const {
     VmaTotalStatistics statistics{};
     vmaCalculateStatistics(allocator_, &statistics);
+    std::uint64_t argument_bytes = 0;
+    for (const QueueState& queue : queues_) {
+        std::lock_guard argument_lock(queue.argument_mutex);
+        for (const auto* chunks : {&queue.argument_chunks, &queue.argument_dedicated})
+            for (const ArgumentChunk& chunk : *chunks)
+                argument_bytes += chunk.arena->size;
+    }
     return {statistics.total.statistics.allocationBytes, statistics.total.statistics.blockBytes,
-        statistics.total.statistics.allocationCount, argument_arena_size_ * queue_count};
+        statistics.total.statistics.allocationCount, argument_bytes};
 }
 
 void DeviceImpl::create_instance(const DeviceConfig& config) {
@@ -306,8 +320,7 @@ void DeviceImpl::select_physical_device() {
     if (!best)
         throw Error(ErrorCode::UnsupportedFeature,
             "No Vulkan 1.3 device supports buffer device address, timeline semaphores, "
-            "synchronization2, dynamic rendering, VK_EXT_descriptor_heap, "
-            "VK_KHR_shader_untyped_pointers and maintenance5");
+            "synchronization2 and dynamic rendering");
     physical_device_ = best;
     adopt_capabilities(best_capabilities);
 }
@@ -351,12 +364,13 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
         {{}, graphics.family, async_index + 1, priorities.data()}};
 
     const auto extensions = physical_device_.enumerateDeviceExtensionProperties();
-    std::vector<const char*> enabled_extensions{
-        VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
-        VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
-    };
-    if (physical_device_.getProperties().apiVersion < VK_API_VERSION_1_4)
-        enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    std::vector<const char*> enabled_extensions;
+    if (descriptor_heap_supported_) {
+        enabled_extensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
+        enabled_extensions.push_back(VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
+        if (physical_device_.getProperties().apiVersion < VK_API_VERSION_1_4)
+            enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    }
     if (presentation_enabled_)
         enabled_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     external_memory_fd_enabled_ = has_extension(extensions,
@@ -370,8 +384,7 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
 
     const vk::PhysicalDeviceFeatures supported_base = physical_device_.getFeatures();
     vk::PhysicalDeviceFeatures base{};
-    if (supported_base.shaderInt64)
-        base.shaderInt64 = VK_TRUE;
+    base.shaderInt64 = descriptor_heap_supported_;
     // RTXDI's path tracer declares Int16; without the feature the module is
     // invalid and the driver's results undefined.
     if (supported_base.shaderInt16)
@@ -380,7 +393,7 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     // shaderDrawParameters is declared by Slang-compiled vertex shaders; the
     // validation layers reject the module without it.
     vk::PhysicalDeviceVulkan11Features features11{};
-    features11.shaderDrawParameters = VK_TRUE;
+    features11.shaderDrawParameters = descriptor_heap_supported_;
     vk::PhysicalDeviceVulkan12Features features12{};
     // Slang declares Float16 for shared records containing half-precision
     // Gaussian coefficients, including shaders that do not load them.
@@ -400,33 +413,29 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     // Slang's natural layout for records reached through GPU pointers matches
     // C++ struct packing (vec3 followed by a scalar, for instance), which is
     // only legal SPIR-V under scalar block layout.
-    features12.scalarBlockLayout = VK_TRUE;
+    features12.scalarBlockLayout = descriptor_heap_supported_;
     vk::PhysicalDeviceVulkan13Features features13{};
     features13.synchronization2 = VK_TRUE;
     features13.dynamicRendering = VK_TRUE;
-    features13.shaderIntegerDotProduct = VK_TRUE;
     features11.pNext = &features12;
     features12.pNext = &features13;
+    void** tail = &features13.pNext;
     vk::PhysicalDeviceDescriptorHeapFeaturesEXT heap_features{};
-    heap_features.descriptorHeap = VK_TRUE;
     vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers{};
-    untyped_pointers.shaderUntypedPointers = VK_TRUE;
     vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5{};
-    maintenance5.maintenance5 = VK_TRUE;
-    features13.pNext = &heap_features;
-    heap_features.pNext = &untyped_pointers;
-    untyped_pointers.pNext = &maintenance5;
-    void** tail = &maintenance5.pNext;
+    if (descriptor_heap_supported_) {
+        heap_features.descriptorHeap = VK_TRUE;
+        untyped_pointers.shaderUntypedPointers = VK_TRUE;
+        maintenance5.maintenance5 = VK_TRUE;
+        *tail = &heap_features;
+        heap_features.pNext = &untyped_pointers;
+        untyped_pointers.pNext = &maintenance5;
+        tail = &maintenance5.pNext;
+    }
 
     vk::PhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features{};
-    const vk::PhysicalDeviceProperties properties = physical_device_.getProperties();
-    // NVIDIA 610's vkGetPipelineKeyKHR returns with RBX clobbered on Linux,
-    // corrupting callers that use the register for a live pointer.
-    nvidia_610_driver_ = properties.vendorID == 0x10de
-        && (properties.driverVersion >> 22) == 610;
     pipeline_binaries_enabled_ =
-        !nvidia_610_driver_
-        && has_extension(extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)
+        has_extension(extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)
         && physical_device_.getFeatures2<vk::PhysicalDeviceFeatures2,
                vk::PhysicalDevicePipelineBinaryFeaturesKHR>()
                .get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries;
@@ -610,17 +619,31 @@ constexpr vk::DeviceSize align_up(const vk::DeviceSize value, const vk::DeviceSi
 // Every shader in this library takes the same thing: one 8-byte pointer to its
 // root argument record as push data, plus whatever textures and samplers it
 // indexes out of the two device-owned heaps. No pipeline layout exists.
-void DeviceImpl::create_descriptor_heaps() {
+void DeviceImpl::query_properties() {
     vk::PhysicalDeviceProperties2 properties{};
-    properties.pNext = &heap_properties_;
+    void** tail = &properties.pNext;
+    if (descriptor_heap_supported_) {
+        *tail = &heap_properties_;
+        tail = &heap_properties_.pNext;
+    }
     if (acceleration_structure_supported_) {
-        heap_properties_.pNext = &acceleration_structure_properties_;
+        *tail = &acceleration_structure_properties_;
         acceleration_structure_properties_.pNext = &ray_tracing_properties_;
     }
     physical_device_.getProperties2(&properties);
     heap_properties_.pNext = nullptr;
     acceleration_structure_properties_.pNext = nullptr;
+}
 
+void DeviceImpl::require_descriptor_heaps() const {
+    if (!descriptor_heap_supported_)
+        throw Error(ErrorCode::UnsupportedFeature,
+            "this device lacks what pipelines, samplers and shader-visible images need: "
+            "VK_EXT_descriptor_heap, VK_KHR_shader_untyped_pointers, maintenance5, shaderInt64, "
+            "shaderDrawParameters and scalarBlockLayout");
+}
+
+void DeviceImpl::create_descriptor_heaps() {
     if (heap_properties_.maxPushDataSize < sizeof(vk::DeviceAddress))
         throw Error(ErrorCode::UnsupportedFeature,
             "descriptor heap push data cannot hold an 8-byte root pointer");
@@ -737,7 +760,6 @@ void DeviceImpl::shutdown() noexcept {
     for (QueueState& queue : queues_) {
         queue.recording = nullptr;
         queue.recording_resources.clear();
-        queue.argument_pending.clear();
         queue.pending.clear();
     }
     // The queue is idle, so everything still deferred can be released.
@@ -753,17 +775,13 @@ void DeviceImpl::shutdown() noexcept {
     // These internal buffers own VMA allocations and are destroyed before the
     // allocator itself. External resource objects keep DeviceImpl alive, so
     // no user-visible resource should remain here.
-    for (QueueState& queue : queues_)
-        queue.argument_arena.reset();
+    for (QueueState& queue : queues_) {
+        queue.argument_chunks.clear();
+        queue.argument_dedicated.clear();
+    }
     {
         std::lock_guard lock(mutex_);
         command_pools_.clear();
-    }
-    {
-        // Break the intentional DeviceImpl -> retained library -> DeviceImpl
-        // ownership cycle once the device is idle.
-        std::lock_guard lock(linked_pipelines_mutex_);
-        retained_linked_pipelines_.clear();
     }
     std::lock_guard heap_lock(heap_mutex_);
     texture_heap_ = {};
@@ -914,6 +932,7 @@ std::shared_ptr<ComputePipelineImpl> DeviceImpl::create_compute(const Shader& sh
 }
 
 std::shared_ptr<SamplerImpl> DeviceImpl::create_sampler(const SamplerDesc& desc) {
+    require_descriptor_heaps();
     const auto filter = desc.filter == Filter::Linear ? vk::Filter::eLinear : vk::Filter::eNearest;
     const auto address = [](const AddressMode mode) {
         switch (mode) {
@@ -1184,8 +1203,13 @@ void DeviceImpl::abandon_recording(Recording::State& state) {
     // and resources protected for it are protected for the last one instead.
     {
         std::lock_guard argument_lock(target.argument_mutex);
-        std::erase_if(target.argument_pending, [index, value](const auto& region) {
-            return region.held == 0 && region.timelines[index] == value;
+        // The submission never signals, so records written for it are dead and
+        // the chunks they share with older records wait for the last one instead.
+        for (ArgumentChunk& chunk : target.argument_chunks)
+            if (chunk.timelines[index] == value)
+                chunk.timelines[index] = value - 1;
+        std::erase_if(target.argument_dedicated, [index, value](const ArgumentChunk& chunk) {
+            return chunk.held == 0 && chunk.timelines[index] == value;
         });
     }
     {
@@ -1348,67 +1372,71 @@ vk::DeviceAddress DeviceImpl::stage_held(const void* args, const std::size_t siz
 void DeviceImpl::release_staged(const std::uint64_t id) noexcept {
     for (QueueState& queue : queues_) {
         std::lock_guard argument_lock(queue.argument_mutex);
-        for (ArgumentRegion& region : queue.argument_pending) {
-            if (region.held != id)
+        for (ArgumentChunk& chunk : queue.argument_dedicated) {
+            if (chunk.held != id)
                 continue;
             // Every launch that read the record was recorded before this
             // call: into an open recording, or into submissions already made.
-            region.held = 0;
-            region.timelines = recorded_timelines();
+            chunk.held = 0;
+            chunk.timelines = recorded_timelines();
             return;
         }
     }
 }
 
-// Places the record in the calling thread's queue's ring, protected for the
-// submission it is being recorded into. Waiting for ring space only ever
-// waits for that queue's own earlier work, and holds no device-wide lock.
+// The chunk with room for `size` bytes: the current one, else the oldest
+// chunk whose submissions have all completed, else a new one. Taking a chunk
+// never waits, so the argument data one submission may record is limited only
+// by device memory.
+DeviceImpl::ArgumentChunk& DeviceImpl::pooled_argument_chunk(QueueState& queue, const std::size_t size) {
+    ArgumentChunk& current = queue.argument_chunks.back();
+    if (((current.offset + host_alignment_ - 1) & ~(host_alignment_ - 1)) + size <= current.arena->size)
+        return current;
+    auto reusable = std::find_if(queue.argument_chunks.begin(), std::prev(queue.argument_chunks.end()),
+        [this](const ArgumentChunk& chunk) { return completed(chunk.timelines); });
+    if (reusable == std::prev(queue.argument_chunks.end()))
+        queue.argument_chunks.push_back({create_argument_arena(argument_arena_size_)});
+    else {
+        reusable->offset = 0;
+        reusable->timelines = {};
+        queue.argument_chunks.splice(queue.argument_chunks.end(), queue.argument_chunks, reusable);
+    }
+    return queue.argument_chunks.back();
+}
+
+DeviceImpl::ArgumentChunk& DeviceImpl::dedicated_argument_chunk(QueueState& queue, const std::size_t size,
+    const std::uint64_t held) {
+    std::erase_if(queue.argument_dedicated, [this](const ArgumentChunk& chunk) {
+        return chunk.held == 0 && completed(chunk.timelines);
+    });
+    const std::size_t capacity = (size + host_alignment_ - 1) & ~(host_alignment_ - 1);
+    queue.argument_dedicated.push_back({create_argument_arena(capacity), 0, {}, held});
+    return queue.argument_dedicated.back();
+}
+
+// Places the record in the calling thread's queue's chunks, protected for the
+// submission it is being recorded into. A staged record (`held` is its id) and
+// a record larger than a chunk each get a chunk of their own, so a long-lived
+// staged record never pins the space of other records.
 vk::DeviceAddress DeviceImpl::place_arguments(const void* args, const std::size_t size,
     const std::uint64_t held) {
     if (!args || size == 0)
         return 0;
     QueueState& queue = queue_state(current_queue());
     std::lock_guard lock(queue.argument_mutex);
-    const std::shared_ptr<BufferImpl>& arena = queue.argument_arena;
-    if (!arena)
+    if (queue.argument_chunks.empty())
         throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
-    if (size > arena->size)
-        throw Error(ErrorCode::OutOfMemory,
-            "root arguments do not fit in the GPU argument arena");
-    const std::size_t alignment = host_alignment_;
-    std::size_t offset = (queue.argument_offset + alignment - 1) & ~(alignment - 1);
-    if (offset + size > arena->size)
-        offset = 0;
-    Timelines overlap{};
-    while (!queue.argument_pending.empty() && queue.argument_pending.front().held == 0
-        && completed(queue.argument_pending.front().timelines))
-        queue.argument_pending.pop_front();
-    for (const auto& region : queue.argument_pending) {
-        if (region.end <= offset || region.begin >= offset + size)
-            continue;
-        if (region.held != 0)
-            throw Error(ErrorCode::OutOfMemory,
-                "argument arena is full of staged records still in use");
-        for (std::size_t index = 0; index < queue_count; ++index)
-            overlap[index] = std::max(overlap[index], region.timelines[index]);
-    }
+    const bool dedicated = held != 0 || size > argument_arena_size_;
+    ArgumentChunk& chunk = dedicated ? dedicated_argument_chunk(queue, size, held)
+                                     : pooled_argument_chunk(queue, size);
+    const std::size_t offset = (chunk.offset + host_alignment_ - 1) & ~(host_alignment_ - 1);
     const Timelines recording = recording_timelines();
-    for (std::size_t index = 0; index < queue_count; ++index) {
-        if (recording[index] != 0 && overlap[index] >= recording[index])
-            throw Error(ErrorCode::OutOfMemory,
-                "open submission exceeds argument arena capacity");
-        if (overlap[index] == 0)
-            continue;
-        const vk::SemaphoreWaitInfo wait_info({}, queues_[index].timeline.get(), overlap[index]);
-        if (vk_device().waitSemaphores(wait_info,
-            std::numeric_limits<std::uint64_t>::max()) != vk::Result::eSuccess)
-            throw Error(ErrorCode::DeviceLost, "waiting for argument storage failed");
-    }
-    queue.argument_pending.push_back({offset, offset + size, recording, held});
-    std::memcpy(static_cast<std::byte*>(arena->mapped) + offset, args, size);
-    vmaFlushAllocation(allocator_, arena->allocation, offset, size);
-    queue.argument_offset = offset + size;
-    return arena->address + offset;
+    for (std::size_t index = 0; index < queue_count; ++index)
+        chunk.timelines[index] = std::max(chunk.timelines[index], recording[index]);
+    std::memcpy(static_cast<std::byte*>(chunk.arena->mapped) + offset, args, size);
+    vmaFlushAllocation(allocator_, chunk.arena->allocation, offset, size);
+    chunk.offset = offset + size;
+    return chunk.arena->address + offset;
 }
 
 void DeviceImpl::push_root(const vk::CommandBuffer command,
@@ -1580,6 +1608,7 @@ RayTracingGroups DeviceImpl::ray_tracing_groups(const RayTracingPipelineDesc& de
 
 std::shared_ptr<RayTracingLibraryImpl> DeviceImpl::create_ray_tracing_library(
     const RayTracingPipelineDesc& desc, const RayTracingInterface& interface) {
+    require_descriptor_heaps();
     auto result = std::make_shared<RayTracingLibraryImpl>();
     result->device = self_.lock();
     result->interface = interface;
@@ -1648,21 +1677,9 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::link_ray_tracing(
     } catch (const vk::SystemError& error) {
         throw Error(ErrorCode::ShaderCreationFailed, error.what());
     }
-    if (nvidia_610_driver_)
-        retain_linked_pipeline(result->pipeline, result->libraries);
     result->groups = std::move(groups);
     build_shader_binding_table(*result, result->groups, hit_groups);
     return result;
-}
-
-// NVIDIA 610 keeps compiling a linked pipeline on its own threads after
-// vkCreateRayTracingPipelinesKHR returns, so the pipeline and every library it
-// links must stay alive until the driver is quiescent.
-void DeviceImpl::retain_linked_pipeline(std::shared_ptr<const vk::UniquePipeline> pipeline,
-    std::vector<std::shared_ptr<RayTracingLibraryImpl>> libraries) {
-    std::lock_guard lock(linked_pipelines_mutex_);
-    retained_linked_pipelines_.push_back(
-        RetainedLinkedPipeline{std::move(pipeline), std::move(libraries)});
 }
 
 std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::rebind_hit_groups(

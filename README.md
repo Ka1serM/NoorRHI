@@ -99,9 +99,10 @@ Temporary duplicate memory is intentional. Download waits for its copy.
 There is no fixed staging budget or global dirty-object list.
 
 Small per-frame values, including NoorRay's camera, go directly in root arguments.
-The backend copies these into a mapped arena and retires ranges by timeline value.
-Exhausting the arena within one open frame throws instead of deadlocking; increase
-`DeviceConfig::argument_arena_bytes` if a frame genuinely needs more space.
+The backend copies these into mapped chunks and reuses a chunk once every submission
+that may read it has completed by timeline value. Chunks are added as needed, so a
+frame can record any amount of argument data; `DeviceConfig::argument_arena_bytes` is
+the chunk size.
 
 ## Presentation
 
@@ -160,13 +161,14 @@ external API to finish using exported objects before their owners are destroyed.
 ## Requirements and verification
 
 Vulkan 1.3 with buffer device addresses, timeline semaphores, synchronization2
-and dynamic rendering is mandatory, as are
+and dynamic rendering is mandatory; devices without them are skipped at selection.
 `VK_EXT_descriptor_heap` (`descriptorHeap`), `VK_KHR_shader_untyped_pointers`
-(`shaderUntypedPointers`) and maintenance5 (core in 1.4, or the extension).
-Devices without them are skipped at selection. None of these is vendor-specific,
-but driver support is recent: at the time of writing, NVIDIA's driver exposes
-`VK_EXT_descriptor_heap`, and AMD and Intel need a driver version that ships it.
-Ray tracing is checked separately.
+(`shaderUntypedPointers`), maintenance5 (core in 1.4, or the extension),
+`shaderInt64`, `shaderDrawParameters` and `scalarBlockLayout` are reported as `DeviceFeatures::descriptor_heap`. Without them a device still
+allocates buffers and presents, but creating a pipeline, a sampler or a
+shader-visible image throws `UnsupportedFeature`. None of these is
+vendor-specific, but driver support is recent. Ray tracing is checked
+separately.
 
 Shaders are supplied as SPIR-V bytes. Any shader that indexes
 `ResourceDescriptorHeap` or `SamplerDescriptorHeap` must be compiled with
