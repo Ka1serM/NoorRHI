@@ -277,7 +277,7 @@ TEST_CASE("NoorRHI API reads back single texels and sub-rectangles") {
         noorrhi::Error);
 }
 
-TEST_CASE("NoorRHI shaders read and write images through the descriptor heaps") {
+TEST_CASE("NoorRHI shaders read and write images through the bindless set") {
     noorrhi::Device device = make_device();
     constexpr std::uint32_t size = 8;
     auto target = device.image<std::uint8_t>(size, size,
@@ -309,9 +309,9 @@ TEST_CASE("NoorRHI shaders read and write images through the descriptor heaps") 
     }
 }
 
-TEST_CASE("NoorRHI descriptor heap slots are reused after retirement and never overflow") {
-    // Slot 0 is reserved, so three storage images fill this heap.
-    noorrhi::Device device({.enable_validation = true, .application_name = "heap tests",
+TEST_CASE("NoorRHI bindless slots are reused after retirement and never overflow") {
+    // Slot 0 is reserved, so three storage images fill the texture slots.
+    noorrhi::Device device({.enable_validation = true, .application_name = "bindless tests",
         .texture_descriptor_capacity = 4, .sampler_descriptor_capacity = 2});
     for (std::uint32_t i = 0; i < 64u; ++i) {
         {
@@ -333,7 +333,7 @@ TEST_CASE("NoorRHI descriptor heap slots are reused after retirement and never o
     REQUIRE(held[0].storage_handle().value != held[2].storage_handle().value);
     try {
         auto overflow = device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage);
-        FAIL("a full descriptor heap accepted another image");
+        FAIL("full texture slots accepted another image");
     } catch (const noorrhi::Error& error) {
         REQUIRE(error.code() == noorrhi::ErrorCode::OutOfMemory);
     }
@@ -432,7 +432,7 @@ TEST_CASE("NoorRHI API exposes samplers and rejects invalid resources") {
 TEST_CASE("NoorRHI API reclaims buffer allocations after GPU retirement") {
     noorrhi::Device device = make_device();
     const auto before = device.memory_report().allocation_bytes;
-    // Churn far more short-lived buffers than any heap would once have held,
+    // Churn far more short-lived buffers than any descriptor table would hold,
     // keeping only one live at a time. Buffers consume no descriptor now, so
     // what this guards is that the retire path actually frees them and that
     // every allocation still yields a usable device address. This models

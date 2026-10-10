@@ -105,15 +105,12 @@ private:
     std::uint64_t address_ = 0;
 };
 
-// Buffer device addresses, timeline semaphores, synchronization2 and dynamic
-// rendering are mandatory: a device that lacks any of them is rejected at
-// construction. The rest are reported. `descriptor_heap` covers descriptor
-// heaps, untyped shader pointers, maintenance5, shaderInt64, shaderDrawParameters
-// and scalarBlockLayout. Without it the device can still allocate
-// buffers, present and share handles, but creating a pipeline, a sampler or an
-// image that shaders read throws ErrorCode::UnsupportedFeature.
+// Everything but ray tracing is core Vulkan 1.3 and mandatory: buffer device
+// addresses, timeline semaphores, synchronization2, dynamic rendering, the
+// descriptor indexing behind the bindless set, scalarBlockLayout, shaderInt64
+// and shaderDrawParameters. A device that lacks any of them is rejected at
+// construction. Ray tracing is reported.
 struct DeviceFeatures {
-    bool descriptor_heap = false;
     bool ray_query = false;
     bool ray_tracing = false;
 };
@@ -143,9 +140,9 @@ struct DeviceConfig {
     // submissions need them and reused once those submissions complete, so this
     // sets the granularity, not a limit.
     std::size_t argument_arena_bytes = 1024u * 1024u;
-    // Slots in the device-owned descriptor heaps. Every sampled or storage
+    // Slots in the device's bindless descriptor set. Every sampled or storage
     // image view takes one texture slot and every sampler one sampler slot;
-    // slot 0 of each is reserved. The heaps never grow, so exhausting either
+    // slot 0 of each is reserved. The set never grows, so exhausting either
     // throws ErrorCode::OutOfMemory.
     std::uint32_t texture_descriptor_capacity = 16384;
     std::uint32_t sampler_descriptor_capacity = 256;
@@ -156,10 +153,9 @@ struct DeviceConfig {
     // its own; each Swapchain creates one. Leaving it null gives a headless
     // device, which is what offline rendering and the tests want.
     SurfaceProvider* presentation = nullptr;
-    // Optional. A folder owned by the device, where every compiled pipeline is
-    // stored once and loaded instead of compiled on later runs. Needs driver
-    // support for VK_KHR_pipeline_binary; without it, or without a folder,
-    // pipelines are compiled every run.
+    // Optional. A folder owned by the device, holding the driver's pipeline
+    // cache (pipeline.cache), so later runs skip compiling what an earlier run
+    // already did. Without it, pipelines are compiled every run.
     std::filesystem::path pipeline_directory;
 };
 

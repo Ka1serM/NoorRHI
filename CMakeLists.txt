@@ -62,7 +62,6 @@ add_library(NoorRHI STATIC
     src/image.cpp
     src/vma_impl.cpp
     src/pipeline_cache_file.cpp
-    src/pipeline_store.cpp
     src/internal.hpp)
 add_library(NoorRHI::NoorRHI ALIAS NoorRHI)
 
@@ -84,6 +83,13 @@ target_compile_definitions(NoorRHI PUBLIC VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1)
 target_link_libraries(NoorRHI
     PUBLIC Vulkan::Vulkan
     PRIVATE $<BUILD_INTERFACE:GPUOpen::VulkanMemoryAllocator>)
+
+# What every shader built for NoorRHI passes to slangc: noorrhi.slang on the
+# import path, its bindless set as set 0, and SPIR-V emitted directly. Cached so
+# a parent project that adds this directory sees it too.
+set(NOORRHI_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "")
+set(NOORRHI_SLANG_FLAGS -I "${NOORRHI_SHADER_DIR}" -bindless-space-index 0
+    -emit-spirv-directly CACHE INTERNAL "")
 
 # Examples and tests compile Slang shaders. An unset VULKAN_SDK must not become
 # a "/bin" hint, which would prefer the distribution's older tools.

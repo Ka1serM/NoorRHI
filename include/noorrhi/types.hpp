@@ -101,10 +101,10 @@ struct DrawArgs {
 // TextureHandle and SamplerHandle belong in shader data; ImageHandle names
 // render/copy/interop resources.
 //
-// Texture and sampler handles are 32-bit indices into the device's resource and
-// sampler descriptor heaps, which shaders read as ResourceDescriptorHeap[i] and
-// SamplerDescriptorHeap[i]. Slot 0 of each heap is never written, so 0 is the
-// null handle.
+// Texture and sampler handles are 32-bit slots in the device's bindless
+// descriptor set, which shaders that import noorrhi.slang read as
+// ResourceDescriptorHeap[i] and SamplerDescriptorHeap[i]. Slot 0 is never
+// written, so 0 is the null handle.
 struct TextureHandle {
     std::uint32_t value = 0;
     explicit operator bool() const noexcept { return value != 0; }

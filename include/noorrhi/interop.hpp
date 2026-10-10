@@ -71,7 +71,7 @@ std::uintptr_t command_buffer(const Frame& frame);
 // open frame's command buffer, or into a submission of its own when no frame
 // is open, ordered against all work recorded before and after it. The
 // callback receives the VkCommandBuffer; it must leave no pipeline state the
-// library relies on (the library rebinds its own pipelines and heaps) and must
+// library relies on (the library rebinds its own pipelines and descriptor set) and must
 // not call back into the Device. Resources the commands use must outlive their
 // completion.
 void record(Device& device, const std::function<void(std::uintptr_t)>& commands);

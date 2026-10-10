@@ -27,7 +27,7 @@ public:
     Sampler& operator=(const Sampler&) = delete;
     Sampler(Sampler&&) noexcept = default;
     Sampler& operator=(Sampler&&) noexcept = default;
-    // Sampler-heap index; shaders read it as SamplerDescriptorHeap[i].
+    // Bindless sampler slot; shaders read it as SamplerDescriptorHeap[i].
     SamplerHandle handle() const noexcept {
         return impl_ ? SamplerHandle{detail::sampler_handle(impl_)} : SamplerHandle{};
     }

@@ -182,6 +182,10 @@ struct ImageImpl {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t mip_levels = 1;
+    // The views behind the shader handles. A storage view keeps the identity
+    // swizzle Vulkan requires; the sampled view may expand luminance.
+    vk::UniqueImageView sampled_view;
+    vk::UniqueImageView storage_view;
     // False for swapchain images: the presentation engine owns the VkImage and
     // there is no VMA allocation, but the view and descriptors are still ours.
     bool owns_image = true;
@@ -192,29 +196,29 @@ struct ImageImpl {
 
 struct SamplerImpl {
     std::shared_ptr<DeviceImpl> device;
+    vk::UniqueSampler sampler;
     SamplerHandle handle{};
 
     ~SamplerImpl();
 };
 
-// One device-owned descriptor heap: a mapped buffer of fixed-size slots
-// followed by the implementation's reserved range. Slot 0 is never handed out,
-// so a zero handle stays null.
-struct DescriptorHeap {
-    std::shared_ptr<BufferImpl> buffer;
-    // First slot, at the aligned heap address inside `buffer`.
-    std::byte* slots = nullptr;
-    std::size_t buffer_offset = 0;
-    vk::DeviceAddress address = 0;
-    vk::DeviceSize descriptor_size = 0;
-    vk::DeviceSize reserved_offset = 0;
-    vk::DeviceSize reserved_size = 0;
+// The array indices of one bindless binding. Slot 0 is never handed out, so a
+// zero handle stays null.
+struct DescriptorSlots {
     std::uint32_t capacity = 0;
     // Slots below `next` have been handed out at least once; freed ones wait
     // in `free` for reuse.
     std::uint32_t next = 1;
     std::vector<std::uint32_t> free;
     const char* capacity_name = "";
+};
+
+// Bindings of the one bindless descriptor set (set 0). The numbers are Slang's
+// DefaultVkBindlessBindings, which shaders select by importing noorrhi.slang.
+enum BindlessBinding : std::uint32_t {
+    SamplerBinding = 0,
+    SampledImageBinding = 2,
+    StorageImageBinding = 3,
 };
 
 struct AccelerationStructureImpl {
@@ -424,15 +428,13 @@ public:
     MemoryReport memory_report() const;
     // Root arguments are one 8-byte device address in a Vulkan push constant.
     void push_root(vk::CommandBuffer, vk::DeviceAddress root) const;
-    // Bind the global bindless descriptor set used by every pipeline.
-    void bind_heaps(vk::CommandBuffer) const;
-    void require_descriptor_heaps() const;
-    vk::PipelineCreateFlags2CreateInfo pipeline_heap_flags(const void* next = nullptr) const {
-        require_descriptor_heaps();
-        return vk::PipelineCreateFlags2CreateInfo{
-            vk::PipelineCreateFlagBits2::eDescriptorHeapEXT, next};
-    }
-    std::uint32_t write_image_descriptor(const ImageImpl&, vk::DescriptorType);
+    // Binds the bindless set. Every bind, because external recorders sharing
+    // the command buffer (NRD, FidelityFX, the UI) bind their own sets.
+    void bind_descriptors(vk::CommandBuffer, vk::PipelineBindPoint) const;
+    // The one layout every pipeline uses: the bindless set and the root pointer.
+    vk::PipelineLayout pipeline_layout() const noexcept { return *pipeline_layout_; }
+    // Creates the image's view of the given type and writes it to a fresh slot.
+    std::uint32_t write_image_descriptor(ImageImpl&, vk::DescriptorType);
     std::shared_ptr<ImageImpl> find_image(ImageHandle handle) const;
     void render(const RenderTarget&, const std::function<void()>&);
     // Shared prologue for every in-render draw: validates that the pipeline
@@ -631,10 +633,7 @@ private:
     Timelines recording_timelines() const;
 
     struct Capabilities {
-        bool mandatory = false;   // BDA, timeline, sync2, dynamic rendering
-        bool descriptor_heap = false;  // descriptor heaps, untyped pointers,
-                                       // maintenance5, int64, draw parameters,
-                                       // scalar layout
+        bool mandatory = false;   // see probe()
         bool acceleration_structure = false;
         bool ray_query = false;
         bool ray_tracing = false;
@@ -649,18 +648,15 @@ private:
     void create_allocator();
     void create_command_state();
     void query_properties();
-    void create_descriptor_heaps();
-    void create_heap(DescriptorHeap&, std::uint32_t capacity, vk::DeviceSize descriptor_size,
-        vk::DeviceSize descriptor_alignment, vk::DeviceSize heap_alignment,
-        vk::DeviceSize reserved_size, vk::DeviceSize max_size, const char* capacity_name);
-    static vk::BindHeapInfoEXT heap_bind_info(const DescriptorHeap&);
+    void create_bindless_set();
     // Slots are taken on resource creation and returned from the resource's
     // retire callback, so a slot is never reused while in-flight work may
-    // still read it.
-    std::uint32_t allocate_slot(DescriptorHeap&);
-    void release_slot(DescriptorHeap&, std::uint32_t slot) noexcept;
-    vk::HostAddressRangeEXT slot_range(const DescriptorHeap&, std::uint32_t slot) const;
-    void flush_slot(const DescriptorHeap&, std::uint32_t slot) const;
+    // still read it. That is what lets the set be written while bound.
+    std::uint32_t allocate_slot(DescriptorSlots&);
+    void release_slot(DescriptorSlots&, std::uint32_t slot) noexcept;
+    // Takes a slot and writes `image` to it, releasing the slot on failure.
+    std::uint32_t write_descriptor(DescriptorSlots&, BindlessBinding, vk::DescriptorType,
+        const vk::DescriptorImageInfo& image);
     void reap_completed();
 public:
     // Called from resource destructors: defers the Vulkan/VMA release until
@@ -697,10 +693,8 @@ private:
     bool acceleration_structure_supported_ = false;
     bool ray_query_supported_ = false;
     bool ray_tracing_supported_ = false;
-    bool descriptor_heap_supported_ = false;
     bool external_memory_fd_enabled_ = false;
     bool external_semaphore_fd_enabled_ = false;
-    bool pipeline_binaries_enabled_ = false;
     VmaAllocator allocator_ = VK_NULL_HANDLE;
 
     // File-backed cache used by ordinary/static pipelines. Runtime material
@@ -719,14 +713,18 @@ private:
     // StagedArguments id while its owner lives, and 0 once the region only
     // waits for its submissions to retire.
     vk::DeviceAddress place_arguments(const void* args, std::size_t size, std::uint64_t held);
-    vk::PhysicalDeviceDescriptorHeapPropertiesEXT heap_properties_{};
-    std::uint32_t texture_descriptor_capacity_ = 0;
-    std::uint32_t sampler_descriptor_capacity_ = 0;
-    DescriptorHeap texture_heap_;
-    DescriptorHeap sampler_heap_;
+    vk::UniqueDescriptorSetLayout descriptor_layout_;
+    vk::UniqueDescriptorPool descriptor_pool_;
+    vk::DescriptorSet descriptor_set_;
+    vk::UniquePipelineLayout pipeline_layout_;
+    // Sampled and storage views share one index space, so one image's two
+    // handles never collide, and each binding is sized to the whole space.
+    DescriptorSlots texture_slots_;
+    DescriptorSlots sampler_slots_;
     // Guarded by its own mutex for the same reason as retire_mutex_: slots are
-    // released from retire callbacks.
-    mutable std::mutex heap_mutex_;
+    // released from retire callbacks. Also serializes writes to the set, which
+    // Vulkan requires to be externally synchronized.
+    mutable std::mutex descriptor_mutex_;
     vk::PhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties_{};
     vk::PhysicalDeviceRayTracingPipelinePropertiesKHR ray_tracing_properties_{};
     std::atomic<std::uint64_t> next_staged_id_ = 1;

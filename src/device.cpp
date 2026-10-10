@@ -50,12 +50,14 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
     presentation_enabled_ = config.presentation != nullptr;
     // Root arguments use a fixed mapped arena; large assets use temporary staging.
     argument_arena_size_ = config.argument_arena_bytes;
-    texture_descriptor_capacity_ = config.texture_descriptor_capacity;
-    sampler_descriptor_capacity_ = config.sampler_descriptor_capacity;
-    // Slot 0 is reserved, so a usable heap needs at least two.
-    if (texture_descriptor_capacity_ < 2 || sampler_descriptor_capacity_ < 2)
+    texture_slots_ = {config.texture_descriptor_capacity, 1, {},
+        "DeviceConfig::texture_descriptor_capacity"};
+    sampler_slots_ = {config.sampler_descriptor_capacity, 1, {},
+        "DeviceConfig::sampler_descriptor_capacity"};
+    // Slot 0 is reserved, so a usable binding needs at least two.
+    if (texture_slots_.capacity < 2 || sampler_slots_.capacity < 2)
         throw Error(ErrorCode::InvalidArgument,
-            "descriptor heap capacities must be at least 2 (slot 0 is reserved)");
+            "descriptor capacities must be at least 2 (slot 0 is reserved)");
     try {
         create_instance(config);
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance());
@@ -89,18 +91,15 @@ DeviceImpl::DeviceImpl(const DeviceConfig& config) {
     }
 }
 
-// The mandatory set is what the whole library is built on: buffer device
-// addresses for every buffer, a timeline semaphore for all synchronization,
-// synchronization2 and dynamic rendering for command recording, descriptor
-// heaps for textures and samplers. Every image lives in GENERAL, which core
-// Vulkan accepts for every usage this library records.
-//
-// VK_EXT_descriptor_heap is what keeps pipelines layout-free: images and
-// samplers are encoded into device-owned heaps that shaders index directly
-// (SPV_EXT_descriptor_heap), and root pointers travel as push data. Slang
-// lowers heap access through untyped pointers, and the pipeline flag that
-// opts into heaps lives in maintenance5's flags2 field, so both are required
-// alongside it.
+// The mandatory set is what the whole library is built on, all of it core
+// Vulkan 1.3: buffer device addresses for every buffer, a timeline semaphore
+// for all synchronization, synchronization2 and dynamic rendering for command
+// recording, and descriptor indexing for the one bindless set every shader
+// reads textures and samplers from. That set is written while bound, so
+// partially bound, update-after-bind arrays indexed non-uniformly are needed.
+// Shaders reach root records through 64-bit pointers in scalar layout, and
+// Slang declares draw parameters for vertex shaders. Every image lives in
+// GENERAL, which core Vulkan accepts for every usage this library records.
 DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
     Capabilities capabilities{};
     const auto properties = candidate.getProperties();
@@ -108,12 +107,6 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
         return capabilities;
 
     const auto extensions = candidate.enumerateDeviceExtensionProperties();
-    const bool has_descriptor_heap = has_extension(extensions,
-        VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
-    const bool has_untyped_pointers = has_extension(extensions,
-        VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
-    const bool has_maintenance5 = properties.apiVersion >= VK_API_VERSION_1_4
-        || has_extension(extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     const bool has_as = has_extension(extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
         && has_extension(extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     const bool has_query = has_as && has_extension(extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
@@ -127,9 +120,6 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR supported_as{};
     vk::PhysicalDeviceRayQueryFeaturesKHR supported_query{};
     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR supported_rt{};
-    vk::PhysicalDeviceDescriptorHeapFeaturesEXT supported_heap{};
-    vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR supported_untyped{};
-    vk::PhysicalDeviceMaintenance5FeaturesKHR supported_maintenance5{};
     vk::PhysicalDeviceFeatures2 supported{};
     // Chain unconditionally: querying a feature struct whose extension is
     // absent simply reports it unsupported.
@@ -139,9 +129,6 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
     supported13.pNext = &supported_as;
     supported_as.pNext = &supported_query;
     supported_query.pNext = &supported_rt;
-    supported_rt.pNext = &supported_heap;
-    supported_heap.pNext = &supported_untyped;
-    supported_untyped.pNext = &supported_maintenance5;
     candidate.getFeatures2(&supported);
 
     bool has_compute = false;
@@ -150,12 +137,15 @@ DeviceImpl::Capabilities DeviceImpl::probe(const vk::PhysicalDevice candidate) {
 
     capabilities.mandatory = has_compute
         && supported12.bufferDeviceAddress && supported12.timelineSemaphore
-        && supported13.synchronization2 && supported13.dynamicRendering;
-    capabilities.descriptor_heap = supported.features.shaderInt64 && supported11.shaderDrawParameters
-        && supported12.scalarBlockLayout
-        && has_descriptor_heap && supported_heap.descriptorHeap
-        && has_untyped_pointers && supported_untyped.shaderUntypedPointers
-        && has_maintenance5 && supported_maintenance5.maintenance5;
+        && supported13.synchronization2 && supported13.dynamicRendering
+        && supported12.runtimeDescriptorArray && supported12.descriptorBindingPartiallyBound
+        && supported12.descriptorBindingUpdateUnusedWhilePending
+        && supported12.descriptorBindingSampledImageUpdateAfterBind
+        && supported12.descriptorBindingStorageImageUpdateAfterBind
+        && supported12.shaderSampledImageArrayNonUniformIndexing
+        && supported12.shaderStorageImageArrayNonUniformIndexing
+        && supported12.scalarBlockLayout && supported.features.shaderInt64
+        && supported11.shaderDrawParameters;
     capabilities.acceleration_structure = has_as && supported_as.accelerationStructure;
     capabilities.ray_query = has_query && capabilities.acceleration_structure
         && supported_query.rayQuery;
@@ -168,8 +158,6 @@ void DeviceImpl::adopt_capabilities(const Capabilities& capabilities) {
     acceleration_structure_supported_ = capabilities.acceleration_structure;
     ray_query_supported_ = capabilities.ray_query;
     ray_tracing_supported_ = capabilities.ray_tracing;
-    descriptor_heap_supported_ = capabilities.descriptor_heap;
-    features_.descriptor_heap = descriptor_heap_supported_;
     features_.ray_query = ray_query_supported_;
     features_.ray_tracing = ray_tracing_supported_;
 }
@@ -182,8 +170,7 @@ std::shared_ptr<BufferImpl> DeviceImpl::create_argument_arena(const std::size_t 
 
 void DeviceImpl::initialize_resources() {
     query_properties();
-    if (descriptor_heap_supported_)
-        create_descriptor_heaps();
+    create_bindless_set();
     for (QueueState& queue : queues_)
         queue.argument_chunks.push_back({create_argument_arena(argument_arena_size_)});
 }
@@ -244,9 +231,7 @@ void DeviceImpl::create_instance(const DeviceConfig& config) {
         throw Error(ErrorCode::UnsupportedFeature, "Vulkan validation needs VK_EXT_debug_utils");
 
     const std::string application_name(config.application_name);
-    // 1.4 so that a 1.4 device exposes maintenance5 as core; 1.3 devices
-    // still qualify through the extension.
-    const vk::ApplicationInfo appInfo(application_name.c_str(), 1, "NoorRHI", 1, VK_API_VERSION_1_4);
+    const vk::ApplicationInfo appInfo(application_name.c_str(), 1, "NoorRHI", 1, VK_API_VERSION_1_3);
     vk::InstanceCreateInfo createInfo{};
     createInfo.setPApplicationInfo(&appInfo)
         .setPEnabledLayerNames(layers)
@@ -320,7 +305,8 @@ void DeviceImpl::select_physical_device() {
     if (!best)
         throw Error(ErrorCode::UnsupportedFeature,
             "No Vulkan 1.3 device supports buffer device address, timeline semaphores, "
-            "synchronization2 and dynamic rendering");
+            "synchronization2, dynamic rendering, bindless descriptor indexing, "
+            "scalar block layout, shaderInt64 and shaderDrawParameters");
     physical_device_ = best;
     adopt_capabilities(best_capabilities);
 }
@@ -365,12 +351,6 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
 
     const auto extensions = physical_device_.enumerateDeviceExtensionProperties();
     std::vector<const char*> enabled_extensions;
-    if (descriptor_heap_supported_) {
-        enabled_extensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
-        enabled_extensions.push_back(VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
-        if (physical_device_.getProperties().apiVersion < VK_API_VERSION_1_4)
-            enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
-    }
     if (presentation_enabled_)
         enabled_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     external_memory_fd_enabled_ = has_extension(extensions,
@@ -384,7 +364,7 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
 
     const vk::PhysicalDeviceFeatures supported_base = physical_device_.getFeatures();
     vk::PhysicalDeviceFeatures base{};
-    base.shaderInt64 = descriptor_heap_supported_;
+    base.shaderInt64 = VK_TRUE;
     // RTXDI's path tracer declares Int16; without the feature the module is
     // invalid and the driver's results undefined.
     if (supported_base.shaderInt16)
@@ -393,7 +373,7 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     // shaderDrawParameters is declared by Slang-compiled vertex shaders; the
     // validation layers reject the module without it.
     vk::PhysicalDeviceVulkan11Features features11{};
-    features11.shaderDrawParameters = descriptor_heap_supported_;
+    features11.shaderDrawParameters = VK_TRUE;
     vk::PhysicalDeviceVulkan12Features features12{};
     // Slang declares Float16 for shared records containing half-precision
     // Gaussian coefficients, including shaders that do not load them.
@@ -413,38 +393,21 @@ void DeviceImpl::create_device(const DeviceConfig& config) {
     // Slang's natural layout for records reached through GPU pointers matches
     // C++ struct packing (vec3 followed by a scalar, for instance), which is
     // only legal SPIR-V under scalar block layout.
-    features12.scalarBlockLayout = descriptor_heap_supported_;
+    features12.scalarBlockLayout = VK_TRUE;
+    // The bindless set; see probe().
+    features12.runtimeDescriptorArray = VK_TRUE;
+    features12.descriptorBindingPartiallyBound = VK_TRUE;
+    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    features12.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
     vk::PhysicalDeviceVulkan13Features features13{};
     features13.synchronization2 = VK_TRUE;
     features13.dynamicRendering = VK_TRUE;
     features11.pNext = &features12;
     features12.pNext = &features13;
     void** tail = &features13.pNext;
-    vk::PhysicalDeviceDescriptorHeapFeaturesEXT heap_features{};
-    vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers{};
-    vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5{};
-    if (descriptor_heap_supported_) {
-        heap_features.descriptorHeap = VK_TRUE;
-        untyped_pointers.shaderUntypedPointers = VK_TRUE;
-        maintenance5.maintenance5 = VK_TRUE;
-        *tail = &heap_features;
-        heap_features.pNext = &untyped_pointers;
-        untyped_pointers.pNext = &maintenance5;
-        tail = &maintenance5.pNext;
-    }
-
-    vk::PhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features{};
-    pipeline_binaries_enabled_ =
-        has_extension(extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)
-        && physical_device_.getFeatures2<vk::PhysicalDeviceFeatures2,
-               vk::PhysicalDevicePipelineBinaryFeaturesKHR>()
-               .get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries;
-    if (pipeline_binaries_enabled_) {
-        pipeline_binary_features.pipelineBinaries = VK_TRUE;
-        *tail = &pipeline_binary_features;
-        tail = &pipeline_binary_features.pNext;
-        enabled_extensions.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
-    }
 
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR as_features{};
     vk::PhysicalDeviceRayQueryFeaturesKHR query_features{};
@@ -609,137 +572,115 @@ double DeviceImpl::timestamp_milliseconds(TimestampQuery::State& query) {
     return query.milliseconds;
 }
 
-namespace {
-constexpr vk::DeviceSize align_up(const vk::DeviceSize value, const vk::DeviceSize alignment) {
-    const vk::DeviceSize a = std::max<vk::DeviceSize>(alignment, 1);
-    return (value + a - 1) / a * a;
-}
-}
-
 // Every shader in this library takes the same thing: one 8-byte pointer to its
-// root argument record as push data, plus whatever textures and samplers it
-// indexes out of the two device-owned heaps. No pipeline layout exists.
+// root argument record as a push constant, plus whatever textures and samplers
+// it indexes out of the one bindless set. So every pipeline shares one layout.
 void DeviceImpl::query_properties() {
+    if (!acceleration_structure_supported_)
+        return;
     vk::PhysicalDeviceProperties2 properties{};
-    void** tail = &properties.pNext;
-    if (descriptor_heap_supported_) {
-        *tail = &heap_properties_;
-        tail = &heap_properties_.pNext;
-    }
-    if (acceleration_structure_supported_) {
-        *tail = &acceleration_structure_properties_;
-        acceleration_structure_properties_.pNext = &ray_tracing_properties_;
-    }
+    properties.pNext = &acceleration_structure_properties_;
+    acceleration_structure_properties_.pNext = &ray_tracing_properties_;
     physical_device_.getProperties2(&properties);
-    heap_properties_.pNext = nullptr;
     acceleration_structure_properties_.pNext = nullptr;
 }
 
-void DeviceImpl::require_descriptor_heaps() const {
-    if (!descriptor_heap_supported_)
-        throw Error(ErrorCode::UnsupportedFeature,
-            "this device lacks what pipelines, samplers and shader-visible images need: "
-            "VK_EXT_descriptor_heap, VK_KHR_shader_untyped_pointers, maintenance5, shaderInt64, "
-            "shaderDrawParameters and scalarBlockLayout");
-}
-
-void DeviceImpl::create_descriptor_heaps() {
-    if (heap_properties_.maxPushDataSize < sizeof(vk::DeviceAddress))
-        throw Error(ErrorCode::UnsupportedFeature,
-            "descriptor heap push data cannot hold an 8-byte root pointer");
-    create_heap(texture_heap_, texture_descriptor_capacity_,
-        heap_properties_.imageDescriptorSize,
-        std::max(heap_properties_.imageDescriptorAlignment,
-            heap_properties_.bufferDescriptorAlignment),
-        heap_properties_.resourceHeapAlignment,
-        heap_properties_.minResourceHeapReservedRange,
-        heap_properties_.maxResourceHeapSize,
-        "DeviceConfig::texture_descriptor_capacity");
-    create_heap(sampler_heap_, sampler_descriptor_capacity_,
-        heap_properties_.samplerDescriptorSize,
-        heap_properties_.samplerDescriptorAlignment,
-        heap_properties_.samplerHeapAlignment,
-        heap_properties_.minSamplerHeapReservedRange,
-        heap_properties_.maxSamplerHeapSize,
-        "DeviceConfig::sampler_descriptor_capacity");
-}
-
-void DeviceImpl::create_heap(DescriptorHeap& heap, const std::uint32_t capacity,
-    const vk::DeviceSize descriptor_size, const vk::DeviceSize descriptor_alignment,
-    const vk::DeviceSize heap_alignment, const vk::DeviceSize reserved_size,
-    const vk::DeviceSize max_size, const char* capacity_name) {
-    if (descriptor_size == 0)
-        throw Error(ErrorCode::UnsupportedFeature, "device reports a zero descriptor size");
-    const vk::DeviceSize reserved_offset = align_up(capacity * descriptor_size,
-        descriptor_alignment);
-    const vk::DeviceSize bind_size = reserved_offset + reserved_size;
-    if (max_size && bind_size > max_size)
+// Set 0 holds three arrays at Slang's DefaultVkBindlessBindings: samplers,
+// sampled images and storage images. Sampled and storage images are indexed
+// by the same texture slots, so both image arrays span the whole slot space.
+void DeviceImpl::create_bindless_set() {
+    const auto limits = physical_device_.getProperties2<vk::PhysicalDeviceProperties2,
+        vk::PhysicalDeviceVulkan12Properties>().get<vk::PhysicalDeviceVulkan12Properties>();
+    const auto require = [](const DescriptorSlots& slots, const std::uint32_t set_limit,
+                             const std::uint32_t stage_limit) {
+        if (slots.capacity > std::min(set_limit, stage_limit))
+            throw Error(ErrorCode::InvalidArgument, std::string(slots.capacity_name)
+                + " exceeds the device's limit of "
+                + std::to_string(std::min(set_limit, stage_limit)) + " bindless descriptors");
+    };
+    require(texture_slots_, limits.maxDescriptorSetUpdateAfterBindSampledImages,
+        limits.maxPerStageDescriptorUpdateAfterBindSampledImages);
+    require(texture_slots_, limits.maxDescriptorSetUpdateAfterBindStorageImages,
+        limits.maxPerStageDescriptorUpdateAfterBindStorageImages);
+    require(sampler_slots_, limits.maxDescriptorSetUpdateAfterBindSamplers,
+        limits.maxPerStageDescriptorUpdateAfterBindSamplers);
+    if (2ull * texture_slots_.capacity + sampler_slots_.capacity
+            > limits.maxPerStageUpdateAfterBindResources)
         throw Error(ErrorCode::InvalidArgument,
-            std::string(capacity_name) + " exceeds the device's maximum descriptor heap size");
-    // VMA does not promise an address aligned to the heap alignment, so
-    // over-allocate and bind the heap at an aligned address inside the buffer.
-    const vk::DeviceSize alignment = std::max<vk::DeviceSize>(heap_alignment, 1);
-    heap.buffer = create_buffer(static_cast<std::size_t>(bind_size + alignment - 1),
-        vk::BufferUsageFlagBits::eDescriptorHeapEXT
-            | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-        VMA_MEMORY_USAGE_CPU_TO_GPU, true);
-    heap.address = align_up(heap.buffer->address, alignment);
-    heap.buffer_offset = static_cast<std::size_t>(heap.address - heap.buffer->address);
-    heap.slots = static_cast<std::byte*>(heap.buffer->mapped) + heap.buffer_offset;
-    heap.descriptor_size = descriptor_size;
-    heap.reserved_offset = reserved_offset;
-    heap.reserved_size = reserved_size;
-    heap.capacity = capacity;
-    heap.capacity_name = capacity_name;
-    // Slot 0 stays zeroed: it is the null handle and is never read.
-    std::memset(heap.buffer->mapped, 0, heap.buffer->size);
+            "the bindless descriptor capacities exceed the device's per-stage resource limit");
+
+    constexpr vk::ShaderStageFlags stages = vk::ShaderStageFlagBits::eAll;
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{SamplerBinding, vk::DescriptorType::eSampler,
+            sampler_slots_.capacity, stages},
+        vk::DescriptorSetLayoutBinding{SampledImageBinding, vk::DescriptorType::eSampledImage,
+            texture_slots_.capacity, stages},
+        vk::DescriptorSetLayoutBinding{StorageImageBinding, vk::DescriptorType::eStorageImage,
+            texture_slots_.capacity, stages},
+    };
+    // Slots are written while command buffers that bind the set are pending,
+    // and most slots are never written at all.
+    constexpr vk::DescriptorBindingFlags binding_flags =
+        vk::DescriptorBindingFlagBits::ePartiallyBound
+        | vk::DescriptorBindingFlagBits::eUpdateAfterBind
+        | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+    const std::array flags{binding_flags, binding_flags, binding_flags};
+    const vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info(flags);
+    descriptor_layout_ = vk_device().createDescriptorSetLayoutUnique(
+        {vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool, bindings, &flags_info});
+
+    const std::array sizes{
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampler, sampler_slots_.capacity},
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, texture_slots_.capacity},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, texture_slots_.capacity},
+    };
+    descriptor_pool_ = vk_device().createDescriptorPoolUnique(
+        {vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind, 1, sizes});
+    const vk::DescriptorSetLayout layout = *descriptor_layout_;
+    descriptor_set_ = vk_device().allocateDescriptorSets({*descriptor_pool_, layout}).front();
+
+    const vk::PushConstantRange root_range(stages, 0, sizeof(vk::DeviceAddress));
+    pipeline_layout_ = vk_device().createPipelineLayoutUnique({{}, layout, root_range});
 }
 
-vk::BindHeapInfoEXT DeviceImpl::heap_bind_info(const DescriptorHeap& heap) {
-    using Range = decltype(vk::BindHeapInfoEXT::heapRange);
-    return vk::BindHeapInfoEXT{Range{heap.address, heap.reserved_offset + heap.reserved_size},
-        heap.reserved_offset, heap.reserved_size};
+void DeviceImpl::bind_descriptors(const vk::CommandBuffer command,
+    const vk::PipelineBindPoint bind_point) const {
+    command.bindDescriptorSets(bind_point, *pipeline_layout_, 0, descriptor_set_, {});
 }
 
-void DeviceImpl::bind_heaps(const vk::CommandBuffer command) const {
-    command.bindResourceHeapEXT(heap_bind_info(texture_heap_));
-    command.bindSamplerHeapEXT(heap_bind_info(sampler_heap_));
-}
-
-std::uint32_t DeviceImpl::allocate_slot(DescriptorHeap& heap) {
-    std::lock_guard lock(heap_mutex_);
-    if (heap.capacity == 0)
+// Called with descriptor_mutex_ held.
+std::uint32_t DeviceImpl::allocate_slot(DescriptorSlots& slots) {
+    if (slots.capacity == 0)
         throw Error(ErrorCode::InvalidState, "noorrhi::Device has been shut down");
-    if (!heap.free.empty()) {
-        const std::uint32_t slot = heap.free.back();
-        heap.free.pop_back();
+    if (!slots.free.empty()) {
+        const std::uint32_t slot = slots.free.back();
+        slots.free.pop_back();
         return slot;
     }
-    if (heap.next < heap.capacity)
-        return heap.next++;
+    if (slots.next < slots.capacity)
+        return slots.next++;
     throw Error(ErrorCode::OutOfMemory,
-        std::string("descriptor heap is full; raise ") + heap.capacity_name);
+        std::string("bindless descriptors are exhausted; raise ") + slots.capacity_name);
 }
 
-void DeviceImpl::release_slot(DescriptorHeap& heap, const std::uint32_t slot) noexcept {
+void DeviceImpl::release_slot(DescriptorSlots& slots, const std::uint32_t slot) noexcept {
     if (slot == 0)
         return;
-    std::lock_guard lock(heap_mutex_);
+    std::lock_guard lock(descriptor_mutex_);
     // After shutdown the allocator is inactive and there is nothing to return to.
-    if (heap.capacity != 0)
-        heap.free.push_back(slot);
+    if (slots.capacity != 0)
+        slots.free.push_back(slot);
 }
 
-vk::HostAddressRangeEXT DeviceImpl::slot_range(const DescriptorHeap& heap,
-    const std::uint32_t slot) const {
-    return vk::HostAddressRangeEXT{heap.slots + slot * heap.descriptor_size,
-        static_cast<std::size_t>(heap.descriptor_size)};
-}
-
-void DeviceImpl::flush_slot(const DescriptorHeap& heap, const std::uint32_t slot) const {
-    if (vmaFlushAllocation(allocator_, heap.buffer->allocation,
-            heap.buffer_offset + slot * heap.descriptor_size, heap.descriptor_size) != VK_SUCCESS)
-        throw Error(ErrorCode::DeviceLost, "flushing a descriptor heap write failed");
+std::uint32_t DeviceImpl::write_descriptor(DescriptorSlots& slots, const BindlessBinding binding,
+    const vk::DescriptorType type, const vk::DescriptorImageInfo& image) {
+    std::lock_guard lock(descriptor_mutex_);
+    const std::uint32_t slot = allocate_slot(slots);
+    vk::WriteDescriptorSet write{};
+    write.setDstSet(descriptor_set_).setDstBinding(binding).setDstArrayElement(slot)
+        .setDescriptorType(type).setImageInfo(image);
+    vk_device().updateDescriptorSets(write, {});
+    return slot;
 }
 
 void DeviceImpl::retain_active(std::shared_ptr<void> resource) {
@@ -783,9 +724,9 @@ void DeviceImpl::shutdown() noexcept {
         std::lock_guard lock(mutex_);
         command_pools_.clear();
     }
-    std::lock_guard heap_lock(heap_mutex_);
-    texture_heap_ = {};
-    sampler_heap_ = {};
+    std::lock_guard descriptor_lock(descriptor_mutex_);
+    texture_slots_ = {};
+    sampler_slots_ = {};
 }
 
 DeviceImpl::~DeviceImpl() {
@@ -911,9 +852,7 @@ std::shared_ptr<ComputePipelineImpl> DeviceImpl::create_compute(const Shader& sh
     result->device = self_.lock();
     const vk::PipelineShaderStageCreateInfo stage({}, vk::ShaderStageFlagBits::eCompute,
         *shader.impl_->module, shader.impl_->entry_point.c_str());
-    const auto heap_flags = pipeline_heap_flags();
-    vk::ComputePipelineCreateInfo pipelineInfo{{}, stage, {}};
-    pipelineInfo.pNext = &heap_flags;
+    const vk::ComputePipelineCreateInfo pipelineInfo{{}, stage, pipeline_layout()};
     try {
         result->pipeline = create_pipeline<vk::ComputePipelineCreateInfo>(pipelineInfo, true,
             [this, entry = shader.impl_->entry_point](const vk::ComputePipelineCreateInfo& info, vk::PipelineCache cache) {
@@ -932,7 +871,6 @@ std::shared_ptr<ComputePipelineImpl> DeviceImpl::create_compute(const Shader& sh
 }
 
 std::shared_ptr<SamplerImpl> DeviceImpl::create_sampler(const SamplerDesc& desc) {
-    require_descriptor_heaps();
     const auto filter = desc.filter == Filter::Linear ? vk::Filter::eLinear : vk::Filter::eNearest;
     const auto address = [](const AddressMode mode) {
         switch (mode) {
@@ -947,14 +885,9 @@ std::shared_ptr<SamplerImpl> DeviceImpl::create_sampler(const SamplerDesc& desc)
     info.maxLod = vk::LodClampNone;
     auto result = std::make_shared<SamplerImpl>();
     result->device = self_.lock();
-    const std::uint32_t slot = allocate_slot(sampler_heap_);
-    const vk::HostAddressRangeEXT destination = slot_range(sampler_heap_, slot);
-    if (vk_device().writeSamplerDescriptorsEXT(1, &info, &destination) != vk::Result::eSuccess) {
-        release_slot(sampler_heap_, slot);
-        throw Error(ErrorCode::InvalidState, "writing a sampler descriptor failed");
-    }
-    flush_slot(sampler_heap_, slot);
-    result->handle = SamplerHandle{slot};
+    result->sampler = vk_device().createSamplerUnique(info);
+    result->handle = SamplerHandle{write_descriptor(sampler_slots_, SamplerBinding,
+        vk::DescriptorType::eSampler, vk::DescriptorImageInfo{*result->sampler})};
     return result;
 }
 
@@ -1357,6 +1290,10 @@ void DeviceImpl::synchronize() {
     }
     for (std::size_t queue = 0; queue < queue_count; ++queue)
         wait({submitted[queue], static_cast<Queue>(queue)});
+    // wait() skips a queue that never submitted, but what was retired while
+    // nothing was in flight is released here all the same.
+    std::lock_guard lock(mutex_);
+    reap_completed();
 }
 
 vk::DeviceAddress DeviceImpl::stage_arguments(const void* args, const std::size_t size) {
@@ -1441,8 +1378,8 @@ vk::DeviceAddress DeviceImpl::place_arguments(const void* args, const std::size_
 
 void DeviceImpl::push_root(const vk::CommandBuffer command,
     const vk::DeviceAddress root) const {
-    command.pushDataEXT(vk::PushDataInfoEXT{0,
-        vk::HostAddressRangeConstEXT{&root, sizeof(root)}});
+    command.pushConstants(*pipeline_layout_, vk::ShaderStageFlagBits::eAll, 0,
+        sizeof(root), &root);
 }
 
 void DeviceImpl::record_compute(const ComputePipelineImpl& pipeline,
@@ -1452,7 +1389,7 @@ void DeviceImpl::record_compute(const ComputePipelineImpl& pipeline,
         || groups.x == 0 || groups.y == 0 || groups.z == 0)
         throw Error(ErrorCode::InvalidArgument, "invalid compute dispatch");
     command.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline.pipeline);
-    bind_heaps(command);
+    bind_descriptors(command, vk::PipelineBindPoint::eCompute);
     push_root(command, stage_arguments(args, size));
     command.dispatch(groups.x, groups.y, groups.z);
 }
@@ -1608,7 +1545,6 @@ RayTracingGroups DeviceImpl::ray_tracing_groups(const RayTracingPipelineDesc& de
 
 std::shared_ptr<RayTracingLibraryImpl> DeviceImpl::create_ray_tracing_library(
     const RayTracingPipelineDesc& desc, const RayTracingInterface& interface) {
-    require_descriptor_heaps();
     auto result = std::make_shared<RayTracingLibraryImpl>();
     result->device = self_.lock();
     result->interface = interface;
@@ -1616,11 +1552,10 @@ std::shared_ptr<RayTracingLibraryImpl> DeviceImpl::create_ray_tracing_library(
 
     const vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface(
         interface.max_payload_size, interface.max_hit_attribute_size);
-    vk::PipelineCreateFlags2CreateInfo flags{
-        vk::PipelineCreateFlagBits2::eDescriptorHeapEXT | vk::PipelineCreateFlagBits2::eLibraryKHR};
-    vk::RayTracingPipelineCreateInfoKHR info({}, result->groups.stages,
-        result->groups.create_infos, 1, nullptr, &library_interface, nullptr, {});
-    info.pNext = &flags;
+    // Every library shares the one pipeline layout, so any set of them links.
+    const vk::RayTracingPipelineCreateInfoKHR info(vk::PipelineCreateFlagBits::eLibraryKHR,
+        result->groups.stages, result->groups.create_infos, 1, nullptr, &library_interface,
+        nullptr, pipeline_layout());
     result->pipeline = create_pipeline<vk::RayTracingPipelineCreateInfoKHR>(info,
         desc.use_pipeline_cache,
         [this](const vk::RayTracingPipelineCreateInfoKHR& library, vk::PipelineCache cache) {
@@ -1663,10 +1598,8 @@ std::shared_ptr<RayTracingPipelineImpl> DeviceImpl::link_ray_tracing(
     const vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface(
         interface.max_payload_size, interface.max_hit_attribute_size);
     const vk::PipelineLibraryCreateInfoKHR library_info(handles);
-    const auto heap_flags = pipeline_heap_flags();
-    vk::RayTracingPipelineCreateInfoKHR info({}, {}, {}, 1, &library_info, &library_interface,
-        nullptr, {});
-    info.pNext = &heap_flags;
+    const vk::RayTracingPipelineCreateInfoKHR info({}, {}, {}, 1, &library_info,
+        &library_interface, nullptr, pipeline_layout());
     try {
         std::lock_guard lock(pipeline_creation_mutex_);
         result->pipeline = std::make_shared<const vk::UniquePipeline>(
@@ -2269,7 +2202,7 @@ void ComputePipelineImpl::launch_indirect(const GpuPtr<DispatchArgs> args,
         // reads its root arguments through the same push-data path.
         const vk::DeviceAddress root = device_impl.stage_arguments(argument_data, argument_size);
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *self->pipeline);
-        device_impl.bind_heaps(command);
+        device_impl.bind_descriptors(command, vk::PipelineBindPoint::eCompute);
         device_impl.push_root(command, root);
         command.dispatchIndirect(buffer, offset);
     }, std::vector<std::shared_ptr<void>>{self, resource});
@@ -2290,8 +2223,10 @@ BufferImpl::~BufferImpl() {
 SamplerImpl::~SamplerImpl() {
     if (!device || !handle)
         return;
-    device->retire([owner = device.get(), slot = handle.value] {
-        owner->release_slot(owner->sampler_heap_, slot);
+    device->retire([owner = device.get(), slot = handle.value, sampler = sampler.release(),
+                       vk_device = device->device()] {
+        owner->release_slot(owner->sampler_slots_, slot);
+        vk_device.destroySampler(sampler);
     });
 }
 
@@ -2526,7 +2461,7 @@ void detail::DeviceImpl::record_ray_tracing(const detail::RayTracingPipelineImpl
         throw Error(ErrorCode::InvalidArgument, "invalid ray-tracing dispatch");
     const vk::DeviceAddress root = stage_arguments(args, size);
     command.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, **pipeline.pipeline);
-    bind_heaps(command);
+    bind_descriptors(command, vk::PipelineBindPoint::eRayTracingKHR);
     push_root(command, root);
     command.traceRaysKHR(raygen, pipeline.miss_region,
         pipeline.hit_region, pipeline.callable_region, groups.x, groups.y, groups.z);

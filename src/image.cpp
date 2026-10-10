@@ -5,41 +5,37 @@
 #include "noorrhi/interop.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
 #include <vector>
 
 namespace noorrhi::detail {
 
-// The shader-facing handle for an image: a resource-heap slot holding a
-// descriptor for the whole image. The view is described inline, so the heap
-// entry owns no VkImageView of its own; it stays valid while the image does,
-// and ImageImpl's retire path returns the slot only after the GPU is done.
-std::uint32_t DeviceImpl::write_image_descriptor(const ImageImpl& image,
+// The shader-facing handle for an image: a texture slot holding a view of the
+// whole image in the sampled or the storage array of the bindless set. The
+// view lives as long as the image, and ImageImpl's retire path returns the
+// slot only after the GPU is done.
+std::uint32_t DeviceImpl::write_image_descriptor(ImageImpl& image,
     const vk::DescriptorType type) {
-    require_descriptor_heaps();
-    const std::uint32_t slot = allocate_slot(texture_heap_);
-    const bool luminance = image.public_format == ImageFormat::L8Unorm
-        || image.public_format == ImageFormat::L8Srgb;
+    const bool storage = type == vk::DescriptorType::eStorageImage;
+    // Luminance expands to grey for sampling; storage views must keep the
+    // identity swizzle.
+    const bool luminance = !storage && (image.public_format == ImageFormat::L8Unorm
+        || image.public_format == ImageFormat::L8Srgb);
     const vk::ComponentMapping components = luminance
         ? vk::ComponentMapping{vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eR,
               vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eOne}
         : vk::ComponentMapping{};
-    const vk::ImageViewUsageCreateInfo usage{type == vk::DescriptorType::eStorageImage
+    const vk::ImageViewUsageCreateInfo usage{storage
         ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled};
-    const vk::ImageViewCreateInfo view({}, image.image, vk::ImageViewType::e2D,
+    const vk::ImageViewCreateInfo info({}, image.image, vk::ImageViewType::e2D,
         image.format, components, {image.aspect, 0, image.mip_levels, 0, 1}, &usage);
-    const vk::ImageDescriptorInfoEXT image_info{&view, vk::ImageLayout::eGeneral};
-    const vk::ResourceDescriptorInfoEXT descriptor{type,
-        vk::ResourceDescriptorDataEXT{&image_info}};
-    const vk::HostAddressRangeEXT destination = slot_range(texture_heap_, slot);
-    if (vk_device().writeResourceDescriptorsEXT(1, &descriptor, &destination)
-            != vk::Result::eSuccess) {
-        release_slot(texture_heap_, slot);
-        throw Error(ErrorCode::InvalidState, "writing an image descriptor failed");
-    }
-    flush_slot(texture_heap_, slot);
-    return slot;
+    vk::UniqueImageView& view = storage ? image.storage_view : image.sampled_view;
+    view = vk_device().createImageViewUnique(info);
+    return write_descriptor(texture_slots_,
+        storage ? StorageImageBinding : SampledImageBinding, type,
+        vk::DescriptorImageInfo{{}, *view, vk::ImageLayout::eGeneral});
 }
 
 ImageImpl::~ImageImpl() {
@@ -47,17 +43,19 @@ ImageImpl::~ImageImpl() {
         return;
     // A presentation image is owned by the swapchain, but its view is ours, so
     // the retire path runs either way and only the image release is
-    // conditional. Heap slots go back to the free list here too, never
+    // conditional. Texture slots go back to the free list here too, never
     // earlier: in-flight work may still read the descriptors they hold.
     device->retire([allocator = device->allocator_, image = this->image,
         allocation = this->allocation, external_memory = this->external_memory,
-        owns = owns_image, view = view.release(),
+        owns = owns_image, views = std::array{view.release(), sampled_view.release(),
+            storage_view.release()},
         vk_device = device->device(), owner = device.get(),
         sampled = sampled_handle.value, storage = storage_handle.value] {
-        owner->release_slot(owner->texture_heap_, sampled);
-        owner->release_slot(owner->texture_heap_, storage);
-        if (view)
-            vk_device.destroyImageView(view);
+        owner->release_slot(owner->texture_slots_, sampled);
+        owner->release_slot(owner->texture_slots_, storage);
+        for (const vk::ImageView view : views)
+            if (view)
+                vk_device.destroyImageView(view);
         if (owns && allocation)
             vmaDestroyImage(allocator, image, allocation);
         else if (owns && external_memory) {
@@ -166,18 +164,18 @@ std::shared_ptr<ImageImpl> DeviceImpl::create_image(const std::uint32_t width,
             std::max(width >> level, 1u), std::max(height >> level, 1u));
     result->block_compressed = is_block_compressed(format_choice);
     // The identity handle names this image to render(), copy() and interop. It
-    // is a weak host reference, deliberately unrelated to the heap indices
+    // is a weak host reference, deliberately unrelated to the texture slots
     // below, which only mean something to shaders.
     result->handle = ImageHandle{result};
-    // The view serves render targets and interop; shader descriptors describe
-    // their own view inline.
+    // The view serves render targets and interop; shader descriptors get
+    // views of their own over every mip.
     const vk::ImageViewCreateInfo viewInfo({}, result->image, vk::ImageViewType::e2D,
         format, {}, {aspect, 0, 1, 0, 1});
     result->view = vk_device().createImageViewUnique(viewInfo);
     if (wants(ImageUsage::Storage))
         result->storage_handle = TextureHandle{
             write_image_descriptor(*result, vk::DescriptorType::eStorageImage)};
-    // A sampled image and a sampler are separate heap entries; shaders that
+    // A sampled image and a sampler are separate descriptors; shaders that
     // filter pair this handle with a Sampler::handle().
     if (wants(ImageUsage::Sampled))
         result->sampled_handle = TextureHandle{
