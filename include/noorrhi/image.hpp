@@ -86,7 +86,7 @@ public:
     void download_region(std::uint32_t x, std::uint32_t y, std::uint32_t width,
         std::uint32_t height, std::span<T> destination) const;
     ImageHandle handle() const noexcept;
-    // Resource-heap indices. There is no combined image/sampler form: pair a
+    // Bindless texture slots. There is no combined image/sampler form: pair a
     // sampled handle with a Sampler::handle() in the shader instead.
     TextureHandle sampled_handle() const noexcept;
     TextureHandle storage_handle() const noexcept;

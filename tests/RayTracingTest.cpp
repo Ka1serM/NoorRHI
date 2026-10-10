@@ -38,7 +38,9 @@ TEST_CASE("NoorRHI API traces rays against a built acceleration structure") {
     indices.upload(std::span<const std::uint32_t>(
         std::vector<std::uint32_t>{0, 1, 2}));
 
-    const noorrhi::TriangleGeometry triangles{positions.ptr(), indices.ptr(), 1};
+    // noorrhi::float3 is padded to 16 bytes, so the positions are strided.
+    const noorrhi::TriangleGeometry triangles{positions.ptr(), indices.ptr(), 1,
+        sizeof(noorrhi::float3)};
     auto blas = device.build_blas(std::span<const noorrhi::TriangleGeometry>(&triangles, 1));
     REQUIRE(blas);
 

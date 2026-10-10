@@ -1,6 +1,7 @@
-// Writes a gradient into a storage image reached through the resource
-// descriptor heap, then reads the sampled view of a second image back through
-// the heap and a sampler from the sampler heap.
+// Writes a gradient into a storage image reached through the bindless set,
+// then reads the sampled view of a second image back through it with a sampler.
+import noorrhi;
+
 struct Arguments
 {
     uint target;

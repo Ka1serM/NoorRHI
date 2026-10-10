@@ -162,7 +162,7 @@ std::shared_ptr<ImageImpl> DeviceImpl::wrap_presentation_image(const vk::Image i
     result->height = height;
     result->byte_size = format_byte_size(public_format, width, height);
     // A presentation image is a render target and a blit destination, never a
-    // shader resource, so it needs an identity handle but no heap slot.
+    // shader resource, so it needs an identity handle but no texture slot.
     result->handle = ImageHandle{result};
     const vk::ImageViewCreateInfo view_info({}, image, vk::ImageViewType::e2D, format, {},
         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});

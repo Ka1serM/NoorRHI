@@ -8,8 +8,8 @@
 
 namespace noorrhi::detail {
 
-// One VkPipelineCache persisted to a file, for drivers without
-// VK_KHR_pipeline_binary, so pipelines are not compiled anew on every run.
+// One VkPipelineCache persisted to a file, so pipelines are not compiled anew
+// on every run.
 // The driver checks the file's header itself and starts empty when the data
 // belongs to another driver or GPU. Several instances may share the file.
 class PipelineCacheFile {

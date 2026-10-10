@@ -1,11 +1,11 @@
 # NoorRHI
 
 A small, object-oriented Vulkan API. Buffers are device addresses; textures and
-samplers are 32-bit indices into descriptor heaps the device owns and fills
-automatically. There are no pipeline layouts, descriptor sets, resource
+samplers are 32-bit indices into one bindless descriptor set the device owns and
+fills automatically. There are no pipeline layouts, descriptor sets, resource
 registries in the app, or upload batches.
 
-Texture binding uses the cross-vendor `VK_EXT_descriptor_heap` model; see
+Everything it needs is core Vulkan 1.3; see
 [Requirements and verification](#requirements-and-verification).
 
 ## Building
@@ -67,27 +67,32 @@ before their Device; a surface provider outlives the Swapchains created for it.
 
 ## Textures and samplers
 
-The device creates one resource heap and one sampler heap at construction, sized
-by `DeviceConfig::texture_descriptor_capacity` (default 16384) and
+The device creates one bindless descriptor set at construction, with arrays
+sized by `DeviceConfig::texture_descriptor_capacity` (default 16384) and
 `DeviceConfig::sampler_descriptor_capacity` (default 256). A `Sampled` or
-`Storage` image takes one resource slot per usage, and a sampler takes one
-sampler slot. Handles are slot indices, so shaders index the heaps directly:
+`Storage` image takes one texture slot per usage, and a sampler takes one
+sampler slot. Handles are slot indices, so shaders that import `noorrhi.slang`
+index them with Slang's heap syntax:
 
 ```slang
+import noorrhi;
+
 RWTexture2D<float4> output = ResourceDescriptorHeap[arguments.output];
 Texture2D<float4> albedo = ResourceDescriptorHeap[arguments.albedo];
 SamplerState linear = SamplerDescriptorHeap[arguments.sampler];
 ```
 
-Slot 0 of each heap is reserved and never written, so a zero handle means "no
+Slot 0 is reserved and never written, so a zero handle means "no
 texture". Store handles as `uint` in shared records. A resource returns its
 slots when it is retired, meaning after every submission that might still read
 them has finished. Until then its handles stay valid for in-flight work.
-Slots are then reused. The heaps never grow: running out throws
-`ErrorCode::OutOfMemory`.
+Slots are then reused. The set never grows: running out throws
+`ErrorCode::OutOfMemory`. Wrap a handle that can differ within a wave, such as
+a per-hit material texture, in `NonUniformResourceIndex()`.
 
-The root argument pointer is delivered with `vkCmdPushDataEXT`, and both heaps are
-bound before every dispatch, draw, and trace. That makes it safe to record
+Every pipeline shares one layout: the bindless set and an 8-byte push constant
+carrying the root argument pointer. The set is bound before every dispatch,
+draw, and trace. That makes it safe to record
 legacy descriptor-set commands, such as an ImGui backend's, into the same
 frame command buffer.
 - `Shared<T>`: public `data`, `ptr()`, `commit()`. Commit compares the
@@ -160,28 +165,25 @@ external API to finish using exported objects before their owners are destroyed.
 
 ## Requirements and verification
 
-Vulkan 1.3 with buffer device addresses, timeline semaphores, synchronization2
-and dynamic rendering is mandatory; devices without them are skipped at selection.
-`VK_EXT_descriptor_heap` (`descriptorHeap`), `VK_KHR_shader_untyped_pointers`
-(`shaderUntypedPointers`), maintenance5 (core in 1.4, or the extension),
-`shaderInt64`, `shaderDrawParameters` and `scalarBlockLayout` are reported as `DeviceFeatures::descriptor_heap`. Without them a device still
-allocates buffers and presents, but creating a pipeline, a sampler or a
-shader-visible image throws `UnsupportedFeature`. None of these is
-vendor-specific, but driver support is recent. Ray tracing is checked
-separately.
+Vulkan 1.3 is mandatory, with buffer device addresses, timeline semaphores,
+synchronization2, dynamic rendering, `scalarBlockLayout`, `shaderInt64`,
+`shaderDrawParameters` and the descriptor indexing features behind the bindless
+set (runtime arrays, partially bound and update-after-bind sampled and storage
+images, non-uniform indexing). Devices without them are skipped at selection.
+Ray tracing is checked separately and reported in `DeviceFeatures`.
 
-Shaders are supplied as SPIR-V bytes. Any shader that indexes
-`ResourceDescriptorHeap` or `SamplerDescriptorHeap` must be compiled with
-`slangc -capability spvDescriptorHeapEXT`, and the heap stride must stay at its
-default (do not pass `-spirv-resource-heap-stride`). Validate modules with
-`spirv-val --target-env vulkan1.4`. Requested validation fails clearly if its
+Shaders are supplied as SPIR-V bytes. Compile them with `NOORRHI_SLANG_FLAGS`
+(set by this project's CMake), which puts `shaders/noorrhi.slang` on the import
+path and the bindless set at set 0. Any shader that indexes
+`ResourceDescriptorHeap` or `SamplerDescriptorHeap` must `import noorrhi;`.
+Validate modules with `spirv-val --target-env vulkan1.3`. Requested validation fails clearly if its
 layer is absent.
 
 `memory_report()` reports VMA allocation bytes, reserved block bytes, allocation
 count, and argument-arena capacity, including pending allocations. Dedicated
 external-memory images are outside these VMA totals.
 
-GPU tests cover compute, images (including heap reads and writes, and slot reuse
+GPU tests cover compute, images (including bindless reads and writes, and slot reuse
 and exhaustion), ray tracing, shared updates, argument wraparound, and retirement. `noorrhi_presentation_test` additionally needs a desktop display and
 tests resizing, present-mode switches and abandoned frames. Enable synchronization validation with
 `VK_LAYER_VALIDATE_SYNC=1`.

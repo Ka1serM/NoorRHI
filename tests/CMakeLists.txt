@@ -34,10 +34,7 @@ set(NOORRHI_TRIANGLE_SHADER "${NOORRHI_TEST_SHADER_DIR}/triangle.spv")
 set(NOORRHI_RAYTRACING_SHADER "${NOORRHI_TEST_SHADER_DIR}/raytracing.spv")
 set(NOORRHI_IMAGE_SHADER "${NOORRHI_TEST_SHADER_DIR}/image.spv")
 
-# Most tests use BDA buffers and framebuffer attachments, not shader textures,
-# so only image.slang requests the descriptor-heap capability.
-set(NOORRHI_TEST_SHADER_FLAGS
-    -emit-spirv-directly
+set(NOORRHI_TEST_SHADER_FLAGS ${NOORRHI_SLANG_FLAGS}
     -matrix-layout-row-major -fvk-use-entrypoint-name -Wno-30081)
 
 add_custom_command(
@@ -46,7 +43,7 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${NOORRHI_TEST_SHADER_DIR}"
     COMMAND "${NOORRHI_SLANGC_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/image.slang"
         -entry main -stage compute -target spirv
-        -profile spirv_1_5 -capability spvDescriptorHeapEXT ${NOORRHI_TEST_SHADER_FLAGS}
+        -profile spirv_1_5 ${NOORRHI_TEST_SHADER_FLAGS}
         -o "${NOORRHI_IMAGE_SHADER}"
     COMMAND "${NOORRHI_SLANGC_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/add.slang"
         -entry main -stage compute -target spirv
@@ -66,6 +63,7 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.slang"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/raytracing.slang"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/image.slang"
+        "${NOORRHI_SHADER_DIR}/noorrhi.slang"
     COMMENT "Compiling NoorRHI test Slang shaders" VERBATIM)
 
 add_custom_target(noorrhi_test_shaders DEPENDS

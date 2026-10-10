@@ -93,7 +93,7 @@ struct RayTracingPipelineDesc {
     std::vector<Shader> intersection;
     // Callable shaders, invoked by index with CallShader().
     std::vector<Shader> callable;
-    // Disable persistent pipeline binaries for libraries built from imported shaders.
+    // Keep libraries built from imported shaders out of the persisted pipeline cache.
     bool use_pipeline_cache = true;
 };
 
