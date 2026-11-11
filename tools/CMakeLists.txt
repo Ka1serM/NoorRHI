@@ -1,0 +1,5 @@
+if(NOORRHI_BACKEND STREQUAL "WebGpu" AND NOT EMSCRIPTEN)
+    add_executable(NoorRHITranslateWgsl TranslateWgsl/main.cpp)
+    target_link_libraries(NoorRHITranslateWgsl PRIVATE NoorRHI)
+    target_compile_options(NoorRHITranslateWgsl PRIVATE -fno-exceptions -Wall -Wextra)
+endif()

@@ -1,474 +1,266 @@
-#include <noorrhi/noorrhi.hpp>
-
-#include <catch2/catch_test_macros.hpp>
-
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
-#include <fstream>
-#include <iterator>
-#include <span>
+#include <numeric>
 #include <vector>
 
-namespace {
-std::vector<std::byte> read_shader(const char* path) {
-    std::ifstream file(path, std::ios::binary);
-    REQUIRE(file.good());
-    const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), {});
-    std::vector<std::byte> result(bytes.size());
-    for (std::size_t i = 0; i < bytes.size(); ++i)
-        result[i] = static_cast<std::byte>(bytes[i]);
-    return result;
+#include "Add.h"
+#include "Add.slang.h"
+#include "Count.h"
+#include "Count.slang.h"
+#include "Raster.h"
+#include "Raster.slang.h"
+#include "StorageImage.h"
+#include "StorageImage.slang.h"
+#include "Test.h"
+
+using namespace NoorRHI;
+
+TEST_CASE("compute adds buffers through pointers") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t count = 1000;
+    std::vector<float> a(count);
+    std::vector<float> b(count);
+    std::iota(a.begin(), a.end(), 0.0f);
+    std::iota(b.begin(), b.end(), 1000.0f);
+    Buffer<float> first;
+    Buffer<float> second;
+    Buffer<float> result;
+    REQUIRE_OK(first.open(*device, count));
+    REQUIRE_OK(second.open(*device, count));
+    REQUIRE_OK(result.open(*device, count));
+    REQUIRE_OK(first.upload(a));
+    REQUIRE_OK(second.upload(b));
+    ComputePipeline pipeline;
+    REQUIRE_OK(pipeline.open(*device, Add::main));
+
+    CommandList list(*device);
+    list.dispatch(pipeline, {count}, Add::Arguments{first.getPtr(), second.getPtr(), result.getPtr(), count});
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::vector<float> sums(count);
+    REQUIRE_OK(result.download(sums));
+    for (std::uint32_t index = 0; index < count; ++index)
+        REQUIRE(sums[index] == a[index] + b[index]);
 }
 
-// Every test runs with the validation layers on, so a spec violation fails the
-// build rather than going unnoticed.
-noorrhi::Device make_device() {
-    return noorrhi::Device({.enable_validation = true, .application_name = "NoorRHI tests"});
-}
-}
+TEST_CASE("a shader from SPIR-V in memory runs like a built shader") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    const std::span<const std::byte> built = Add::main.getCode(false, false);
+    const std::vector<std::byte> code(built.begin(), built.end());
+    const Shader shader{.code = {code, code, code, code}, .entryPoint = Add::main.entryPoint, .stage = ShaderStage::Compute, .threadGroupSize = Add::main.threadGroupSize};
+    constexpr std::uint32_t count = 100;
+    std::vector<float> values(count);
+    std::iota(values.begin(), values.end(), 1.0f);
+    Buffer<float> input;
+    Buffer<float> result;
+    REQUIRE_OK(input.open(*device, count));
+    REQUIRE_OK(result.open(*device, count));
+    REQUIRE_OK(input.upload(values));
+    ComputePipeline pipeline;
+    REQUIRE_OK(pipeline.open(*device, shader));
 
-TEST_CASE("NoorRHI API adds typed buffers through a root argument") {
-    constexpr std::size_t count = 257;
-
-    noorrhi::Device device = make_device();
-    auto shader = device.create_shader(read_shader(NOORRHI_TEST_SHADER));
-    auto a = device.buffer<float>(count);
-    auto b = device.buffer<float>(count);
-    auto output = device.buffer<float>(count);
-    const auto a_address = a.ptr();
-    REQUIRE(a_address.address != 0);
-    REQUIRE(a.ptr().address == a_address.address);
-
-    std::vector<float> lhs(count), rhs(count), expected(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        lhs[i] = static_cast<float>(i) * 0.25f;
-        rhs[i] = 3.0f - static_cast<float>(i) * 0.125f;
-        expected[i] = lhs[i] + rhs[i];
-    }
-    a.upload(std::span<const float>(lhs));
-    b.upload(std::span<const float>(rhs));
-
-    struct Args {
-        noorrhi::GpuPtr<float> a;
-        noorrhi::GpuPtr<float> b;
-        noorrhi::GpuPtr<float> output;
-        std::uint32_t count;
-    } args{a.ptr(), b.ptr(), output.ptr(), static_cast<std::uint32_t>(count)};
-
-    // The temporary pipeline is destroyed immediately after launch; the
-    // submission must retain the Vulkan pipeline until GPU completion.
-    device.compute(shader).launch(
-        {static_cast<std::uint32_t>((count + 63) / 64), 1, 1}, args);
-    device.barrier(noorrhi::Stage::Compute, noorrhi::Stage::Copy);
-    const auto token = device.signal();
-    device.wait(token);
-
-    std::vector<float> actual(count);
-    output.download(std::span<float>(actual));
-    REQUIRE(actual == expected);
+    CommandList list(*device);
+    list.dispatch(pipeline, {count}, Add::Arguments{input.getPtr(), input.getPtr(), result.getPtr(), count});
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::vector<float> sums(count);
+    REQUIRE_OK(result.download(sums));
+    for (std::uint32_t index = 0; index < count; ++index)
+        REQUIRE(sums[index] == 2.0f * values[index]);
 }
 
-TEST_CASE("NoorRHI API dispatches compute indirectly with root arguments") {
-    constexpr std::size_t count = 64;
-    noorrhi::Device device = make_device();
-    auto shader = device.create_shader(read_shader(NOORRHI_TEST_SHADER));
-    auto pipeline = device.compute(shader);
-
-    auto a = device.buffer<float>(count);
-    auto b = device.buffer<float>(count);
-    auto output = device.buffer<float>(count);
+TEST_CASE("a buffer released before its list is submitted keeps its contents for that list") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t count = 256;
     const std::vector<float> ones(count, 1.0f);
     const std::vector<float> twos(count, 2.0f);
-    a.upload(std::span<const float>(ones));
-    b.upload(std::span<const float>(twos));
+    Buffer<float> result;
+    REQUIRE_OK(result.open(*device, count));
+    ComputePipeline pipeline;
+    REQUIRE_OK(pipeline.open(*device, Add::main));
 
-    auto groups = device.buffer<noorrhi::DispatchArgs>(1);
-    const noorrhi::DispatchArgs dispatch{1, 1, 1};
-    groups.upload(std::span<const noorrhi::DispatchArgs>(&dispatch, 1));
-
-    struct Args {
-        noorrhi::GpuPtr<float> a;
-        noorrhi::GpuPtr<float> b;
-        noorrhi::GpuPtr<float> output;
-        std::uint32_t count;
-    } args{a.ptr(), b.ptr(), output.ptr(), static_cast<std::uint32_t>(count)};
-
-    pipeline.launch_indirect(groups.ptr(), args);
-    device.synchronize();
-
-    std::vector<float> actual(count);
-    output.download(std::span<float>(actual));
-    REQUIRE(actual == std::vector<float>(count, 3.0f));
-}
-
-TEST_CASE("NoorRHI uploads capture bytes and preserve overlapping write order") {
-    auto device = make_device();
-    auto buffer = device.buffer<std::uint32_t>(4);
-    std::vector<std::uint32_t> values{1, 2, 3, 4};
-    buffer.upload(std::span<const std::uint32_t>(values));
-    values.assign(4, 99);
-    const std::uint32_t replacement = 7;
-    buffer.upload(std::span(&replacement, 1), 1);
-    std::vector<std::uint32_t> actual(4);
-    buffer.download(std::span(actual));
-    CHECK(actual == std::vector<std::uint32_t>{1, 7, 3, 4});
-}
-
-TEST_CASE("NoorRHI buffers keep their address across partial uploads") {
-    auto device = make_device();
-    constexpr std::size_t count = 40000;
-    auto a = device.buffer<float>(count);
-    auto b = device.buffer<float>(count);
-    std::vector<float> aData(count, 2.0f);
-    const std::vector<float> bData(count, 3.0f);
-    auto output = device.buffer<float>(count);
-    const auto address = a.ptr();
-    a.upload(std::span<const float>(aData));
-    b.upload(std::span<const float>(bData));
-    aData[17] = 8.0f;
-    a.upload(std::span<const float>(aData).subspan(17, 1), 17);
-    CHECK(a.ptr().address == address.address);
-    auto shader = device.create_shader(read_shader(NOORRHI_TEST_SHADER));
-    struct Args {
-        noorrhi::GpuPtr<float> a, b, output;
-        std::uint32_t count;
-    } args{a.ptr(), b.ptr(), output.ptr(), count};
-    device.compute(shader).launch({(count + 63) / 64, 1, 1}, args);
-    std::vector<float> actual(count);
-    output.download(std::span(actual));
-    std::vector<float> expected(count, 5.0f);
-    expected[17] = 11.0f;
-    CHECK(actual == expected);
-}
-
-TEST_CASE("NoorRHI shared records publish their data on commit") {
-    auto device = make_device();
-    noorrhi::Shared<std::uint32_t> record(device);
-    record.setData(42);
-    record.commit();
-    device.synchronize();
-    std::uint32_t actual = 0;
-    CHECK(record.ptr().address != 0);
-}
-
-TEST_CASE("NoorRHI argument arena preserves launches across chunks") {
-    noorrhi::Device device({.enable_validation = true, .application_name = "arena tests",
-        .argument_arena_bytes = 4096});
-    auto input = device.buffer<float>(1);
-    auto output = device.buffer<float>(400);
-    const float one = 1.0f;
-    input.upload(std::span(&one, 1));
-    std::vector<float> actual(400, 0.0f);
-    output.upload(std::span<const float>(actual));
-    auto pipeline = device.compute(device.create_shader(read_shader(NOORRHI_TEST_SHADER)));
-    struct Args {
-        noorrhi::GpuPtr<float> a, b, output;
-        std::uint32_t count;
-    };
-    for (std::size_t i = 0; i < actual.size(); ++i) {
-        const Args args{input.ptr(), input.ptr(),
-            noorrhi::GpuPtr<float>{output.ptr().address + i * sizeof(float)}, 1};
-        pipeline.launch({1, 1, 1}, args);
-    }
-    output.download(std::span(actual));
-    CHECK(actual == std::vector<float>(400, 2.0f));
-}
-
-TEST_CASE("NoorRHI argument arena holds more than a chunk in one open recording") {
-    noorrhi::Device device({.enable_validation = true, .application_name = "arena tests",
-        .argument_arena_bytes = 4096});
-    auto input = device.buffer<float>(1);
-    auto output = device.buffer<float>(2000);
-    const float one = 1.0f;
-    input.upload(std::span(&one, 1));
-    std::vector<float> actual(2000, 0.0f);
-    output.upload(std::span<const float>(actual));
-    auto pipeline = device.compute(device.create_shader(read_shader(NOORRHI_TEST_SHADER)));
-    struct Args {
-        noorrhi::GpuPtr<float> a, b, output;
-        std::uint32_t count;
-    };
-    struct LargeArgs : Args {
-        std::byte padding[8192];
-    };
+    CommandList list(*device);
     {
-        noorrhi::Recording recording(device);
-        for (std::size_t i = 0; i < actual.size(); ++i) {
-            const Args args{input.ptr(), input.ptr(),
-                noorrhi::GpuPtr<float>{output.ptr().address + i * sizeof(float)}, 1};
-            pipeline.launch({1, 1, 1}, args);
-        }
-        recording.submit();
+        Buffer<float> released;
+        REQUIRE_OK(released.open(*device, count));
+        REQUIRE_OK(released.upload(ones));
+        list.dispatch(pipeline, {count}, Add::Arguments{released.getPtr(), released.getPtr(), result.getPtr(), count});
     }
-    output.download(std::span(actual));
-    CHECK(actual == std::vector<float>(2000, 2.0f));
+    Buffer<float> reused;
+    REQUIRE_OK(reused.open(*device, count));
+    REQUIRE_OK(reused.upload(twos));
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::vector<float> sums(count);
+    REQUIRE_OK(result.download(sums));
+    for (const float sum : sums)
+        REQUIRE(sum == 2.0f);
+}
 
-    std::fill(actual.begin(), actual.end(), 0.0f);
-    output.upload(std::span<const float>(actual));
-    for (std::size_t i = 0; i < 8; ++i) {
-        LargeArgs args{};
-        args.a = input.ptr();
-        args.b = input.ptr();
-        args.output = noorrhi::GpuPtr<float>{output.ptr().address + i * sizeof(float)};
-        args.count = 1;
-        pipeline.launch({1, 1, 1}, args);
+TEST_CASE("each command sees the writes of the commands before it") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t count = 1u << 20;
+    constexpr std::uint32_t steps = 64;
+    Buffer<float> ones;
+    Buffer<float> first;
+    Buffer<float> second;
+    Buffer<float> sum;
+    REQUIRE_OK(ones.open(*device, count));
+    REQUIRE_OK(first.open(*device, count));
+    REQUIRE_OK(second.open(*device, count));
+    REQUIRE_OK(sum.open(*device, count));
+    REQUIRE_OK(ones.upload(std::vector<float>(count, 1.0f)));
+    const std::vector<float> zeros(count, 0.0f);
+    ComputePipeline add;
+    REQUIRE_OK(add.open(*device, Add::main));
+    Readback<float> readback;
+    REQUIRE_OK(readback.open(*device, count));
+
+    CommandList list(*device);
+    list.upload(first, std::span<const float>(zeros));
+    for (std::uint32_t step = 0; step < steps; ++step) {
+        const Buffer<float>& from = step % 2 == 0 ? first : second;
+        const Buffer<float>& to = step % 2 == 0 ? second : first;
+        list.dispatch(add, {count}, Add::Arguments{from.getPtr(), ones.getPtr(), to.getPtr(), count});
     }
-    output.download(std::span(actual));
-    for (std::size_t i = 0; i < 8; ++i)
-        CHECK(actual[i] == 2.0f);
+    list.beginConcurrent();
+    list.dispatch(add, {count}, Add::Arguments{first.getPtr(), ones.getPtr(), second.getPtr(), count});
+    list.dispatch(add, {count}, Add::Arguments{first.getPtr(), first.getPtr(), sum.getPtr(), count});
+    list.endConcurrent();
+    list.dispatch(add, {count}, Add::Arguments{second.getPtr(), sum.getPtr(), first.getPtr(), count});
+    list.download(first, readback);
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::expected<std::span<const float>, Error> values = readback.read();
+    REQUIRE(values.has_value());
+    constexpr float expected = (steps + 1.0f) + 2.0f * steps;
+    CHECK(std::ranges::count_if(*values, [](const float value) { return value != expected; }) == 0);
 }
 
-TEST_CASE("NoorRHI API round-trips image contents") {
-    noorrhi::Device device = make_device();
-    auto image = device.image<std::uint8_t>(4, 4,
-        noorrhi::ImageUsage::Storage | noorrhi::ImageUsage::Sampled);
-    REQUIRE(image.storage_handle());
-    REQUIRE(image.sampled_handle());
-    REQUIRE(image.storage_handle().value != image.sampled_handle().value);
+TEST_CASE("indirect dispatch reads its groups from a buffer") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t count = 256;
+    const std::vector<float> ones(count, 1.0f);
+    Buffer<float> first;
+    Buffer<float> result;
+    Buffer<DispatchSize> groups;
+    REQUIRE_OK(first.open(*device, count));
+    REQUIRE_OK(result.open(*device, count));
+    REQUIRE_OK(groups.open(*device, 1));
+    REQUIRE_OK(first.upload(ones));
+    const std::array<DispatchSize, 1> size{DispatchSize{count / 64, 1, 1}};
+    ComputePipeline pipeline;
+    REQUIRE_OK(pipeline.open(*device, Add::main));
 
-    std::vector<std::uint8_t> pixels(4u * 4u * 4u);
-    for (std::size_t i = 0; i < pixels.size(); ++i)
-        pixels[i] = static_cast<std::uint8_t>(i * 3u + 1u);
-    image.upload(std::span<const std::uint8_t>(pixels));
-
-    std::vector<std::uint8_t> read_back(pixels.size());
-    image.download(std::span<std::uint8_t>(read_back));
-    REQUIRE(read_back == pixels);
+    CommandList list(*device);
+    list.upload(groups, std::span<const DispatchSize>(size));
+    list.dispatchIndirect(pipeline, groups.getPtr(), Add::Arguments{first.getPtr(), first.getPtr(), result.getPtr(), count});
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::vector<float> sums(count);
+    REQUIRE_OK(result.download(sums));
+    CHECK(std::ranges::all_of(sums, [](const float value) { return value == 2.0f; }));
 }
 
-TEST_CASE("NoorRHI API reads back single texels and sub-rectangles") {
-    noorrhi::Device device = make_device();
-    constexpr std::uint32_t width = 5;
-    constexpr std::uint32_t height = 3;
-    auto image = device.image<std::uint8_t>(width, height,
-        noorrhi::ImageUsage::Storage | noorrhi::ImageUsage::Sampled);
-    std::vector<std::uint8_t> pixels(width * height * 4u);
-    for (std::size_t i = 0; i < pixels.size(); ++i)
-        pixels[i] = static_cast<std::uint8_t>(i * 7u + 2u);
-    image.upload(std::span<const std::uint8_t>(pixels));
-    const auto texel_at = [&](const std::uint32_t x, const std::uint32_t y) {
-        return pixels.begin() + static_cast<std::ptrdiff_t>((y * width + x) * 4u);
-    };
+TEST_CASE("atomics in atomic memory work next to plain pointer access") {
+    static_assert(sizeof(Count::Arguments) == 32 && offsetof(Count::Arguments, counters) == 16);
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t count = 1000;
+    constexpr std::uint32_t threshold = 600;
+    std::vector<std::uint32_t> values(count);
+    std::iota(values.begin(), values.end(), 0u);
+    Buffer<std::uint32_t> input;
+    Buffer<std::uint32_t> slots;
+    Buffer<Atomic<std::uint32_t>> counters;
+    REQUIRE_OK(input.open(*device, count));
+    REQUIRE_OK(slots.open(*device, count));
+    REQUIRE_OK(counters.open(*device, 2));
+    REQUIRE_OK(input.upload(values));
+    REQUIRE_OK(counters.upload(std::array<Atomic<std::uint32_t>, 2>{}));
+    ComputePipeline pipeline;
+    REQUIRE_OK(pipeline.open(*device, Count::main));
 
-    std::vector<std::uint8_t> texel(4);
-    image.download_region(3, 2, 1, 1, std::span<std::uint8_t>(texel));
-    CHECK(std::equal(texel.begin(), texel.end(), texel_at(3, 2)));
-
-    // A rectangle comes back row by row, starting at its own origin.
-    std::vector<std::uint8_t> region(2u * 2u * 4u);
-    image.download_region(1, 1, 2, 2, std::span<std::uint8_t>(region));
-    for (std::uint32_t row = 0; row < 2; ++row)
-        for (std::uint32_t column = 0; column < 2; ++column)
-            CHECK(std::equal(region.begin() + static_cast<std::ptrdiff_t>((row * 2u + column) * 4u),
-                region.begin() + static_cast<std::ptrdiff_t>((row * 2u + column + 1u) * 4u),
-                texel_at(1 + column, 1 + row)));
-
-    // Regions past the edge, empty regions and mismatched destinations throw.
-    std::vector<std::uint8_t> two_texels(8);
-    CHECK_THROWS_AS(image.download_region(4, 0, 2, 1, std::span<std::uint8_t>(two_texels)),
-        noorrhi::Error);
-    CHECK_THROWS_AS(image.download_region(0, 3, 1, 1, std::span<std::uint8_t>(texel)),
-        noorrhi::Error);
-    CHECK_THROWS_AS(image.download_region(0, 0, 0, 1, std::span<std::uint8_t>(texel)),
-        noorrhi::Error);
-    CHECK_THROWS_AS(image.download_region(0, 0, 1, 1, std::span<std::uint8_t>(region)),
-        noorrhi::Error);
+    CommandList list(*device);
+    list.dispatch(pipeline, {count}, Count::Arguments{input.getPtr(), slots.getPtr(), counters.getPtr(), count, threshold});
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::array<Atomic<std::uint32_t>, 2> totals{};
+    REQUIRE_OK(counters.download(totals));
+    REQUIRE(totals[0].value == count - threshold);
+    CHECK(totals[1].value == count - 1);
+    std::vector<std::uint32_t> written(count - threshold);
+    REQUIRE_OK(slots.download(written));
+    std::ranges::sort(written);
+    for (std::uint32_t index = 0; index < written.size(); ++index)
+        REQUIRE(written[index] == threshold + index);
 }
 
-TEST_CASE("NoorRHI shaders read and write images through the bindless set") {
-    noorrhi::Device device = make_device();
-    constexpr std::uint32_t size = 8;
-    auto target = device.image<std::uint8_t>(size, size,
-        noorrhi::ImageUsage::Storage, noorrhi::ImageFormat::Rgba8Unorm);
-    auto source = device.image<std::uint8_t>(1, 1,
-        noorrhi::ImageUsage::Sampled, noorrhi::ImageFormat::Rgba8Unorm);
-    const std::uint8_t texel[4]{0, 0, 64, 255};
-    source.upload(std::span<const std::uint8_t>(texel));
-    auto sampler = device.sampler({noorrhi::Filter::Nearest});
-    auto pipeline = device.compute(device.create_shader(read_shader(NOORRHI_IMAGE_SHADER)));
-
-    struct Args {
-        std::uint32_t target, source, sampler, size;
-    };
-    pipeline.launch({1, 1, 1}, Args{target.storage_handle().value,
-        source.sampled_handle().value, sampler.handle().value, size});
-    device.synchronize();
-
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size) * size * 4u);
-    target.download(std::span<std::uint8_t>(pixels));
-    for (std::uint32_t y = 0; y < size; ++y) {
-        for (std::uint32_t x = 0; x < size; ++x) {
-            const std::size_t offset = (static_cast<std::size_t>(y) * size + x) * 4u;
-            REQUIRE(pixels[offset] == x * 16u);
-            REQUIRE(pixels[offset + 1] == y * 16u);
-            REQUIRE(pixels[offset + 2] == 64u);
-            REQUIRE(pixels[offset + 3] == 255u);
-        }
-    }
+TEST_CASE("command list uploads keep unaligned bytes") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    Buffer<std::uint8_t> bytes;
+    REQUIRE_OK(bytes.open(*device, 16));
+    const std::vector<std::uint8_t> zeros(16, 0);
+    REQUIRE_OK(bytes.upload(zeros));
+    const std::array<std::uint8_t, 7> pattern{1, 2, 3, 4, 5, 6, 7};
+    CommandList list(*device);
+    list.upload(bytes, std::span<const std::uint8_t>(pattern), 3);
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::vector<std::uint8_t> result(16);
+    REQUIRE_OK(bytes.download(result));
+    const std::vector<std::uint8_t> expected{0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0, 0};
+    CHECK(result == expected);
 }
 
-TEST_CASE("NoorRHI bindless slots are reused after retirement and never overflow") {
-    // Slot 0 is reserved, so three storage images fill the texture slots.
-    noorrhi::Device device({.enable_validation = true, .application_name = "bindless tests",
-        .texture_descriptor_capacity = 4, .sampler_descriptor_capacity = 2});
-    for (std::uint32_t i = 0; i < 64u; ++i) {
-        {
-            auto image = device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage);
-            REQUIRE(image.storage_handle());
-            REQUIRE(image.storage_handle().value < 4u);
-            auto sampler = device.sampler({});
-            REQUIRE(sampler.handle().value == 1u);
-        }
-        // Slots come back only once the GPU has passed the retire point.
-        device.synchronize();
-    }
+TEST_CASE("compute writes storage images and samples images through handles") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t size = 16;
+    Image target;
+    Image source;
+    Sampler sampler;
+    REQUIRE_OK(target.open(*device, {.width = size, .height = size, .usage = ImageUsage::Storage}));
+    REQUIRE_OK(source.open(*device, {.width = 1, .height = 1}));
+    REQUIRE_OK(Test::uploadTexels(source, std::array<std::uint32_t, 1>{0xff800000u}));
+    REQUIRE_OK(sampler.open(*device, {.filter = Filter::Nearest}));
+    ComputePipeline pipeline;
+    REQUIRE_OK(pipeline.open(*device, StorageImage::main));
 
-    std::vector<noorrhi::Image<std::uint8_t>> held;
-    for (std::uint32_t i = 0; i < 3u; ++i)
-        held.push_back(device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage));
-    REQUIRE(held[0].storage_handle().value != held[1].storage_handle().value);
-    REQUIRE(held[1].storage_handle().value != held[2].storage_handle().value);
-    REQUIRE(held[0].storage_handle().value != held[2].storage_handle().value);
-    try {
-        auto overflow = device.image<std::uint8_t>(2, 2, noorrhi::ImageUsage::Storage);
-        FAIL("full texture slots accepted another image");
-    } catch (const noorrhi::Error& error) {
-        REQUIRE(error.code() == noorrhi::ErrorCode::OutOfMemory);
-    }
-    auto sampler = device.sampler({});
-    REQUIRE_THROWS_AS(device.sampler({}), noorrhi::Error);
+    CommandList list(*device);
+    list.dispatch(pipeline, {size, size}, StorageImage::Arguments{target.getStorageHandle(), source.getSampledHandle(), sampler.getHandle(), size});
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::expected<std::vector<std::uint32_t>, Error> texels = Test::downloadTexels(target);
+    REQUIRE_OK(texels);
+    for (std::uint32_t y = 0; y < size; ++y)
+        for (std::uint32_t x = 0; x < size; ++x)
+            REQUIRE((*texels)[y * size + x] == (0xff000000u | 0x800000u | (y * 16u) << 8 | x * 16u));
 }
 
-TEST_CASE("NoorRHI API rasterizes a triangle into a render target") {
-    noorrhi::Device device = make_device();
-    const auto triangle = read_shader(NOORRHI_TRIANGLE_SHADER);
-    auto vertex = device.create_shader(triangle, "vertMain");
-    auto fragment = device.create_shader(triangle, "fragMain");
+TEST_CASE("dispatch counts threads and argument structs have the GPU layout") {
+    static_assert(sizeof(Add::Arguments) == 28 && offsetof(Add::Arguments, count) == 24);
+    static_assert(sizeof(Raster::Arguments) == 40 && offsetof(Raster::Arguments, targetSize) == 32);
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    constexpr std::uint32_t count = 77;
+    const std::vector<float> ones(count + 1, 1.0f);
+    Buffer<float> first;
+    Buffer<float> result;
+    REQUIRE_OK(first.open(*device, count + 1));
+    REQUIRE_OK(result.open(*device, count + 1));
+    REQUIRE_OK(first.upload(ones));
+    REQUIRE_OK(result.upload(std::vector<float>(count + 1, 0.0f)));
+    ComputePipeline pipeline;
+    CHECK(pipeline.open(*device, Shader{}).error().code == ErrorCode::InvalidArgument);
+    CHECK(pipeline.open(*device, Raster::vertMain).error().code == ErrorCode::InvalidArgument);
+    REQUIRE_OK(pipeline.open(*device, Add::main));
 
-    constexpr std::uint32_t size = 64;
-    auto target = device.image<std::uint8_t>(size, size,
-        noorrhi::ImageUsage::ColorAttachment, noorrhi::ImageFormat::Rgba8Unorm);
-    auto pipeline = device.graphics({vertex, fragment, {}, noorrhi::ImageFormat::Rgba8Unorm});
-
-    device.render({target.handle(), {}}, [&] { pipeline.draw(3); });
-    device.synchronize();
-
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size) * size * 4u);
-    target.download(std::span<std::uint8_t>(pixels));
-    const auto texel = [&](const std::uint32_t x, const std::uint32_t y) {
-        return std::span<const std::uint8_t>(
-            pixels.data() + (static_cast<std::size_t>(y) * size + x) * 4u, 4u);
-    };
-    // The triangle covers the middle of the target and none of the corners.
-    const auto centre = texel(size / 2, size / 2);
-    REQUIRE((centre[0] || centre[1] || centre[2]));
-    const auto corner = texel(0, 0);
-    REQUIRE(corner[0] == 0);
-    REQUIRE(corner[1] == 0);
-    REQUIRE(corner[2] == 0);
-
-    // A pipeline built for a different attachment format must be rejected
-    // rather than silently mismatching the render pass instance.
-    auto bgra_target = device.image<std::uint8_t>(8, 8,
-        noorrhi::ImageUsage::ColorAttachment, noorrhi::ImageFormat::Bgra8Unorm);
-    REQUIRE_THROWS_AS(
-        device.render({bgra_target.handle(), {}}, [&] { pipeline.draw(3); }), noorrhi::Error);
-}
-
-TEST_CASE("NoorRHI API draws indirectly and honours depth targets") {
-    noorrhi::Device device = make_device();
-    const auto triangle = read_shader(NOORRHI_TRIANGLE_SHADER);
-    auto vertex = device.create_shader(triangle, "vertMain");
-    auto fragment = device.create_shader(triangle, "fragMain");
-
-    constexpr std::uint32_t size = 32;
-    auto target = device.image<std::uint8_t>(size, size, noorrhi::ImageUsage::ColorAttachment);
-    auto depth = device.image<float>(size, size, noorrhi::ImageUsage::DepthAttachment);
-
-    noorrhi::GraphicsState state{};
-    state.depth_test = true;
-    state.depth_write = true;
-    auto depth_pipeline = device.graphics({vertex, fragment, state});
-    auto plain_pipeline = device.graphics({vertex, fragment, {}});
-
-    auto commands = device.buffer<noorrhi::DrawArgs>(1);
-    const noorrhi::DrawArgs draw_args{3, 1, 0, 0};
-    commands.upload(std::span<const noorrhi::DrawArgs>(&draw_args, 1));
-
-    device.render({target.handle(), depth.handle()},
-        [&] { depth_pipeline.draw_indirect(commands.ptr()); });
-    device.synchronize();
-
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size) * size * 4u);
-    target.download(std::span<std::uint8_t>(pixels));
-    const std::size_t centre =
-        (static_cast<std::size_t>(size / 2) * size + size / 2) * 4u;
-    REQUIRE((pixels[centre] || pixels[centre + 1] || pixels[centre + 2]));
-
-    // Depth attachment presence is part of the pipeline's contract.
-    REQUIRE_THROWS_AS(device.render({target.handle(), depth.handle()},
-        [&] { plain_pipeline.draw(3); }), noorrhi::Error);
-    REQUIRE_THROWS_AS(device.render({target.handle(), {}},
-        [&] { depth_pipeline.draw(3); }), noorrhi::Error);
-}
-
-TEST_CASE("NoorRHI API exposes samplers and rejects invalid resources") {
-    noorrhi::Device device = make_device();
-    auto sampler = device.sampler({});
-    REQUIRE(sampler);
-    REQUIRE(sampler.handle());
-    auto texture = device.image<std::uint8_t>(1, 1, noorrhi::ImageUsage::Sampled);
-    REQUIRE(texture.sampled_handle());
-    REQUIRE_FALSE(texture.storage_handle());
-
-    REQUIRE_THROWS_AS(device.buffer<float>(0), noorrhi::Error);
-    REQUIRE_THROWS_AS(device.image<std::uint8_t>(0, 4, noorrhi::ImageUsage::Storage), noorrhi::Error);
-    REQUIRE_THROWS_AS(noorrhi::Buffer<float>{}.ptr(), noorrhi::Error);
-    REQUIRE_THROWS_AS(noorrhi::ComputePipeline{}.launch({1, 1, 1}, 0u), noorrhi::Error);
-}
-
-TEST_CASE("NoorRHI API reclaims buffer allocations after GPU retirement") {
-    noorrhi::Device device = make_device();
-    const auto before = device.memory_report().allocation_bytes;
-    // Churn far more short-lived buffers than any descriptor table would hold,
-    // keeping only one live at a time. Buffers consume no descriptor now, so
-    // what this guards is that the retire path actually frees them and that
-    // every allocation still yields a usable device address. This models
-    // camera and immutable scene snapshots replaced over a long session.
-    for (std::uint32_t i = 0; i < 12'000u; ++i) {
-        {
-            auto snapshot = device.buffer<std::uint32_t>(1);
-            REQUIRE(snapshot.ptr().address != 0);
-        }
-        if ((i & 31u) == 31u) {
-            const auto token = device.signal();
-            device.wait(token);
-        }
-    }
-    device.synchronize();
-    CHECK(device.memory_report().allocation_bytes == before);
-}
-
-TEST_CASE("NoorRHI owners reject invalid ranges and expired host references") {
-    auto device = make_device();
-    noorrhi::ImageHandle expired;
-    {
-        auto image = device.image<std::uint8_t>(1, 1, noorrhi::ImageUsage::ColorAttachment);
-        expired = image.handle();
-        REQUIRE(expired);
-    }
-    device.synchronize(); // Retire the initial image-layout submission's reference.
-    CHECK_FALSE(expired);
-    CHECK_THROWS_AS(device.render({expired, {}}, [] {}), noorrhi::Error);
-
-    auto buffer = device.buffer<std::uint32_t>(2);
-    const std::uint32_t value = 42;
-    CHECK_THROWS_AS(buffer.upload(std::span(&value, 1), 2), noorrhi::Error);
-    noorrhi::Shared<unsigned> empty;
-    CHECK_THROWS_AS(empty.commit(), noorrhi::Error);
-    struct alignas(1024) Aligned { std::uint32_t value; };
-    auto aligned = device.buffer<Aligned>(1);
-    CHECK(aligned.ptr().address % alignof(Aligned) == 0);
+    CommandList list(*device);
+    list.dispatch(pipeline, {count}, Add::Arguments{first.getPtr(), first.getPtr(), result.getPtr(), count});
+    REQUIRE_OK(Test::execute(*device, std::move(list)));
+    std::vector<float> sums(count + 1);
+    REQUIRE_OK(result.download(sums));
+    CHECK(std::all_of(sums.begin(), sums.begin() + count, [](const float value) { return value == 2.0f; }));
+    CHECK(sums[count] == 0.0f);
 }

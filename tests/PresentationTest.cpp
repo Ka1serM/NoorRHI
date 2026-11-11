@@ -1,65 +1,71 @@
-#include "TestWindow.hpp"
-
-#include <noorrhi/noorrhi.hpp>
-#include <SDL3/SDL.h>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
-#include <catch2/catch_test_macros.hpp>
+#include <expected>
+#include <utility>
 
-TEST_CASE("NoorRHI presentation survives resize, mode switches and abandoned frames",
-    "[NoorRHI][window]") {
-    if (!std::getenv("DISPLAY") && !std::getenv("WAYLAND_DISPLAY"))
-        SKIP("presentation test requires a desktop display");
-    TestWindow window(320, 240);
-    noorrhi::Device device({.enable_validation = true, .presentation = &window});
-    noorrhi::Swapchain swapchain(device, window);
-    REQUIRE(swapchain.present_mode() == noorrhi::PresentMode::LowLatency);
-    noorrhi::Shared<unsigned> record(device);
-    record.commit();
-    device.synchronize();
-    const auto allocation_bytes = device.memory_report().allocation_bytes;
+#include "Test.h"
+#include "TestWindow.h"
 
-    constexpr noorrhi::PresentMode modes[] = {noorrhi::PresentMode::Vsync,
-        noorrhi::PresentMode::Immediate, noorrhi::PresentMode::LowLatency};
-    for (unsigned iteration = 0; iteration < 48; ++iteration) {
-        if (iteration % 8 == 7)
-            swapchain.set_present_mode(modes[(iteration / 8) % 3]);
-        const int width = iteration % 2 ? 320 : 480;
-        const int height = iteration % 2 ? 240 : 360;
-        REQUIRE(SDL_SetWindowSize(window.nativeHandle(), width, height));
-        REQUIRE(SDL_SyncWindow(window.nativeHandle()));
-        SDL_Event event{};
-        while (window.pollEvent(event)) {}
+using namespace NoorRHI;
 
-        swapchain.wait_until_ready();
-        auto frame = swapchain.begin_frame();
-        if (!frame) frame = swapchain.begin_frame();
-        REQUIRE(frame);
-        CHECK(frame.width() == window.width());
-        CHECK(frame.height() == window.height());
-        record.setData(iteration + 1);
-        // Uploads are rejected while a frame's command buffer is open.
-        CHECK_THROWS_AS(record.commit(), noorrhi::Error);
+namespace {
 
-        if (iteration % 3 == 0) {
-            frame = {}; // Discard the acquire and command buffer through RAII.
-            record.commit();
-            frame = swapchain.begin_frame();
-            REQUIRE(frame);
-        }
-        device.render({frame.target(), {}}, [] {});
-        swapchain.present(std::move(frame));
-        record.commit();
-    }
-    // Replaced chains are retired, not waited on; they are gone once the GPU
-    // has caught up.
-    device.synchronize();
-    CHECK(device.memory_report().allocation_bytes == allocation_bytes);
+bool hasDisplay() {
+    return std::getenv("DISPLAY") || std::getenv("WAYLAND_DISPLAY");
 }
 
-TEST_CASE("NoorRHI swapchains are optional and need a presentation device", "[NoorRHI][window]") {
-    if (!std::getenv("DISPLAY") && !std::getenv("WAYLAND_DISPLAY"))
-        SKIP("presentation test requires a desktop display");
-    TestWindow window(320, 240);
-    noorrhi::Device headless({.enable_validation = true});
-    CHECK_THROWS_AS(noorrhi::Swapchain(headless, window), noorrhi::Error);
+std::expected<Frame, Error> acquireFrame(Swapchain& swapchain) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (std::expected<void, Error> ready = swapchain.wait(); !ready)
+            return std::unexpected(std::move(ready.error()));
+        std::expected<Frame, Error> frame = swapchain.acquire();
+        if (!frame || *frame)
+            return frame;
+    }
+    return fail(ErrorCode::InvalidState, "the swapchain gives no image after a rebuild");
+}
+
+}
+
+TEST_CASE("presentation survives resizes and present mode changes") {
+    if (!hasDisplay())
+        return;
+    TestWindow window;
+    REQUIRE_OK(window.open(320, 240));
+    Device device;
+    REQUIRE_OK(device.open({.enableValidation = true, .applicationName = "NoorRHI tests", .presentation = &window}));
+    Swapchain swapchain;
+    REQUIRE_OK(swapchain.open(device, window));
+    CHECK(swapchain.getPresentMode() == PresentMode::LowLatency);
+
+    constexpr std::array modes{PresentMode::Vsync, PresentMode::Immediate, PresentMode::LowLatency};
+    for (std::uint32_t iteration = 0; iteration < 48; ++iteration) {
+        if (iteration % 8 == 7)
+            swapchain.setPresentMode(modes[(iteration / 8) % modes.size()]);
+        REQUIRE(window.resize(iteration % 2 ? 320 : 480, iteration % 2 ? 240 : 360));
+
+        std::expected<Frame, Error> frame = acquireFrame(swapchain);
+        REQUIRE_OK(frame);
+        CHECK(frame->getImage().getWidth() == window.getWidth());
+        CHECK(frame->getImage().getHeight() == window.getHeight());
+
+        CommandList list(device);
+        list.beginRender({.color = &frame->getImage(), .clearColor = {0.0f, 0.0f, static_cast<float>(iteration % 2), 1.0f}});
+        list.endRender();
+        REQUIRE_OK(device.submit(std::move(list)));
+        REQUIRE_OK(swapchain.present(std::move(*frame)));
+    }
+    REQUIRE_OK(device.waitIdle());
+}
+
+TEST_CASE("a swapchain needs a device opened for presentation") {
+    if (!hasDisplay())
+        return;
+    TestWindow window;
+    REQUIRE_OK(window.open(320, 240));
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    Swapchain swapchain;
+    CHECK(swapchain.open(*device, window).error().code == ErrorCode::InvalidState);
 }

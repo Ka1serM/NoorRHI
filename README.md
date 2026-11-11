@@ -1,189 +1,114 @@
 # NoorRHI
 
-A small, object-oriented Vulkan API. Buffers are device addresses; textures and
-samplers are 32-bit indices into one bindless descriptor set the device owns and
-fills automatically. There are no pipeline layouts, descriptor sets, resource
-registries in the app, or upload batches.
-
-Everything it needs is core Vulkan 1.3; see
-[Requirements and verification](#requirements-and-verification).
-
-## Building
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-cmake --install build --prefix /your/prefix
-```
-
-Vulkan and [VulkanMemoryAllocator][vma] are the only dependencies. VMA comes
-from an existing `GPUOpen::VulkanMemoryAllocator` target, then
-`find_package(VulkanMemoryAllocator)`, then `-DNOORRHI_VMA_DIR=`, then a vendored copy
-at `external/VulkanMemoryAllocator`.
-`NOORRHI_BUILD_EXAMPLES` and `NOORRHI_BUILD_TESTS` default to `ON` for a standalone
-build and `OFF` when this project is added as a subdirectory. Both need `slangc`
-from the Vulkan SDK (set `VULKAN_SDK`). The tests also need Catch2 v3, found with
-`find_package`, `-DNOORRHI_CATCH2_DIR=`, or `external/Catch2`.
-
-[vma]: https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
-
-## Consuming
-
-```cmake
-find_package(NoorRHI REQUIRED)
-target_link_libraries(my_app PRIVATE NoorRHI::NoorRHI)
-```
-
-Or vendor it and `add_subdirectory(external/NoorRHI)`, which defines the same
-`NoorRHI::NoorRHI` target.
+A small C++23 GPU API with a Vulkan backend and a WebGPU backend. The same app code runs on the desktop and in the
+browser. Shaders are written in Slang and use pointers and bindless handles.
 
 ```cpp
-noorrhi::Device device;
-auto vertices = device.buffer<Vertex>(source.size());
-vertices.upload(std::span<const Vertex>(source));
-
-noorrhi::Shared<SceneData> scene(device);
-scene.data.vertices = vertices.ptr();
-scene.commit();
-
-struct FrameData { noorrhi::GpuPtr<SceneData> scene; Camera camera; };
-pipeline.launch(groups, FrameData{scene.ptr(), camera});
-```
-
-Buffer, image, sampler, and shared-data owners are move-only. Internal references
-keep submitted Vulkan objects alive until completion. GPU pointers and texture
-handles are non-owning: keep their owners alive while using them, including
-objects referenced indirectly through another GPU record. Destroy resources
-before their Device; a surface provider outlives the Swapchains created for it.
-
-## Data and uploads
-
-- `Buffer<T>`: `ptr()`, `upload(span, elementOffset)`, `download(span)`.
-- `Image<T>`: full-level `upload(span)` and `download(span)`;
-  `sampled_handle()` and `storage_handle()` for shaders.
-  `handle()` is a checked host reference for render targets and interop.
-- `Sampler`: `handle()` for shaders. There is no combined image/sampler; a
-  shader pairs a sampled texture handle with a sampler handle.
-
-## Textures and samplers
-
-The device creates one bindless descriptor set at construction, with arrays
-sized by `DeviceConfig::texture_descriptor_capacity` (default 16384) and
-`DeviceConfig::sampler_descriptor_capacity` (default 256). A `Sampled` or
-`Storage` image takes one texture slot per usage, and a sampler takes one
-sampler slot. Handles are slot indices, so shaders that import `noorrhi.slang`
-index them with Slang's heap syntax:
-
-```slang
-import noorrhi;
-
-RWTexture2D<float4> output = ResourceDescriptorHeap[arguments.output];
-Texture2D<float4> albedo = ResourceDescriptorHeap[arguments.albedo];
-SamplerState linear = SamplerDescriptorHeap[arguments.sampler];
-```
-
-Slot 0 is reserved and never written, so a zero handle means "no
-texture". Store handles as `uint` in shared records. A resource returns its
-slots when it is retired, meaning after every submission that might still read
-them has finished. Until then its handles stay valid for in-flight work.
-Slots are then reused. The set never grows: running out throws
-`ErrorCode::OutOfMemory`. Wrap a handle that can differ within a wave, such as
-a per-hit material texture, in `NonUniformResourceIndex()`.
-
-Every pipeline shares one layout: the bindless set and an 8-byte push constant
-carrying the root argument pointer. The set is bound before every dispatch,
-draw, and trace. That makes it safe to record
-legacy descriptor-set commands, such as an ImGui backend's, into the same
-frame command buffer.
-- `Shared<T>`: public `data`, `ptr()`, `commit()`. Commit compares the
-  trivially-copyable record and skips unchanged bytes.
-
-Upload copies into temporary mapped memory before returning. The caller may
-immediately reuse its source; staging lives until the GPU copy finishes.
-Temporary duplicate memory is intentional. Download waits for its copy.
-There is no fixed staging budget or global dirty-object list.
-
-Small per-frame values, including NoorRay's camera, go directly in root arguments.
-The backend copies these into mapped chunks and reuses a chunk once every submission
-that may read it has completed by timeline value. Chunks are added as needed, so a
-frame can record any amount of argument data; `DeviceConfig::argument_arena_bytes` is
-the chunk size.
-
-## Presentation
-
-A `Device` renders into images and needs no window. Presentation is an optional
-`Swapchain`, one per window, for hosts that show results directly:
-
-```cpp
-noorrhi::Device device({.presentation = &window});   // window: a SurfaceProvider
-noorrhi::Swapchain swapchain(device, window, {.present_mode = noorrhi::PresentMode::LowLatency});
-
-while (running) {
-    swapchain.wait_until_ready();      // before sampling input
-    poll_input_and_update();
-    noorrhi::Frame frame = swapchain.begin_frame();
-    if (!frame) continue;              // minimised or just rebuilt
-    record_work_and_draw_into(frame.target());
-    swapchain.present(std::move(frame));
+// shaders/Scale.h, included by C++ and by Slang
+#include "NoorRHI/Shaders/ShaderTypes.h"
+namespace Scale {
+using namespace NoorRHI;
+struct Arguments { Ptr<float> values; uint count; };
 }
 ```
 
-`DeviceConfig::presentation` only adopts the window system's loader and instance
-extensions and restricts GPU and queue selection to ones that can present to it.
-Each `Swapchain` creates and owns its surface.
+```slang
+// shaders/Scale.slang
+#include "Scale.h"
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    const Scale::Arguments arguments = rootArguments<Scale::Arguments>();
+    if (id.x < arguments.count)
+        arguments.values[id.x] *= 2.0;
+}
+```
 
-The swapchain is built for low latency:
+```cpp
+#include "NoorRHI/NoorRHI.h"
+#include "Scale.slang.h"
 
-- `PresentMode::LowLatency` (default) prefers MAILBOX, then FIFO_LATEST_READY
-  (enabled when the device supports it), then FIFO. `Vsync` is FIFO and
-  `Immediate` prefers IMMEDIATE. `active_present_mode()` reports the result;
-  `set_present_mode()` switches on the next frame.
-- `SwapchainDesc::max_frames_in_flight` (default 1) paces the CPU to the GPU, so
-  frames never queue behind a busy GPU. `wait_until_ready()` performs that wait
-  up front so input is sampled after it, not before.
-- Resizes rebuild from the previous chain without waiting for the GPU. The old
-  chain, its images and semaphores are retired and released once the frames
-  that used them have finished.
-- `present()` submits and queues the image without a CPU wait.
+using namespace NoorRHI;
 
-## Frames and synchronization
+Device device;
+ComputePipeline pipeline;
+Buffer<float> values;
+if (!device.open() || !pipeline.open(device, Scale::main) || !values.open(device, 1024))
+    return 1;
 
-Prepare changed resources and commit shared data **before** `begin_frame()`.
-Launch rendering and presentation between begin and present; they share one
-submission. Acquire slots wait only when reused.
-Timestamp reads are nonblocking and return the latest available measurement.
+CommandList list(device);
+list.dispatch(pipeline, {1024}, Scale::Arguments{values.getPtr(), 1024});
+std::expected<Token, Error> token = device.submit(std::move(list));
+if (!token || !device.wait(*token))
+    return 1;
+```
 
-Uploads/readbacks during an open frame are rejected. Large scene replacement and
-destruction may synchronize. Ordered submissions handle normal updates and TLAS
-refits. Dropping a Frame discards it and rebuilds the acquired swapchain before
-the next frame. The window provider reports live pixel dimensions.
+```cmake
+add_subdirectory(external/NoorRHI)
+include(external/NoorRHI/cmake/NoorRHIShaders.cmake)
+noorrhi_add_shaders(AppShaders shaders/Scale.slang)
+target_link_libraries(app PRIVATE AppShaders)
+```
 
-The API is single-threaded per Device. Raw pointers cannot validate arbitrary
-shader pointer graphs; callers remain responsible for pointer bounds, compatible
-host/shader layouts, and owner lifetime. Vulkan interop additionally requires the
-external API to finish using exported objects before their owners are destroyed.
+## Synchronization
 
-## Requirements and verification
+- Each command sees the writes of the commands before it in the list. Each list sees the writes of the lists that were
+  submitted before it on the same queue. The list records only the barriers that this needs. Each barrier waits only
+  for the stages that ran and blocks only the stages of the next command.
+- Copies of memory that does not overlap run without a barrier between them.
+- Put independent commands between `beginConcurrent()` and `endConcurrent()`. Then they have no barriers between them.
+  A command in the group must not read what another command in the group writes.
+- Draws in one render pass do not see the writes of other draws in the same pass.
+- To use the results of a list on another queue, give its token to `submit` as a wait.
 
-Vulkan 1.3 is mandatory, with buffer device addresses, timeline semaphores,
-synchronization2, dynamic rendering, `scalarBlockLayout`, `shaderInt64`,
-`shaderDrawParameters` and the descriptor indexing features behind the bindless
-set (runtime arrays, partially bound and update-after-bind sampled and storage
-images, non-uniform indexing). Devices without them are skipped at selection.
-Ray tracing is checked separately and reported in `DeviceFeatures`.
+## Autodiff
 
-Shaders are supplied as SPIR-V bytes. Compile them with `NOORRHI_SLANG_FLAGS`
-(set by this project's CMake), which puts `shaders/noorrhi.slang` on the import
-path and the bindless set at set 0. Any shader that indexes
-`ResourceDescriptorHeap` or `SamplerDescriptorHeap` must `import noorrhi;`.
-Validate modules with `spirv-val --target-env vulkan1.3`. Requested validation fails clearly if its
-layer is absent.
+Slang autodiff works on both backends. Mark a function `[Differentiable]` and call `bwd_diff` on it. To get the
+gradients of weights in a buffer, read each weight through a `[Differentiable]` load whose `[BackwardDerivative]` adds
+the gradient with `atomicAdd` to an `AtomicPtr<float>`. `tests/shaders/Network.slang` gets the gradients of a small MLP
+this way.
 
-`memory_report()` reports VMA allocation bytes, reserved block bytes, allocation
-count, and argument-arena capacity, including pending allocations. Dedicated
-external-memory images are outside these VMA totals.
+## Portability
 
-GPU tests cover compute, images (including bindless reads and writes, and slot reuse
-and exhaustion), ray tracing, shared updates, argument wraparound, and retirement. `noorrhi_presentation_test` additionally needs a desktop display and
-tests resizing, present-mode switches and abandoned frames. Enable synchronization validation with
-`VK_LAYER_VALIDATE_SYNC=1`.
+- Use `SV_VulkanVertexID` and `SV_VulkanInstanceID` in vertex shaders. They include the first vertex and the first
+  instance on both backends. `SV_VertexID` and `SV_InstanceID` do not agree between SPIR-V and WGSL.
+- On WebGPU, index buffers and indirect commands of draws without a count must be in `BufferMemory::Plain`. The count
+  of a count draw can be in atomic memory.
+- On WebGPU, a count draw runs a small compute pass before its render pass to clear the commands past the count.
+- `Queue::Async` uses a dedicated compute queue when Vulkan has one. On WebGPU it is the same queue.
+- `openAsync` compiles a pipeline in the background. A draw or dispatch with a pipeline that is not ready fails.
+- `CommandList::download` copies into a `Readback`. `isReady()` does not block, and `read()` waits for the copy.
+
+## Linux
+
+Install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) and set `VULKAN_SDK`. It gives `slangc` and the Vulkan
+headers.
+
+```sh
+sudo dnf install clang lld libcxx-devel libcxx-static libcxxabi-static compiler-rt llvm-libunwind-devel \
+    llvm-libunwind-static cmake ninja-build python3 wayland-devel libxkbcommon-devel
+```
+
+```sh
+git submodule update --init --recursive
+cmake --workflow --preset linux-release
+cmake --workflow --preset linux-webgpu-release
+```
+
+## Windows
+
+Install the Vulkan SDK and [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) with its `bin` folder in PATH.
+
+```powershell
+git submodule update --init --recursive
+cmake --workflow --preset windows-release
+cmake --workflow --preset windows-webgpu-release
+```
+
+## Web
+
+The web build uses the Linux dependencies and an activated [emsdk](https://emscripten.org).
+
+```sh
+cmake --workflow --preset web-release
+```

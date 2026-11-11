@@ -1,4 +1,6 @@
-/build/
-/external/
-compile_commands.json
+build*/
 .cache/
+/external/emsdk/
+compile_commands.json
+__pycache__/
+*.pyc

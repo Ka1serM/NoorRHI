@@ -1,0 +1,4 @@
+[submodule "external/dawn"]
+	path = external/dawn
+	url = https://github.com/google/dawn.git
+	shallow = true
