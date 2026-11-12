@@ -50,6 +50,13 @@ std::uint32_t getWord(const std::uint64_t address) {
     return static_cast<std::uint32_t>((address & addressOffsetMask) / 4);
 }
 
+//! emdawnwebgpu passes kQuerySetIndexUndefined to the browser as 4294967295, so an unused write goes to a scratch slot.
+wgpu::PassTimestampWrites getTimestampWrites(const wgpu::QuerySet& querySet, const bool begin, const bool end) {
+    return {.querySet = querySet,
+            .beginningOfPassWriteIndex = begin ? timestampBeginSlot : timestampScratchBeginSlot,
+            .endOfPassWriteIndex = end ? timestampEndSlot : timestampScratchEndSlot};
+}
+
 }
 
 std::uint32_t WebGpuCommandList::place(const std::span<const std::byte> data) {
@@ -168,6 +175,10 @@ void WebGpuCommandList::copy(const Image& source, const Image& destination, cons
                   "a scaled WebGPU copy needs a filterable source format and a renderable destination format"))
         return;
     commands.emplace_back(CopyCommand{std::move(from), std::move(to), sourceRegion});
+}
+
+void WebGpuCommandList::copy(const std::uint64_t address, const Image& destination, const std::uint32_t level) {
+    commands.emplace_back(BufferCopyCommand{address, getImage(destination), level});
 }
 
 void WebGpuCommandList::patch(const std::uint64_t address, const std::span<const std::byte> data) {
@@ -303,7 +314,7 @@ struct Replayer {
     void resolve(const std::shared_ptr<WebGpuTimestampQuery>& query) {
         if (query->mapping || std::ranges::contains(ended, query))
             return;
-        encoder.ResolveQuerySet(query->querySet, 0, 2, query->resolve, 0);
+        encoder.ResolveQuerySet(query->querySet, timestampBeginSlot, 2, query->resolve, 0);
         encoder.CopyBufferToBuffer(query->resolve, 0, query->readback, 0, 16);
         ended.push_back(query);
     }
@@ -394,11 +405,8 @@ struct Replayer {
         }
         const std::shared_ptr<WebGpuTimestampQuery>& query = command.beginQuery ? command.beginQuery : command.endQuery;
         wgpu::PassTimestampWrites timestamps;
-        if (query) {
-            timestamps.querySet = query->querySet;
-            timestamps.beginningOfPassWriteIndex = command.beginQuery ? 0 : wgpu::kQuerySetIndexUndefined;
-            timestamps.endOfPassWriteIndex = command.endQuery ? 1 : wgpu::kQuerySetIndexUndefined;
-        }
+        if (query)
+            timestamps = getTimestampWrites(query->querySet, command.beginQuery != nullptr, command.endQuery != nullptr);
         const wgpu::RenderPassDescriptor descriptor{.colorAttachmentCount = 1,
                                                     .colorAttachments = &colorAttachment,
                                                     .depthStencilAttachment = command.depth ? &depthAttachment : nullptr,
@@ -525,6 +533,32 @@ struct Replayer {
         return {};
     }
 
+    std::expected<void, Error> operator()(const BufferCopyCommand& command) {
+        endCompute();
+        const WebGpuImage& to = *command.destination;
+        const std::uint32_t levels = to.sampled.binding != 0 ? to.sampled.levels : to.mipLevels;
+        if (command.level >= levels)
+            return {};
+        const FormatInfo info = getFormatInfo(to.format);
+        const std::uint32_t width = std::max(to.width >> command.level, 1u);
+        const std::uint32_t height = std::max(to.height >> command.level, 1u);
+        const std::uint32_t columns = (width + info.blockExtent - 1) / info.blockExtent;
+        const std::uint32_t rows = (height + info.blockExtent - 1) / info.blockExtent;
+        const wgpu::TexelCopyBufferInfo source{
+            .layout = {.offset = command.address & addressOffsetMask, .bytesPerRow = getCopyRowPitch(to.format, width), .rowsPerImage = rows},
+            .buffer = device.getBuffer(command.address)};
+        const wgpu::Extent3D extent{columns * info.blockExtent, rows * info.blockExtent, 1};
+        std::vector<TextureRegion> regions{device.getPrimary(to)};
+        if (to.isShadowed())
+            regions.push_back(device.getSampled(to));
+        for (const TextureRegion& region : regions) {
+            const wgpu::TexelCopyTextureInfo target{
+                .texture = region.texture, .mipLevel = command.level, .origin = {region.x >> command.level, region.y >> command.level, region.layer}};
+            encoder.CopyBufferToTexture(&source, &target, &extent);
+        }
+        return {};
+    }
+
     std::expected<void, Error> operator()(const UploadCommand& command) {
         endCompute();
         encoder.CopyBufferToBuffer(device.staging, command.stagingOffset, device.getBuffer(command.address), command.address & addressOffsetMask, command.size);
@@ -550,9 +584,7 @@ struct Replayer {
 
     std::expected<void, Error> operator()(const TimestampCommand& command) {
         endCompute();
-        const wgpu::PassTimestampWrites timestamps{.querySet = command.query->querySet,
-                                                   .beginningOfPassWriteIndex = command.end ? wgpu::kQuerySetIndexUndefined : 0,
-                                                   .endOfPassWriteIndex = command.end ? 1 : wgpu::kQuerySetIndexUndefined};
+        const wgpu::PassTimestampWrites timestamps = getTimestampWrites(command.query->querySet, !command.end, command.end);
         const wgpu::ComputePassDescriptor descriptor{.timestampWrites = &timestamps};
         encoder.BeginComputePass(&descriptor).End();
         if (command.end)

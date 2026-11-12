@@ -73,12 +73,6 @@ struct StoragePool {
     std::vector<std::uint32_t> freeLayers;
 };
 
-struct SamplerSlot {
-    wgpu::Sampler sampler;
-    SamplerDesc desc;
-    std::uint32_t references = 0;
-};
-
 struct TextureRegion {
     wgpu::Texture texture;
     std::uint32_t layer = 0;
@@ -132,8 +126,6 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
     void releaseSampled(const SampledSlot& slot);
     std::expected<std::uint32_t, Error> allocateStorageLayer(std::uint32_t binding, std::uint32_t width, std::uint32_t height);
     void releaseStorageLayer(std::uint32_t binding, std::uint32_t layer);
-    std::expected<std::uint32_t, Error> acquireSampler(const SamplerDesc& desc, const wgpu::SamplerDescriptor& native);
-    void releaseSampler(std::uint32_t binding);
     TextureRegion getPrimary(const WebGpuImage& image) const;
     TextureRegion getSampled(const WebGpuImage& image) const;
     bool hasStaleShadows(bool dispatched) const;
@@ -180,10 +172,9 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
 
     std::array<SampledPool, bindingCount> sampledPools;
     std::array<StoragePool, storagePoolBindings.count> storagePools;
-    std::array<SamplerSlot, samplerBindings.count> samplers;
     std::array<wgpu::TextureView, sampledPoolBindings.size()> emptySampled;
     std::array<wgpu::TextureView, storagePoolBindings.count> emptyStorage;
-    wgpu::Sampler emptySampler;
+    wgpu::Sampler sampler;
     std::set<WebGpuImage*> shadowedImages;
     std::vector<std::uint32_t> freeTextureIndices;
     std::uint32_t nextTextureIndex = 1;
@@ -193,6 +184,9 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
     wgpu::ShaderModule blitModule;
     wgpu::Sampler blitSampler;
     std::map<wgpu::TextureFormat, wgpu::RenderPipeline> blitPipelines;
+    //! Each embedded Slang source holds all of its entry points, so one translated WGSL module serves every pipeline that it opens.
+    std::map<const std::byte*, wgpu::ShaderModule> shaderModules;
+    std::map<std::string, std::string, std::less<>> translatedShaders;
     wgpu::ComputePipeline patchPipeline;
     wgpu::BindGroupLayout countGroupLayout;
     wgpu::ComputePipeline countPipeline;
@@ -257,12 +251,7 @@ struct WebGpuImage final : Image, std::enable_shared_from_this<WebGpuImage> {
     bool shadowStale = false;
 };
 
-struct WebGpuSampler final : Sampler {
-    ~WebGpuSampler() override;
-
-    std::shared_ptr<WebGpuDevice> device;
-    std::uint32_t binding = 0;
-};
+struct WebGpuSampler final : Sampler {};
 
 struct WebGpuCompilation {
     std::shared_ptr<WebGpuDevice> device;
@@ -305,6 +294,12 @@ struct WebGpuReadback final : Readback, std::enable_shared_from_this<WebGpuReadb
     wgpu::Future future;
     std::shared_ptr<MapState> map;
 };
+
+constexpr std::uint32_t timestampBeginSlot = 0;
+constexpr std::uint32_t timestampEndSlot = 1;
+constexpr std::uint32_t timestampScratchBeginSlot = 2;
+constexpr std::uint32_t timestampScratchEndSlot = 3;
+constexpr std::uint32_t timestampSlotCount = 4;
 
 struct WebGpuTimestampQuery final : TimestampQuery, std::enable_shared_from_this<WebGpuTimestampQuery> {
     double getMilliseconds() override;
@@ -373,6 +368,12 @@ struct CopyCommand {
     Rect region;
 };
 
+struct BufferCopyCommand {
+    std::uint64_t address = 0;
+    std::shared_ptr<WebGpuImage> destination;
+    std::uint32_t level = 0;
+};
+
 struct UploadCommand {
     std::uint64_t address = 0;
     std::uint64_t stagingOffset = 0;
@@ -400,7 +401,7 @@ struct LabelCommand {
 };
 
 struct RecordedCommand : std::variant<DispatchCommand, ConcurrentCommand, BeginRenderCommand, EndRenderCommand, ScissorCommand, StencilReferenceCommand,
-                                      DrawCommand, CopyCommand, UploadCommand, DownloadCommand, PatchCommand, TimestampCommand, LabelCommand> {
+                                      DrawCommand, CopyCommand, BufferCopyCommand, UploadCommand, DownloadCommand, PatchCommand, TimestampCommand, LabelCommand> {
     using variant::variant;
 };
 
@@ -420,6 +421,7 @@ struct WebGpuCommandList final : CommandList {
                      std::span<const std::byte> arguments) override;
     void drawIndirect(const GraphicsPipeline& pipeline, const IndirectDraw& draw, std::span<const std::byte> arguments) override;
     void copy(const Image& source, const Image& destination, const Rect& sourceRegion) override;
+    void copy(std::uint64_t address, const Image& destination, std::uint32_t level) override;
     void upload(std::uint64_t address, std::span<const std::byte> data) override;
     void download(std::uint64_t address, Readback& readback, std::size_t bytes) override;
     void beginTimestamp(TimestampQuery& query) override;

@@ -213,8 +213,7 @@ void appendSharedEntries(std::vector<wgpu::BindGroupLayoutEntry>& entries, const
     for (std::size_t kind = 0; kind < ranges.size(); ++kind)
         for (std::uint32_t index = 0; index < ranges[kind].count; ++index)
             entries.push_back(makeTextureEntry(ranges[kind].first + index, visibility, poolSampleTypes[kind]));
-    for (std::uint32_t index = 0; index < samplerBindings.count; ++index)
-        entries.push_back(makeSamplerEntry(samplerBindings.first + index, visibility));
+    entries.push_back(makeSamplerEntry(samplerBinding, visibility));
 }
 
 std::size_t getPoolKind(const std::uint32_t binding) {
@@ -468,9 +467,8 @@ std::expected<void, Error> WebGpuDevice::createDevice([[maybe_unused]] const boo
     storageImages = device.HasFeature(wgpu::FeatureName::TextureFormatsTier2) && limits.maxStorageTexturesPerShaderStage >= storagePoolBindings.count;
     PoolBindings& floatPools = sampledRanges[static_cast<std::size_t>(PoolKind::Float)];
     const std::uint32_t otherPools = sampledTextureCount - floatPools.count;
-    if (limits.maxSampledTexturesPerShaderStage <= otherPools || limits.maxSamplersPerShaderStage < samplerBindings.count)
-        return fail(ErrorCode::Unsupported, "the WebGPU device needs more than " + std::to_string(otherPools) + " sampled textures and "
-                                                + std::to_string(samplerBindings.count) + " samplers per shader stage");
+    if (limits.maxSampledTexturesPerShaderStage <= otherPools)
+        return fail(ErrorCode::Unsupported, "the WebGPU device needs more than " + std::to_string(otherPools) + " sampled textures per shader stage");
     floatPools.count = std::min(floatPools.count, limits.maxSampledTexturesPerShaderStage - otherPools);
     if (!device.HasFeature(wgpu::FeatureName::IndirectFirstInstance))
         return fail(ErrorCode::Unsupported, "the WebGPU device has no indirect-first-instance");
@@ -545,8 +543,11 @@ std::expected<void, Error> WebGpuDevice::createEmptyResources() {
         const wgpu::TextureDescriptor descriptor{.usage = wgpu::TextureUsage::StorageBinding, .size = {1, 1, 1}, .format = storageFormats[index]};
         emptyStorage[index] = device.CreateTexture(&descriptor).CreateView(&arrayView);
     }
-    const wgpu::SamplerDescriptor samplerDescriptor;
-    emptySampler = device.CreateSampler(&samplerDescriptor);
+    const wgpu::SamplerDescriptor samplerDescriptor{.magFilter = wgpu::FilterMode::Linear,
+                                                    .minFilter = wgpu::FilterMode::Linear,
+                                                    .mipmapFilter = wgpu::MipmapFilterMode::Linear,
+                                                    .maxAnisotropy = 16};
+    sampler = device.CreateSampler(&samplerDescriptor);
     reserve(argumentBuffer, argumentBufferBytes, argumentUsage);
     for (std::size_t index = 0; index < storagePools.size(); ++index)
         storagePools[index].format = storageFormats[index];
@@ -647,8 +648,7 @@ void WebGpuDevice::updateBindGroups() {
             const wgpu::TextureView& view = sampledPools[binding].view ? sampledPools[binding].view : emptySampled[getPoolKind(binding)];
             shared.push_back({.binding = binding, .textureView = view});
         }
-    for (std::uint32_t index = 0; index < samplerBindings.count; ++index)
-        shared.push_back({.binding = samplerBindings.first + index, .sampler = samplers[index].sampler ? samplers[index].sampler : emptySampler});
+    shared.push_back({.binding = samplerBinding, .sampler = sampler});
 
     std::vector<wgpu::BindGroupEntry> computeEntries{{.binding = heapBinding, .buffer = heaps[0].buffer},
                                                      {.binding = atomicBinding, .buffer = heaps[1].buffer}};
@@ -707,6 +707,19 @@ void WebGpuDevice::pushErrorScope() {
 }
 
 std::expected<void, Error> WebGpuDevice::popErrorScope(const std::string_view operation) {
+#if defined(__EMSCRIPTEN__)
+    //! Waiting on an error scope yields to the browser and expires the canvas texture of the frame, so the errors reach the next takeError.
+    for (const ErrorCode code : {ErrorCode::OutOfMemory, ErrorCode::InvalidArgument})
+        device.PopErrorScope(wgpu::CallbackMode::AllowSpontaneous,
+                             [owner = weak_from_this(), code, label = std::string(operation)](const wgpu::PopErrorScopeStatus, const wgpu::ErrorType type,
+                                                                                              const wgpu::StringView text) {
+                                 if (type == wgpu::ErrorType::NoError)
+                                     return;
+                                 if (const std::shared_ptr<WebGpuDevice> locked = owner.lock())
+                                     locked->recordError(code, label + " failed: " + toString(text));
+                             });
+    return {};
+#else
     std::optional<Error> error;
     for (const ErrorCode code : {ErrorCode::OutOfMemory, ErrorCode::InvalidArgument}) {
         const wgpu::Future future =
@@ -721,6 +734,7 @@ std::expected<void, Error> WebGpuDevice::popErrorScope(const std::string_view op
     if (error)
         return std::unexpected(std::move(*error));
     return {};
+#endif
 }
 
 std::expected<void, Error> WebGpuDevice::waitFuture(const wgpu::Future future) {

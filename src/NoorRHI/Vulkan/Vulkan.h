@@ -352,6 +352,7 @@ struct VulkanCommandList final : CommandList {
                      std::span<const std::byte> arguments) override;
     void drawIndirect(const GraphicsPipeline& pipeline, const IndirectDraw& draw, std::span<const std::byte> arguments) override;
     void copy(const Image& source, const Image& destination, const Rect& sourceRegion) override;
+    void copy(std::uint64_t address, const Image& destination, std::uint32_t level) override;
     void upload(std::uint64_t address, std::span<const std::byte> data) override;
     void download(std::uint64_t address, Readback& readback, std::size_t bytes) override;
     void beginTimestamp(TimestampQuery& query) override;

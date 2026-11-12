@@ -13,7 +13,7 @@ std::expected<void, Error> TimestampQuery::open(Device& device) {
     if (owner.timestamps) {
         std::lock_guard lock(owner.mutex);
         owner.pushErrorScope();
-        const wgpu::QuerySetDescriptor querySet{.type = wgpu::QueryType::Timestamp, .count = 2};
+        const wgpu::QuerySetDescriptor querySet{.type = wgpu::QueryType::Timestamp, .count = Backend::timestampSlotCount};
         result->querySet = owner.device.CreateQuerySet(&querySet);
         const wgpu::BufferDescriptor resolve{.usage = wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc, .size = 16};
         result->resolve = owner.device.CreateBuffer(&resolve);

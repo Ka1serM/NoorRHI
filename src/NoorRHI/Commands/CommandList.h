@@ -100,6 +100,10 @@ public:
 
     void copy(const Image& source, const Image& destination, std::optional<Rect> sourceRegion = std::nullopt);
     template <class T>
+    void copy(const Buffer<T>& source, const std::size_t offset, const Image& destination, const std::uint32_t level) {
+        copyBytes(source.getPtr().getAddress(), source.getByteSize(), offset * sizeof(T), destination, level);
+    }
+    template <class T>
     void upload(const Buffer<T>& buffer, const std::span<const T> data, const std::size_t offset = 0) {
         if (offset > buffer.getSize() || data.size() > buffer.getSize() - offset)
             return setError(ErrorCode::InvalidArgument, "the upload range exceeds the buffer");
@@ -138,6 +142,7 @@ private:
     void drawIndirectBytes(const GraphicsPipeline& pipeline, Ptr<std::uint32_t> indices, std::uint64_t commands, AtomicPtr<std::uint32_t> count,
                            std::uint32_t maxDraws, std::span<const std::byte> arguments);
     void traceRaysBytes(const RayTracingPipeline& pipeline, const Shader& raygen, DispatchSize size, std::span<const std::byte> arguments);
+    void copyBytes(std::uint64_t address, std::size_t bufferBytes, std::size_t offset, const Image& destination, std::uint32_t level);
     void uploadBytes(std::uint64_t address, std::span<const std::byte> data);
     void downloadBytes(std::uint64_t address, Backend::Readback& readback, std::size_t bytes);
     void setError(ErrorCode code, std::string_view message);

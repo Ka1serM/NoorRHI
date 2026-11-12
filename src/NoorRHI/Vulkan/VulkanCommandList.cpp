@@ -282,6 +282,22 @@ void VulkanCommandList::copy(const Image& source, const Image& destination, cons
     pool.commands.blitImage(from.image, vk::ImageLayout::eGeneral, to.image, vk::ImageLayout::eGeneral, region, vk::Filter::eLinear);
 }
 
+void VulkanCommandList::copy(const std::uint64_t address, const Image& destination, const std::uint32_t level) {
+    const auto& to = static_cast<const VulkanImage&>(destination);
+    const FormatInfo info = getFormatInfo(to.publicFormat);
+    const std::uint32_t width = std::max(to.width >> level, 1u);
+    const std::uint32_t height = std::max(to.height >> level, 1u);
+    const std::size_t bytes = getCopyLevelByteSize(to.publicFormat, width, height);
+    const std::optional<BufferRange> buffer = device->findBuffer(address);
+    if (!check(buffer.has_value() && bytes <= buffer->size, ErrorCode::InvalidArgument, "the copy range is not inside a buffer of this device"))
+        return;
+    synchronizeCopy(std::array{CopyRange{0, address, address + bytes}}, std::array{getImageRange(to.image)});
+    const std::uint32_t rowLength = getCopyRowPitch(to.publicFormat, width) / info.blockBytes * info.blockExtent;
+    pool.commands.copyBufferToImage(
+        buffer->buffer, to.image, vk::ImageLayout::eGeneral,
+        vk::BufferImageCopy(buffer->offset, rowLength, 0, vk::ImageSubresourceLayers(to.aspect, level, 0, 1), vk::Offset3D{}, vk::Extent3D{width, height, 1}));
+}
+
 void VulkanCommandList::upload(const std::uint64_t address, const std::span<const std::byte> data) {
     const std::optional<BufferRange> buffer = device->findBuffer(address);
     if (!check(buffer.has_value() && data.size() <= buffer->size, ErrorCode::InvalidArgument, "the upload range is not inside a buffer of this device"))

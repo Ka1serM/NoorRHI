@@ -70,5 +70,8 @@ struct FormatInfo {
 FormatInfo getFormatInfo(ImageFormat format);
 std::size_t getLevelByteSize(ImageFormat format, std::uint32_t width, std::uint32_t height);
 std::size_t getImageByteSize(ImageFormat format, std::uint32_t width, std::uint32_t height, std::uint32_t mipLevels);
+//! WebGPU copies from a buffer to an image only with rows of a multiple of 256 bytes.
+std::uint32_t getCopyRowPitch(ImageFormat format, std::uint32_t width);
+std::size_t getCopyLevelByteSize(ImageFormat format, std::uint32_t width, std::uint32_t height);
 
 }

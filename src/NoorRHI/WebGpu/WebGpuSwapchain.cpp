@@ -30,8 +30,9 @@ std::expected<wgpu::TextureFormat, Error> chooseFormat(const wgpu::SurfaceCapabi
             return getWebGpuFormat(preferred);
         return fail(ErrorCode::Unsupported, "the surface does not offer the requested swapchain format");
     }
-    for (const wgpu::TextureFormat format : {wgpu::TextureFormat::BGRA8Unorm, wgpu::TextureFormat::RGBA8Unorm})
-        if (contains(capabilities.formats, capabilities.formatCount, format))
+    //! The surface lists its preferred format first, and a browser copies the canvas on every frame in any other format.
+    for (const wgpu::TextureFormat format : std::span(capabilities.formats, capabilities.formatCount))
+        if (format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::RGBA8Unorm)
             return format;
     return fail(ErrorCode::Unsupported, "the surface offers no 8-bit RGBA or BGRA format");
 }

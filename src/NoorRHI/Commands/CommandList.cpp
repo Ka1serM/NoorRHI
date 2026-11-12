@@ -207,6 +207,24 @@ void CommandList::copy(const Image& source, const Image& destination, const std:
     list->copy(*source.getBackend(), *destination.getBackend(), region);
 }
 
+void CommandList::copyBytes(const std::uint64_t address, const std::size_t bufferBytes, const std::size_t offset, const Image& destination,
+                            const std::uint32_t level) {
+    Backend::CommandList* list = getRecording(backend);
+    if (!list || !list->check(address != 0 && destination, ErrorCode::InvalidArgument, "copy needs an open buffer and image")
+        || !list->check(!list->rendering, ErrorCode::InvalidState, "copy is not allowed inside beginRender"))
+        return;
+    const FormatInfo info = getFormatInfo(destination.getFormat());
+    const std::uint32_t width = std::max(destination.getWidth() >> level, 1u);
+    const std::uint32_t height = std::max(destination.getHeight() >> level, 1u);
+    const bool inside = level < destination.getMipLevels() && offset <= bufferBytes
+                        && getCopyLevelByteSize(destination.getFormat(), width, height) <= bufferBytes - offset;
+    if (!list->check(inside, ErrorCode::InvalidArgument, "the copy level is not in the image or its rows exceed the buffer")
+        || !list->check(offset % info.blockBytes == 0 && offset % 4 == 0, ErrorCode::InvalidArgument, "the copy offset is not a multiple of the block size")
+        || !list->check(!info.depth && destination.getSamples() == 1, ErrorCode::InvalidArgument, "a buffer copies only to a single-sampled color image"))
+        return;
+    list->copy(address + offset, *destination.getBackend(), level);
+}
+
 void CommandList::uploadBytes(const std::uint64_t address, const std::span<const std::byte> data) {
     Backend::CommandList* list = getRecording(backend);
     if (!list || data.empty() || !list->check(!list->rendering, ErrorCode::InvalidState, "upload is not allowed inside beginRender"))

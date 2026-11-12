@@ -52,6 +52,17 @@ std::size_t getLevelByteSize(const ImageFormat format, const std::uint32_t width
     return blocksX * blocksY * info.blockBytes;
 }
 
+std::uint32_t getCopyRowPitch(const ImageFormat format, const std::uint32_t width) {
+    const FormatInfo info = getFormatInfo(format);
+    const std::uint32_t rowBytes = (width + info.blockExtent - 1) / info.blockExtent * info.blockBytes;
+    return (rowBytes + 255) / 256 * 256;
+}
+
+std::size_t getCopyLevelByteSize(const ImageFormat format, const std::uint32_t width, const std::uint32_t height) {
+    const FormatInfo info = getFormatInfo(format);
+    return std::size_t{getCopyRowPitch(format, width)} * ((height + info.blockExtent - 1) / info.blockExtent);
+}
+
 std::size_t getImageByteSize(const ImageFormat format, const std::uint32_t width, const std::uint32_t height, const std::uint32_t mipLevels) {
     std::size_t total = 0;
     for (std::uint32_t level = 0; level < mipLevels; level++)

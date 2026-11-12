@@ -24,7 +24,9 @@ std::expected<std::string, Error> translateToWgsl(SpirvModule& module) {
     auto ir = tint::spirv::reader::ReadIR(module.write());
     if (ir != tint::Success)
         return fail(ErrorCode::InvalidShader, ir.Failure().reason);
-    auto wgsl = tint::wgsl::writer::WgslFromIR(ir.Get(), {.allowed_features = tint::wgsl::AllowedFeatures::Everything()});
+    //! SPIR-V allows derivatives in non-uniform control flow, and WGSL rejects them there unless the writer turns the check off.
+    auto wgsl = tint::wgsl::writer::WgslFromIR(ir.Get(),
+                                               {.allow_non_uniform_derivatives = true, .allowed_features = tint::wgsl::AllowedFeatures::Everything()});
     if (wgsl != tint::Success)
         return fail(ErrorCode::InvalidShader, wgsl.Failure().reason);
     return std::move(wgsl->wgsl);

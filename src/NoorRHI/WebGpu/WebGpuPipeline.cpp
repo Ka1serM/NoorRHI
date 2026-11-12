@@ -73,6 +73,9 @@ wgpu::StencilOperation getStencilOp(const StencilOp op) {
 }
 
 wgpu::BlendState getBlendState(const BlendMode mode) {
+    if (mode == BlendMode::Multiply)
+        return {.color = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::Dst, .dstFactor = wgpu::BlendFactor::Zero},
+                .alpha = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::Zero, .dstFactor = wgpu::BlendFactor::One}};
     const wgpu::BlendFactor colorSource = mode == BlendMode::Alpha ? wgpu::BlendFactor::SrcAlpha : wgpu::BlendFactor::One;
     const wgpu::BlendFactor colorDestination = mode == BlendMode::Additive ? wgpu::BlendFactor::One : wgpu::BlendFactor::OneMinusSrcAlpha;
     const wgpu::BlendFactor alphaDestination = mode == BlendMode::Additive ? wgpu::BlendFactor::One : wgpu::BlendFactor::OneMinusSrcAlpha;
@@ -86,8 +89,11 @@ std::expected<void, Error> asShaderError(std::expected<void, Error> result) {
     return result;
 }
 
-std::expected<wgpu::ShaderModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
-    const std::span<const std::byte> code = shader.getCode(false, false);
+std::string_view contentOf(const std::span<const std::byte> code) {
+    return {reinterpret_cast<const char*>(code.data()), code.size()};
+}
+
+std::expected<std::string, Error> translateModule(const Backend::WebGpuDevice& owner, const std::span<const std::byte> code) {
     if (code.size() % sizeof(std::uint32_t) != 0)
         return fail(ErrorCode::InvalidShader, "a WebGPU shader must be a SPIR-V module");
     std::vector<std::uint32_t> words(code.size() / sizeof(std::uint32_t));
@@ -102,7 +108,26 @@ std::expected<wgpu::ShaderModule, Error> createModule(Backend::WebGpuDevice& own
         return fail(ErrorCode::Unsupported, "a WebGPU shader with storage images needs the texture-formats-tier2 feature");
     if (std::expected<void, Error> moved = moveFloatPools(spirv, owner.sampledRanges[static_cast<std::size_t>(Backend::PoolKind::Float)]); !moved)
         return std::unexpected(std::move(moved.error()));
-    std::expected<std::string, Error> text = translateToWgsl(spirv);
+    return translateToWgsl(spirv);
+}
+
+std::expected<std::string, Error> takeTranslation(Backend::WebGpuDevice& owner, const std::span<const std::byte> code) {
+    {
+        std::lock_guard lock(owner.mutex);
+        if (auto prepared = owner.translatedShaders.find(contentOf(code)); prepared != owner.translatedShaders.end())
+            return std::move(owner.translatedShaders.extract(prepared).mapped());
+    }
+    return translateModule(owner, code);
+}
+
+std::expected<wgpu::ShaderModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
+    const std::span<const std::byte> code = shader.getCode(false, false);
+    {
+        std::lock_guard lock(owner.mutex);
+        if (const auto cached = owner.shaderModules.find(code.data()); cached != owner.shaderModules.end())
+            return cached->second;
+    }
+    std::expected<std::string, Error> text = takeTranslation(owner, code);
     if (!text)
         return std::unexpected(std::move(text.error()));
     wgpu::ShaderSourceWGSL wgsl;
@@ -113,6 +138,7 @@ std::expected<wgpu::ShaderModule, Error> createModule(Backend::WebGpuDevice& own
     wgpu::ShaderModule module = owner.device.CreateShaderModule(&descriptor);
     if (std::expected<void, Error> created = asShaderError(owner.popErrorScope("compiling WGSL")); !created)
         return std::unexpected(std::move(created.error()));
+    owner.shaderModules.emplace(code.data(), module);
     return module;
 }
 
@@ -154,6 +180,24 @@ std::expected<void, Error> waitCompilation(Backend::WebGpuCompilation& compilati
 }
 
 namespace Backend {
+
+std::expected<void, Error> prepareShader(NoorRHI::Device& device, const Shader& shader) {
+    if (!device)
+        return fail(ErrorCode::InvalidState, "the device is not open");
+    auto& owner = static_cast<WebGpuDevice&>(*device.getBackend());
+    const std::span<const std::byte> code = shader.getCode(false, false);
+    {
+        std::lock_guard lock(owner.mutex);
+        if (owner.shaderModules.contains(code.data()) || owner.translatedShaders.contains(contentOf(code)))
+            return {};
+    }
+    std::expected<std::string, Error> text = translateModule(owner, code);
+    if (!text)
+        return std::unexpected(std::move(text.error()));
+    std::lock_guard lock(owner.mutex);
+    owner.translatedShaders.emplace(contentOf(code), std::move(*text));
+    return {};
+}
 
 void WebGpuComputePipeline::poll() {
     if (!ready)
