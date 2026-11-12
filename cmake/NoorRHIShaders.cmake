@@ -1,11 +1,7 @@
 #! enable_language works only at file scope, so the app includes this file in its top-level CMakeLists.txt.
 include_guard(GLOBAL)
 
-if(WIN32)
-    enable_language(RC)
-else()
-    enable_language(ASM)
-endif()
+enable_language(ASM)
 
 cmake_path(ABSOLUTE_PATH CMAKE_CURRENT_LIST_DIR NORMALIZE OUTPUT_VARIABLE noorrhi_cmake_dir)
 cmake_path(GET noorrhi_cmake_dir PARENT_PATH noorrhi_root_dir)
@@ -35,15 +31,18 @@ function(noorrhi_compile_module source module reflection symbol)
                        VERBATIM)
     set(modules ${modules} "${module}" PARENT_SCOPE)
     if(WIN32)
-        string(TOUPPER "${symbol}" resource)
-        set(data "${data}${resource} RCDATA \"${module}\"\n" PARENT_SCOPE)
-        set(functions "${functions}std::span<const std::byte> ${symbol}() { return read(\"${resource}\"); }\n" PARENT_SCOPE)
-        return()
-    endif()
-    if(EMSCRIPTEN)
+        set(section ".section .rdata,\"dr\"")
+    elseif(EMSCRIPTEN)
         set(section ".section .rodata.${symbol},\"\",@")
     else()
         set(section ".section .rodata.${symbol},\"a\"")
+    endif()
+    #! COFF has no .size directive.
+    set(data_size "    .size ${symbol}, .L${symbol}_end - ${symbol}\n")
+    set(size_size "    .size ${symbol}_size, 4\n")
+    if(WIN32)
+        set(data_size "")
+        set(size_size "")
     endif()
     set(data "${data}\
     ${section}
@@ -53,12 +52,10 @@ function(noorrhi_compile_module source module reflection symbol)
 ${symbol}:
     .incbin \"${module}\"
 .L${symbol}_end:
-    .size ${symbol}, .L${symbol}_end - ${symbol}
-    .p2align 2
+${data_size}    .p2align 2
 ${symbol}_size:
     .int .L${symbol}_end - ${symbol}
-    .size ${symbol}_size, 4
-" PARENT_SCOPE)
+${size_size}" PARENT_SCOPE)
 endfunction()
 
 #! Compiles each Slang source, embeds the modules, and generates <name>.slang.h with a NoorRHI::Shader for each entry point. A source with ray tracing or cooperative matrices also gets modules for the fallbacks, and Shader::getCode chooses one when the pipeline opens.
@@ -83,7 +80,7 @@ function(noorrhi_compile_shaders target)
         get_filename_component(source_directory "${source}" DIRECTORY)
         string(MAKE_C_IDENTIFIER "noorrhi_${target}_${name}" symbol)
         set(header "${output}/${name}.slang.h")
-        set(header_arguments "-DHEADER=${header}" "-DNAME=${name}" "-DWINDOWS=${WIN32}")
+        set(header_arguments "-DHEADER=${header}" "-DNAME=${name}")
         set(header_depends "${NOORRHI_SHADER_HEADER_SCRIPT}")
         set(ray_tracing "")
         if(text MATCHES "\\[shader\\(\"(raygeneration|miss|closesthit|anyhit|intersection|callable)\"\\)\\]")
@@ -154,39 +151,14 @@ function(noorrhi_compile_shaders target)
         list(APPEND headers "${header}")
     endforeach()
 
-    if(WIN32)
-        set(data_sources "${output}/${target}.rc" "${output}/${target}.cpp")
-        file(CONFIGURE OUTPUT "${output}/${target}.rc" CONTENT "${data}" @ONLY)
-        file(CONFIGURE OUTPUT "${output}/${target}.cpp" CONTENT "\
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-#include <cstddef>
-#include <span>
-
-namespace {
-
-std::span<const std::byte> read(const char* name) {
-    HRSRC info = FindResourceA(nullptr, name, RT_RCDATA);
-    HGLOBAL resource = info ? LoadResource(nullptr, info) : nullptr;
-    if (!resource)
-        return {};
-    return {static_cast<const std::byte*>(LockResource(resource)), SizeofResource(nullptr, info)};
-}
-
-}
-
-${functions}" @ONLY)
-    else()
-        set(data_sources "${output}/${target}.S")
-        if(NOT EMSCRIPTEN)
-            string(APPEND data "    .section .note.GNU-stack,\"\",@progbits\n")
-        endif()
-        file(CONFIGURE OUTPUT "${output}/${target}.S" CONTENT "${data}" @ONLY)
+    set(data_source "${output}/${target}.S")
+    if(NOT EMSCRIPTEN AND NOT WIN32)
+        string(APPEND data "    .section .note.GNU-stack,\"\",@progbits\n")
     endif()
+    file(CONFIGURE OUTPUT "${data_source}" CONTENT "${data}" @ONLY)
 
-    add_library(${target} OBJECT ${data_sources} ${headers})
-    set_source_files_properties(${data_sources} PROPERTIES OBJECT_DEPENDS "${modules}")
+    add_library(${target} OBJECT "${data_source}" ${headers})
+    set_source_files_properties("${data_source}" PROPERTIES OBJECT_DEPENDS "${modules}")
     target_include_directories(${target} PUBLIC "${output}")
 endfunction()
 
