@@ -32,7 +32,7 @@ else()
         target_link_libraries(NoorRHI PUBLIC dawn::webgpu_dawn)
     endif()
     target_link_libraries(NoorRHI PRIVATE tint_lang_spirv_reader tint_lang_wgsl_writer tint_lang_core_ir dawn_utils_config SPIRV-Headers)
-    target_include_directories(NoorRHI SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../external/dawn")
+    target_include_directories(NoorRHI SYSTEM PRIVATE "${dawn_SOURCE_DIR}")
     target_compile_definitions(NoorRHI PRIVATE SPV_ENABLE_UTILITY_CODE)
     #! Dawn requires NDEBUG outside Debug, and CompilerOptions.cmake removes it from RelWithDebInfo.
     set_source_files_properties(NoorRHI/Shaders/WgslTranslator.cpp PROPERTIES COMPILE_DEFINITIONS "$<$<NOT:$<CONFIG:Debug>>:NDEBUG>")

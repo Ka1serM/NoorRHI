@@ -1,8 +1,21 @@
 if(NOORRHI_BACKEND STREQUAL "Vulkan")
     #! The backend loads libvulkan at run time, so only the headers are needed.
     find_package(VulkanHeaders 1.4 CONFIG REQUIRED GLOBAL HINTS "$ENV{VULKAN_SDK}")
-elseif(EMSCRIPTEN)
-    #! The emdawnwebgpu port in emsdk has no SetImmediates, so the bindings come from the Dawn submodule.
+    return()
+endif()
+
+include(FetchContent)
+FetchContent_Populate(dawn
+    URL https://github.com/google/dawn/archive/43af65b60452f3e51ea94db848b6bb8c053a1fd0.tar.gz
+    URL_HASH SHA256=4fc51992e385a733cdd2f8eafbaee6b3372229a0b8152dd1d970a130060488a8)
+set(dawn_SOURCE_DIR "${dawn_SOURCE_DIR}" PARENT_SCOPE)
+#! Dawn's own DAWN_FETCH_DEPENDENCIES runs inside Dawn, after the SPIRV-Tools that Emscripten adds below.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${dawn_SOURCE_DIR}/tools/fetch_dawn_dependencies.py"
+                        --directory "${dawn_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+
+if(EMSCRIPTEN)
+    #! The emdawnwebgpu port in emsdk has no SetImmediates, so the bindings come from Dawn.
     set(DAWN_FETCH_DEPENDENCIES OFF CACHE BOOL "" FORCE)
     set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
     set(DAWN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -19,10 +32,10 @@ elseif(EMSCRIPTEN)
     set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
     set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
     if(NOT TARGET SPIRV-Headers)
-        add_subdirectory(dawn/third_party/spirv-headers/src spirv-headers EXCLUDE_FROM_ALL SYSTEM)
+        add_subdirectory("${dawn_SOURCE_DIR}/third_party/spirv-headers/src" spirv-headers EXCLUDE_FROM_ALL SYSTEM)
     endif()
     if(NOT TARGET SPIRV-Tools-static)
-        add_subdirectory(dawn/third_party/spirv-tools/src spirv-tools EXCLUDE_FROM_ALL SYSTEM)
+        add_subdirectory("${dawn_SOURCE_DIR}/third_party/spirv-tools/src" spirv-tools EXCLUDE_FROM_ALL SYSTEM)
     endif()
     set(TINT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(TINT_BUILD_CMD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -34,7 +47,7 @@ elseif(EMSCRIPTEN)
     set(TINT_BUILD_MSL_WRITER OFF CACHE BOOL "" FORCE)
     set(TINT_BUILD_GLSL_VALIDATOR OFF CACHE BOOL "" FORCE)
     set(TINT_BUILD_IR_BINARY OFF CACHE BOOL "" FORCE)
-    add_subdirectory(dawn EXCLUDE_FROM_ALL SYSTEM)
+    add_subdirectory("${dawn_SOURCE_DIR}" dawn EXCLUDE_FROM_ALL SYSTEM)
     add_library(noorrhi_webgpu INTERFACE)
     target_link_libraries(noorrhi_webgpu INTERFACE emdawnwebgpu_cpp)
 elseif(NOT TARGET dawn::webgpu_dawn)
@@ -74,5 +87,5 @@ elseif(NOT TARGET dawn::webgpu_dawn)
         set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
         set(DAWN_USE_WINDOWS_UI OFF CACHE BOOL "" FORCE)
     endif()
-    add_subdirectory(dawn EXCLUDE_FROM_ALL SYSTEM)
+    add_subdirectory("${dawn_SOURCE_DIR}" dawn EXCLUDE_FROM_ALL SYSTEM)
 endif()

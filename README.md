@@ -82,7 +82,8 @@ this way.
 ## Linux
 
 Install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) and set `VULKAN_SDK`. It gives `slangc` and the Vulkan
-headers.
+headers. The WebGPU and web builds download the pinned Dawn and its dependencies with git and Python on the first
+configure.
 
 ```sh
 sudo dnf install clang lld libcxx-devel libcxx-static libcxxabi-static compiler-rt llvm-libunwind-devel \
@@ -90,17 +91,16 @@ sudo dnf install clang lld libcxx-devel libcxx-static libcxxabi-static compiler-
 ```
 
 ```sh
-git submodule update --init --recursive
 cmake --workflow --preset linux-release
 cmake --workflow --preset linux-webgpu-release
 ```
 
 ## Windows
 
-Install the Vulkan SDK and [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) with its `bin` folder in PATH.
+Install the Vulkan SDK, Python, and [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) with its `bin` folder in
+PATH. The WebGPU build downloads the pinned Dawn and its dependencies with git and Python on the first configure.
 
 ```powershell
-git submodule update --init --recursive
 cmake --workflow --preset windows-release
 cmake --workflow --preset windows-webgpu-release
 ```
