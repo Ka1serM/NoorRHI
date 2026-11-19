@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <bit>
+
 #include "NoorRHI/Device/Device.h"
 #include "NoorRHI/Resources/Sampler.h"
 #include "NoorRHI/WebGpu/WebGpu.h"
