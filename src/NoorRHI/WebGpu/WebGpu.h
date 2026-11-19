@@ -37,6 +37,12 @@ struct WebGpuShaderModule {
     BindingSet bindings;
 };
 
+//! The WGSL of a shader with the pools of the device, which any thread prepares before the thread of the device creates the module.
+struct WebGpuPreparedShader {
+    std::string text;
+    BindingSet bindings;
+};
+
 inline constexpr std::size_t argumentAlignment = 16;
 inline constexpr std::uint64_t argumentWindowBytes = 4096;
 inline constexpr std::uint64_t heapReservedBytes = textureTableAddress + std::uint64_t{textureTableCapacity} * 16;
@@ -204,6 +210,8 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
     std::map<wgpu::TextureFormat, wgpu::RenderPipeline> mipPipelines;
     //! One WGSL module serves every pipeline of a Slang source; the key is the code, since a shader built at run time can reuse an address.
     std::map<std::string, WebGpuShaderModule, std::less<>> shaderModules;
+    //! emdawnwebgpu keeps the modules in the JavaScript of the device's thread, so prepareShader keeps only the WGSL until that thread creates the module.
+    std::map<std::string, WebGpuPreparedShader, std::less<>> preparedShaders;
     wgpu::ComputePipeline patchPipeline;
     wgpu::BindGroupLayout countGroupLayout;
     wgpu::ComputePipeline countPipeline;

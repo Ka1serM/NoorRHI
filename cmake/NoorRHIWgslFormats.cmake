@@ -6,4 +6,5 @@ foreach(pool IN ITEMS "53:rgba16float" "57:r16float" "58:r8unorm")
     list(GET pool 1 format)
     string(REGEX REPLACE "(noorrhi_pool_${binding}_[0-9]+ : texture_storage_2d_array<)rgba32float" "\\1${format}" text "${text}")
 endforeach()
-file(WRITE "${FILE}" "${text}")
+#! Slang follows HLSL, where derivatives in non-uniform control flow are allowed, so the module turns off the WGSL check that rejects them.
+file(WRITE "${FILE}" "diagnostic(off, derivative_uniformity);\n${text}")

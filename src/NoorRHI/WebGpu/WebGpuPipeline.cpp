@@ -1,3 +1,4 @@
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -88,7 +89,7 @@ std::expected<void, Error> asShaderError(std::expected<void, Error> result) {
     return result;
 }
 
-std::expected<Backend::WebGpuShaderModule, Error> compileModule(Backend::WebGpuDevice& owner, const std::string_view code) {
+std::expected<Backend::WebGpuPreparedShader, Error> translateModule(const Backend::WebGpuDevice& owner, const std::string_view code) {
     WgslModule wgsl{std::string(code)};
     const std::string& text = wgsl.getText();
     if (text.contains("enable subgroups;") && !owner.features.subgroups)
@@ -100,13 +101,29 @@ std::expected<Backend::WebGpuShaderModule, Error> compileModule(Backend::WebGpuD
         return fail(ErrorCode::Unsupported, "a WebGPU shader with storage images needs the texture-formats-tier2 feature");
     if (std::expected<void, Error> moved = moveFloatPools(wgsl, owner.sampledRanges[static_cast<std::size_t>(Backend::PoolKind::Float)]); !moved)
         return std::unexpected(std::move(moved.error()));
-    wgpu::ShaderSourceWGSL source;
-    source.code = wgpu::StringView(wgsl.getText().data(), wgsl.getText().size());
-    const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &source};
     Backend::BindingSet bindings;
     for (const std::uint32_t binding : wgsl.listBindings(0))
         if (binding < bindings.size())
             bindings.set(binding);
+    return Backend::WebGpuPreparedShader{wgsl.getText(), bindings};
+}
+
+std::expected<Backend::WebGpuShaderModule, Error> compileModule(Backend::WebGpuDevice& owner, const std::string_view code) {
+    std::optional<Backend::WebGpuPreparedShader> prepared;
+    {
+        std::lock_guard lock(owner.mutex);
+        if (auto found = owner.preparedShaders.find(code); found != owner.preparedShaders.end())
+            prepared = std::move(owner.preparedShaders.extract(found).mapped());
+    }
+    if (!prepared) {
+        std::expected<Backend::WebGpuPreparedShader, Error> translated = translateModule(owner, code);
+        if (!translated)
+            return std::unexpected(std::move(translated.error()));
+        prepared = std::move(*translated);
+    }
+    wgpu::ShaderSourceWGSL source;
+    source.code = wgpu::StringView(prepared->text.data(), prepared->text.size());
+    const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &source};
     std::lock_guard lock(owner.mutex);
     if (const auto cached = owner.shaderModules.find(code); cached != owner.shaderModules.end())
         return cached->second;
@@ -114,7 +131,7 @@ std::expected<Backend::WebGpuShaderModule, Error> compileModule(Backend::WebGpuD
     wgpu::ShaderModule module = owner.device.CreateShaderModule(&descriptor);
     if (std::expected<void, Error> created = asShaderError(owner.popErrorScope("compiling WGSL")); !created)
         return std::unexpected(std::move(created.error()));
-    return owner.shaderModules.emplace(std::string(code), Backend::WebGpuShaderModule{std::move(module), bindings}).first->second;
+    return owner.shaderModules.emplace(std::string(code), Backend::WebGpuShaderModule{std::move(module), prepared->bindings}).first->second;
 }
 
 std::expected<Backend::WebGpuShaderModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
@@ -170,9 +187,19 @@ namespace Backend {
 std::expected<void, Error> prepareShader(NoorRHI::Device& device, const Shader& shader) {
     if (!device)
         return fail(ErrorCode::InvalidState, "the device is not open");
-    std::expected<WebGpuShaderModule, Error> module = createModule(static_cast<WebGpuDevice&>(*device.getBackend()), shader);
-    if (!module)
-        return std::unexpected(std::move(module.error()));
+    auto& owner = static_cast<WebGpuDevice&>(*device.getBackend());
+    const std::span<const std::byte> bytes = shader.getCode(false, false);
+    const std::string_view code(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    {
+        std::lock_guard lock(owner.mutex);
+        if (owner.shaderModules.contains(code) || owner.preparedShaders.contains(code))
+            return {};
+    }
+    std::expected<WebGpuPreparedShader, Error> prepared = translateModule(owner, code);
+    if (!prepared)
+        return std::unexpected(std::move(prepared.error()));
+    std::lock_guard lock(owner.mutex);
+    owner.preparedShaders.try_emplace(std::string(code), std::move(*prepared));
     return {};
 }
 

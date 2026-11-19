@@ -161,7 +161,17 @@ std::expected<void, Error> WgslModule::replaceFunction(const std::string_view na
     const std::size_t donorEnd = findBlockEnd(donor, donorBegin);
     if (hostEnd == std::string::npos || donorEnd == std::string_view::npos)
         return fail(ErrorCode::InvalidShader, std::format("The function {} has no closed body.", name));
+    //! slangc writes a helper once per specialization, so a name links first to the function that the replaced body calls.
+    std::unordered_map<std::string_view, std::string_view> called;
+    const std::string_view body = std::string_view(text).substr(host->second.position, hostEnd - host->second.position);
+    renameIdentifiers(body, [&](const std::string_view word) {
+        if (baseName(word) != word && findAtLineStart(text, std::format("fn {}(", word)) != std::string_view::npos)
+            called.try_emplace(baseName(word), word);
+        return word;
+    });
     const std::string replacement = renameIdentifiers(donor.substr(donorBegin, donorEnd - donorBegin), [&](const std::string_view word) {
+        if (const auto call = called.find(word); call != called.end())
+            return call->second;
         const auto found = definitions.find(word);
         return found == definitions.end() || found->second.name.empty() ? word : found->second.name;
     });
