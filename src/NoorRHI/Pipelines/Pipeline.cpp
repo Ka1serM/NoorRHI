@@ -116,4 +116,8 @@ std::expected<void, Error> GraphicsPipeline::wait() const {
     return waitForPipeline(backend);
 }
 
+std::expected<void, Error> prepareShader(Device& device, const Shader& shader) {
+    return Backend::prepareShader(device, shader);
+}
+
 }

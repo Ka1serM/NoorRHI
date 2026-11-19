@@ -16,8 +16,8 @@ inline constexpr std::uint64_t storageExtentAddress = 256;
 inline constexpr std::uint32_t storageLayerCapacity = 256;
 inline constexpr std::uint64_t textureTableAddress = 14592;
 inline constexpr std::uint32_t textureTableCapacity = 65536;
-inline constexpr std::uint32_t samplerModeShift = 8;
-inline constexpr std::uint32_t samplerNearest = 1;
+inline constexpr std::uint32_t samplerNearestBit = 16;
+inline constexpr std::uint32_t samplerAnisotropyShift = 5;
 inline constexpr std::uint32_t bindingCount = 59;
 
 enum class PoolKind : std::uint8_t { Float, Unfilterable, Uint };
@@ -29,7 +29,7 @@ struct PoolBindings {
 };
 
 inline constexpr std::array<PoolBindings, 3> sampledPoolBindings{PoolBindings{3, 40}, PoolBindings{43, 4}, PoolBindings{47, 4}};
-inline constexpr PoolBindings samplerBindings{51, 1};
+inline constexpr std::uint32_t samplerBinding = 51;
 inline constexpr PoolBindings storagePoolBindings{52, 7};
 inline constexpr std::uint32_t sampledTextureCount = 48;
 

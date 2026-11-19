@@ -52,7 +52,7 @@
 [vk::binding(48, 0)] Texture2DArray<uint4> noorrhi_pool_48;
 [vk::binding(49, 0)] Texture2DArray<uint4> noorrhi_pool_49;
 [vk::binding(50, 0)] Texture2DArray<uint4> noorrhi_pool_50;
-[vk::binding(51, 0)] SamplerState noorrhi_sampler_51;
+[vk::binding(51, 0)] SamplerState noorrhi_sampler;
 [format("rgba8")] [vk::binding(52, 0)] RWTexture2DArray<float4> noorrhi_pool_52;
 #if defined(NOORRHI_WGSL)
 //! Slang writes no read_write rgba16float, r16float or r8unorm storage textures, so these pools are rgba32float here and NoorRHIWgslFormats.cmake restores their formats.
@@ -74,98 +74,101 @@
 [format("r8")] [vk::binding(58, 0)] RWTexture2DArray<float4> noorrhi_pool_58;
 #endif
 
-float4 noorrhi_sample_level(uint binding, float2 texel, float layer, float lod) {
+[noinline]
+float4 noorrhi_sample_level_pool(uint binding, float2 texel, float layer, float lod) {
     switch (binding) {
-    case 3: { uint width, height, layers; noorrhi_pool_3.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_3.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 4: { uint width, height, layers; noorrhi_pool_4.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_4.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 5: { uint width, height, layers; noorrhi_pool_5.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_5.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 6: { uint width, height, layers; noorrhi_pool_6.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_6.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 7: { uint width, height, layers; noorrhi_pool_7.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_7.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 8: { uint width, height, layers; noorrhi_pool_8.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_8.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 9: { uint width, height, layers; noorrhi_pool_9.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_9.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 10: { uint width, height, layers; noorrhi_pool_10.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_10.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 11: { uint width, height, layers; noorrhi_pool_11.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_11.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 12: { uint width, height, layers; noorrhi_pool_12.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_12.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 13: { uint width, height, layers; noorrhi_pool_13.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_13.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 14: { uint width, height, layers; noorrhi_pool_14.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_14.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 15: { uint width, height, layers; noorrhi_pool_15.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_15.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 16: { uint width, height, layers; noorrhi_pool_16.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_16.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 17: { uint width, height, layers; noorrhi_pool_17.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_17.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 18: { uint width, height, layers; noorrhi_pool_18.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_18.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 19: { uint width, height, layers; noorrhi_pool_19.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_19.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 20: { uint width, height, layers; noorrhi_pool_20.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_20.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 21: { uint width, height, layers; noorrhi_pool_21.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_21.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 22: { uint width, height, layers; noorrhi_pool_22.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_22.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 23: { uint width, height, layers; noorrhi_pool_23.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_23.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 24: { uint width, height, layers; noorrhi_pool_24.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_24.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 25: { uint width, height, layers; noorrhi_pool_25.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_25.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 26: { uint width, height, layers; noorrhi_pool_26.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_26.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 27: { uint width, height, layers; noorrhi_pool_27.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_27.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 28: { uint width, height, layers; noorrhi_pool_28.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_28.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 29: { uint width, height, layers; noorrhi_pool_29.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_29.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 30: { uint width, height, layers; noorrhi_pool_30.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_30.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 31: { uint width, height, layers; noorrhi_pool_31.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_31.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 32: { uint width, height, layers; noorrhi_pool_32.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_32.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 33: { uint width, height, layers; noorrhi_pool_33.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_33.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 34: { uint width, height, layers; noorrhi_pool_34.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_34.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 35: { uint width, height, layers; noorrhi_pool_35.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_35.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 36: { uint width, height, layers; noorrhi_pool_36.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_36.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 37: { uint width, height, layers; noorrhi_pool_37.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_37.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 38: { uint width, height, layers; noorrhi_pool_38.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_38.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 39: { uint width, height, layers; noorrhi_pool_39.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_39.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 40: { uint width, height, layers; noorrhi_pool_40.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_40.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 41: { uint width, height, layers; noorrhi_pool_41.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_41.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
-    case 42: { uint width, height, layers; noorrhi_pool_42.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_42.SampleLevel(noorrhi_sampler_51, float3(texel * scale, layer), lod); }
+    case 3: { uint width, height, layers; noorrhi_pool_3.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_3.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 4: { uint width, height, layers; noorrhi_pool_4.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_4.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 5: { uint width, height, layers; noorrhi_pool_5.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_5.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 6: { uint width, height, layers; noorrhi_pool_6.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_6.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 7: { uint width, height, layers; noorrhi_pool_7.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_7.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 8: { uint width, height, layers; noorrhi_pool_8.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_8.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 9: { uint width, height, layers; noorrhi_pool_9.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_9.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 10: { uint width, height, layers; noorrhi_pool_10.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_10.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 11: { uint width, height, layers; noorrhi_pool_11.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_11.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 12: { uint width, height, layers; noorrhi_pool_12.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_12.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 13: { uint width, height, layers; noorrhi_pool_13.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_13.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 14: { uint width, height, layers; noorrhi_pool_14.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_14.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 15: { uint width, height, layers; noorrhi_pool_15.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_15.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 16: { uint width, height, layers; noorrhi_pool_16.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_16.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 17: { uint width, height, layers; noorrhi_pool_17.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_17.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 18: { uint width, height, layers; noorrhi_pool_18.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_18.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 19: { uint width, height, layers; noorrhi_pool_19.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_19.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 20: { uint width, height, layers; noorrhi_pool_20.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_20.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 21: { uint width, height, layers; noorrhi_pool_21.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_21.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 22: { uint width, height, layers; noorrhi_pool_22.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_22.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 23: { uint width, height, layers; noorrhi_pool_23.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_23.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 24: { uint width, height, layers; noorrhi_pool_24.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_24.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 25: { uint width, height, layers; noorrhi_pool_25.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_25.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 26: { uint width, height, layers; noorrhi_pool_26.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_26.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 27: { uint width, height, layers; noorrhi_pool_27.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_27.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 28: { uint width, height, layers; noorrhi_pool_28.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_28.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 29: { uint width, height, layers; noorrhi_pool_29.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_29.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 30: { uint width, height, layers; noorrhi_pool_30.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_30.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 31: { uint width, height, layers; noorrhi_pool_31.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_31.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 32: { uint width, height, layers; noorrhi_pool_32.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_32.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 33: { uint width, height, layers; noorrhi_pool_33.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_33.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 34: { uint width, height, layers; noorrhi_pool_34.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_34.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 35: { uint width, height, layers; noorrhi_pool_35.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_35.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 36: { uint width, height, layers; noorrhi_pool_36.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_36.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 37: { uint width, height, layers; noorrhi_pool_37.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_37.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 38: { uint width, height, layers; noorrhi_pool_38.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_38.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 39: { uint width, height, layers; noorrhi_pool_39.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_39.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 40: { uint width, height, layers; noorrhi_pool_40.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_40.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 41: { uint width, height, layers; noorrhi_pool_41.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_41.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
+    case 42: { uint width, height, layers; noorrhi_pool_42.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_42.SampleLevel(noorrhi_sampler, float3(texel * scale, layer), lod); }
     default: return float4(0.0);
     }
 }
 
-float4 noorrhi_sample_grad(uint binding, float2 texel, float layer, float2 dx, float2 dy) {
+[noinline]
+float4 noorrhi_sample_grad_pool(uint binding, float2 texel, float layer, float2 dx, float2 dy) {
     switch (binding) {
-    case 3: { uint width, height, layers; noorrhi_pool_3.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_3.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 4: { uint width, height, layers; noorrhi_pool_4.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_4.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 5: { uint width, height, layers; noorrhi_pool_5.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_5.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 6: { uint width, height, layers; noorrhi_pool_6.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_6.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 7: { uint width, height, layers; noorrhi_pool_7.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_7.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 8: { uint width, height, layers; noorrhi_pool_8.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_8.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 9: { uint width, height, layers; noorrhi_pool_9.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_9.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 10: { uint width, height, layers; noorrhi_pool_10.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_10.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 11: { uint width, height, layers; noorrhi_pool_11.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_11.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 12: { uint width, height, layers; noorrhi_pool_12.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_12.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 13: { uint width, height, layers; noorrhi_pool_13.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_13.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 14: { uint width, height, layers; noorrhi_pool_14.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_14.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 15: { uint width, height, layers; noorrhi_pool_15.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_15.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 16: { uint width, height, layers; noorrhi_pool_16.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_16.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 17: { uint width, height, layers; noorrhi_pool_17.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_17.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 18: { uint width, height, layers; noorrhi_pool_18.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_18.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 19: { uint width, height, layers; noorrhi_pool_19.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_19.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 20: { uint width, height, layers; noorrhi_pool_20.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_20.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 21: { uint width, height, layers; noorrhi_pool_21.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_21.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 22: { uint width, height, layers; noorrhi_pool_22.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_22.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 23: { uint width, height, layers; noorrhi_pool_23.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_23.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 24: { uint width, height, layers; noorrhi_pool_24.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_24.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 25: { uint width, height, layers; noorrhi_pool_25.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_25.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 26: { uint width, height, layers; noorrhi_pool_26.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_26.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 27: { uint width, height, layers; noorrhi_pool_27.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_27.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 28: { uint width, height, layers; noorrhi_pool_28.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_28.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 29: { uint width, height, layers; noorrhi_pool_29.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_29.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 30: { uint width, height, layers; noorrhi_pool_30.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_30.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 31: { uint width, height, layers; noorrhi_pool_31.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_31.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 32: { uint width, height, layers; noorrhi_pool_32.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_32.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 33: { uint width, height, layers; noorrhi_pool_33.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_33.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 34: { uint width, height, layers; noorrhi_pool_34.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_34.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 35: { uint width, height, layers; noorrhi_pool_35.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_35.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 36: { uint width, height, layers; noorrhi_pool_36.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_36.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 37: { uint width, height, layers; noorrhi_pool_37.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_37.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 38: { uint width, height, layers; noorrhi_pool_38.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_38.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 39: { uint width, height, layers; noorrhi_pool_39.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_39.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 40: { uint width, height, layers; noorrhi_pool_40.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_40.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 41: { uint width, height, layers; noorrhi_pool_41.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_41.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
-    case 42: { uint width, height, layers; noorrhi_pool_42.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_42.SampleGrad(noorrhi_sampler_51, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 3: { uint width, height, layers; noorrhi_pool_3.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_3.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 4: { uint width, height, layers; noorrhi_pool_4.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_4.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 5: { uint width, height, layers; noorrhi_pool_5.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_5.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 6: { uint width, height, layers; noorrhi_pool_6.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_6.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 7: { uint width, height, layers; noorrhi_pool_7.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_7.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 8: { uint width, height, layers; noorrhi_pool_8.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_8.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 9: { uint width, height, layers; noorrhi_pool_9.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_9.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 10: { uint width, height, layers; noorrhi_pool_10.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_10.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 11: { uint width, height, layers; noorrhi_pool_11.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_11.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 12: { uint width, height, layers; noorrhi_pool_12.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_12.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 13: { uint width, height, layers; noorrhi_pool_13.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_13.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 14: { uint width, height, layers; noorrhi_pool_14.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_14.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 15: { uint width, height, layers; noorrhi_pool_15.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_15.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 16: { uint width, height, layers; noorrhi_pool_16.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_16.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 17: { uint width, height, layers; noorrhi_pool_17.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_17.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 18: { uint width, height, layers; noorrhi_pool_18.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_18.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 19: { uint width, height, layers; noorrhi_pool_19.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_19.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 20: { uint width, height, layers; noorrhi_pool_20.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_20.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 21: { uint width, height, layers; noorrhi_pool_21.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_21.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 22: { uint width, height, layers; noorrhi_pool_22.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_22.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 23: { uint width, height, layers; noorrhi_pool_23.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_23.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 24: { uint width, height, layers; noorrhi_pool_24.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_24.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 25: { uint width, height, layers; noorrhi_pool_25.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_25.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 26: { uint width, height, layers; noorrhi_pool_26.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_26.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 27: { uint width, height, layers; noorrhi_pool_27.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_27.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 28: { uint width, height, layers; noorrhi_pool_28.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_28.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 29: { uint width, height, layers; noorrhi_pool_29.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_29.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 30: { uint width, height, layers; noorrhi_pool_30.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_30.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 31: { uint width, height, layers; noorrhi_pool_31.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_31.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 32: { uint width, height, layers; noorrhi_pool_32.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_32.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 33: { uint width, height, layers; noorrhi_pool_33.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_33.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 34: { uint width, height, layers; noorrhi_pool_34.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_34.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 35: { uint width, height, layers; noorrhi_pool_35.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_35.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 36: { uint width, height, layers; noorrhi_pool_36.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_36.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 37: { uint width, height, layers; noorrhi_pool_37.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_37.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 38: { uint width, height, layers; noorrhi_pool_38.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_38.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 39: { uint width, height, layers; noorrhi_pool_39.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_39.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 40: { uint width, height, layers; noorrhi_pool_40.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_40.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 41: { uint width, height, layers; noorrhi_pool_41.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_41.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
+    case 42: { uint width, height, layers; noorrhi_pool_42.GetDimensions(width, height, layers); float2 scale = 1.0 / float2(width, height); return noorrhi_pool_42.SampleGrad(noorrhi_sampler, float3(texel * scale, layer), dx * scale, dy * scale); }
     default: return float4(0.0);
     }
 }
 
+[noinline]
 float4 noorrhi_load_pool(uint binding, int2 coord, int layer, int mip) {
     switch (binding) {
     case 3: return noorrhi_pool_3.Load(int4(coord, layer, mip));
@@ -216,6 +219,7 @@ float4 noorrhi_load_pool(uint binding, int2 coord, int layer, int mip) {
     }
 }
 
+[noinline]
 uint4 noorrhi_load_uint_pool(uint binding, int2 coord, int layer, int mip) {
     switch (binding) {
     case 47: return noorrhi_pool_47.Load(int4(coord, layer, mip));
@@ -226,6 +230,7 @@ uint4 noorrhi_load_uint_pool(uint binding, int2 coord, int layer, int mip) {
     }
 }
 
+[noinline]
 float4 noorrhi_storage_load(uint handle, uint2 coord) {
     switch (handle >> 16) {
     case 52: return noorrhi_pool_52[uint3(coord, (handle & 65535u))];
@@ -238,6 +243,7 @@ float4 noorrhi_storage_load(uint handle, uint2 coord) {
     }
 }
 
+[noinline]
 void noorrhi_storage_store(uint handle, uint2 coord, float4 value) {
     switch (handle >> 16) {
     case 52: noorrhi_pool_52[uint3(coord, (handle & 65535u))] = value; return;
@@ -250,6 +256,7 @@ void noorrhi_storage_store(uint handle, uint2 coord, float4 value) {
     }
 }
 
+[noinline]
 uint4 noorrhi_storage_load_uint(uint handle, uint2 coord) {
     switch (handle >> 16) {
     case 55: return noorrhi_pool_55[uint3(coord, (handle & 65535u))];
@@ -257,6 +264,7 @@ uint4 noorrhi_storage_load_uint(uint handle, uint2 coord) {
     }
 }
 
+[noinline]
 void noorrhi_storage_store_uint(uint handle, uint2 coord, uint4 value) {
     switch (handle >> 16) {
     case 55: noorrhi_pool_55[uint3(coord, (handle & 65535u))] = value; return;
@@ -270,5 +278,5 @@ uint2 noorrhi_storage_dimensions(uint handle) {
 }
 
 static const uint noorrhi_texture_table = 14592u;
-static const uint noorrhi_sampler_mode_shift = 8u;
-static const uint noorrhi_sampler_nearest = 1u;
+static const uint noorrhi_sampler_nearest_bit = 16u;
+static const uint noorrhi_sampler_anisotropy_shift = 5u;

@@ -72,6 +72,9 @@ wgpu::StencilOperation getStencilOp(const StencilOp op) {
 }
 
 wgpu::BlendState getBlendState(const BlendMode mode) {
+    if (mode == BlendMode::Multiply)
+        return {.color = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::Dst, .dstFactor = wgpu::BlendFactor::Zero},
+                .alpha = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::Zero, .dstFactor = wgpu::BlendFactor::One}};
     const wgpu::BlendFactor colorSource = mode == BlendMode::Alpha ? wgpu::BlendFactor::SrcAlpha : wgpu::BlendFactor::One;
     const wgpu::BlendFactor colorDestination = mode == BlendMode::Additive ? wgpu::BlendFactor::One : wgpu::BlendFactor::OneMinusSrcAlpha;
     const wgpu::BlendFactor alphaDestination = mode == BlendMode::Additive ? wgpu::BlendFactor::One : wgpu::BlendFactor::OneMinusSrcAlpha;
@@ -85,14 +88,8 @@ std::expected<void, Error> asShaderError(std::expected<void, Error> result) {
     return result;
 }
 
-struct CompiledModule {
-    wgpu::ShaderModule module;
-    Backend::BindingSet bindings;
-};
-
-std::expected<CompiledModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
-    const std::span<const std::byte> code = shader.getCode(false, false);
-    WgslModule wgsl(std::string(reinterpret_cast<const char*>(code.data()), code.size()));
+std::expected<Backend::WebGpuShaderModule, Error> compileModule(Backend::WebGpuDevice& owner, const std::string_view code) {
+    WgslModule wgsl{std::string(code)};
     const std::string& text = wgsl.getText();
     if (text.contains("enable subgroups;") && !owner.features.subgroups)
         return fail(ErrorCode::Unsupported, "a WebGPU shader with subgroup operations needs the subgroups feature");
@@ -106,16 +103,29 @@ std::expected<CompiledModule, Error> createModule(Backend::WebGpuDevice& owner, 
     wgpu::ShaderSourceWGSL source;
     source.code = wgpu::StringView(wgsl.getText().data(), wgsl.getText().size());
     const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &source};
-    std::lock_guard lock(owner.mutex);
-    owner.pushErrorScope();
-    wgpu::ShaderModule module = owner.device.CreateShaderModule(&descriptor);
-    if (std::expected<void, Error> created = asShaderError(owner.popErrorScope("compiling WGSL")); !created)
-        return std::unexpected(std::move(created.error()));
     Backend::BindingSet bindings;
     for (const std::uint32_t binding : wgsl.listBindings(0))
         if (binding < bindings.size())
             bindings.set(binding);
-    return CompiledModule{std::move(module), bindings};
+    std::lock_guard lock(owner.mutex);
+    if (const auto cached = owner.shaderModules.find(code); cached != owner.shaderModules.end())
+        return cached->second;
+    owner.pushErrorScope();
+    wgpu::ShaderModule module = owner.device.CreateShaderModule(&descriptor);
+    if (std::expected<void, Error> created = asShaderError(owner.popErrorScope("compiling WGSL")); !created)
+        return std::unexpected(std::move(created.error()));
+    return owner.shaderModules.emplace(std::string(code), Backend::WebGpuShaderModule{std::move(module), bindings}).first->second;
+}
+
+std::expected<Backend::WebGpuShaderModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
+    const std::span<const std::byte> bytes = shader.getCode(false, false);
+    const std::string_view code(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    {
+        std::lock_guard lock(owner.mutex);
+        if (const auto cached = owner.shaderModules.find(code); cached != owner.shaderModules.end())
+            return cached->second;
+    }
+    return compileModule(owner, code);
 }
 
 wgpu::StringView getEntryPoint(const Shader& shader) {
@@ -157,6 +167,15 @@ std::expected<void, Error> waitCompilation(Backend::WebGpuCompilation& compilati
 
 namespace Backend {
 
+std::expected<void, Error> prepareShader(NoorRHI::Device& device, const Shader& shader) {
+    if (!device)
+        return fail(ErrorCode::InvalidState, "the device is not open");
+    std::expected<WebGpuShaderModule, Error> module = createModule(static_cast<WebGpuDevice&>(*device.getBackend()), shader);
+    if (!module)
+        return std::unexpected(std::move(module.error()));
+    return {};
+}
+
 void WebGpuComputePipeline::poll() {
     if (!ready)
         compilation.device->instance.ProcessEvents();
@@ -182,7 +201,7 @@ std::expected<std::shared_ptr<ComputePipeline>, Error> openComputePipeline(NoorR
     if (std::expected<void, Error> checked = checkShader(shader, ShaderStage::Compute); !checked)
         return std::unexpected(std::move(checked.error()));
     auto& owner = static_cast<WebGpuDevice&>(*device.getBackend());
-    std::expected<CompiledModule, Error> module = createModule(owner, shader);
+    std::expected<Backend::WebGpuShaderModule, Error> module = createModule(owner, shader);
     if (!module)
         return std::unexpected(std::move(module.error()));
     wgpu::ComputePipelineDescriptor descriptor{.layout = owner.computeLayout};
@@ -211,10 +230,10 @@ std::expected<std::shared_ptr<GraphicsPipeline>, Error> openGraphicsPipeline(Noo
     auto& owner = static_cast<WebGpuDevice&>(*device.getBackend());
     if (!owner.isRenderable(desc.colorFormat))
         return fail(ErrorCode::Unsupported, "the WebGPU device cannot render to the color format of the pipeline");
-    std::expected<CompiledModule, Error> vertex = createModule(owner, desc.vertex);
+    std::expected<Backend::WebGpuShaderModule, Error> vertex = createModule(owner, desc.vertex);
     if (!vertex)
         return std::unexpected(std::move(vertex.error()));
-    std::expected<CompiledModule, Error> fragment = createModule(owner, desc.fragment);
+    std::expected<Backend::WebGpuShaderModule, Error> fragment = createModule(owner, desc.fragment);
     if (!fragment)
         return std::unexpected(std::move(fragment.error()));
     const bool usesDepth = desc.depthFormat != ImageFormat::Undefined;

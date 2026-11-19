@@ -143,6 +143,13 @@ vk::PipelineColorBlendAttachmentState getBlendState(const BlendMode mode, const 
     blend.blendEnable = vk::True;
     blend.colorBlendOp = vk::BlendOp::eAdd;
     blend.alphaBlendOp = vk::BlendOp::eAdd;
+    if (mode == BlendMode::Multiply) {
+        blend.srcColorBlendFactor = vk::BlendFactor::eDstColor;
+        blend.dstColorBlendFactor = vk::BlendFactor::eZero;
+        blend.srcAlphaBlendFactor = vk::BlendFactor::eZero;
+        blend.dstAlphaBlendFactor = vk::BlendFactor::eOne;
+        return blend;
+    }
     blend.srcAlphaBlendFactor = vk::BlendFactor::eOne;
     blend.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
     blend.srcColorBlendFactor = mode == BlendMode::Alpha ? vk::BlendFactor::eSrcAlpha : vk::BlendFactor::eOne;
@@ -304,6 +311,12 @@ void start(VulkanDevice& owner, Pipeline& result, const bool background, Create 
     owner.compile(std::move(job));
 }
 
+}
+
+std::expected<void, Error> prepareShader(NoorRHI::Device& device, const Shader&) {
+    if (!device)
+        return fail(ErrorCode::InvalidState, "the device is not open");
+    return {};
 }
 
 std::expected<std::shared_ptr<ComputePipeline>, Error> openComputePipeline(NoorRHI::Device& device, const Shader& shader, const bool background) {

@@ -32,14 +32,17 @@ namespace NoorRHI::Backend {
 //! The bindings of group 0 that a shader declares; slangc leaves out the ones it does not use.
 using BindingSet = std::bitset<bindingCount>;
 
+struct WebGpuShaderModule {
+    wgpu::ShaderModule module;
+    BindingSet bindings;
+};
+
 inline constexpr std::size_t argumentAlignment = 16;
 inline constexpr std::uint64_t argumentWindowBytes = 4096;
 inline constexpr std::uint64_t heapReservedBytes = textureTableAddress + std::uint64_t{textureTableCapacity} * 16;
 inline constexpr std::array<std::uint64_t, 2> initialHeapBytes{16ull << 20, 64ull << 10};
 inline constexpr std::uint64_t addressOffsetMask = 0xffffffffull;
 inline constexpr std::uint64_t indirectSlotBytes = 16;
-//! The anisotropy of the one WebGPU sampler; a sampler that asks for less still gets it, and nearest samplers read single texels.
-inline constexpr std::uint16_t samplerAnisotropy = 8;
 
 wgpu::TextureFormat getWebGpuFormat(ImageFormat format);
 std::string toString(wgpu::StringView text);
@@ -199,6 +202,8 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
     wgpu::PipelineLayout mipLayout;
     wgpu::ShaderModule mipModule;
     std::map<wgpu::TextureFormat, wgpu::RenderPipeline> mipPipelines;
+    //! One WGSL module serves every pipeline of a Slang source; the key is the code, since a shader built at run time can reuse an address.
+    std::map<std::string, WebGpuShaderModule, std::less<>> shaderModules;
     wgpu::ComputePipeline patchPipeline;
     wgpu::BindGroupLayout countGroupLayout;
     wgpu::ComputePipeline countPipeline;
@@ -264,9 +269,7 @@ struct WebGpuImage final : Image, std::enable_shared_from_this<WebGpuImage> {
     bool shadowStale = false;
 };
 
-struct WebGpuSampler final : Sampler {
-    std::shared_ptr<WebGpuDevice> device;
-};
+struct WebGpuSampler final : Sampler {};
 
 struct WebGpuCompilation {
     std::shared_ptr<WebGpuDevice> device;
@@ -310,6 +313,12 @@ struct WebGpuReadback final : Readback, std::enable_shared_from_this<WebGpuReadb
     wgpu::Future future;
     std::shared_ptr<MapState> map;
 };
+
+constexpr std::uint32_t timestampBeginSlot = 0;
+constexpr std::uint32_t timestampEndSlot = 1;
+constexpr std::uint32_t timestampScratchBeginSlot = 2;
+constexpr std::uint32_t timestampScratchEndSlot = 3;
+constexpr std::uint32_t timestampSlotCount = 4;
 
 struct WebGpuTimestampQuery final : TimestampQuery, std::enable_shared_from_this<WebGpuTimestampQuery> {
     double getMilliseconds() override;
@@ -378,6 +387,12 @@ struct CopyCommand {
     Rect region;
 };
 
+struct BufferCopyCommand {
+    std::uint64_t address = 0;
+    std::shared_ptr<WebGpuImage> destination;
+    std::uint32_t level = 0;
+};
+
 struct UploadCommand {
     std::uint64_t address = 0;
     std::uint64_t stagingOffset = 0;
@@ -405,7 +420,7 @@ struct LabelCommand {
 };
 
 struct RecordedCommand : std::variant<DispatchCommand, ConcurrentCommand, BeginRenderCommand, EndRenderCommand, ScissorCommand, StencilReferenceCommand,
-                                      DrawCommand, CopyCommand, UploadCommand, DownloadCommand, PatchCommand, TimestampCommand, LabelCommand> {
+                                      DrawCommand, CopyCommand, BufferCopyCommand, UploadCommand, DownloadCommand, PatchCommand, TimestampCommand, LabelCommand> {
     using variant::variant;
 };
 
@@ -425,6 +440,7 @@ struct WebGpuCommandList final : CommandList {
                      std::span<const std::byte> arguments) override;
     void drawIndirect(const GraphicsPipeline& pipeline, const IndirectDraw& draw, std::span<const std::byte> arguments) override;
     void copy(const Image& source, const Image& destination, const Rect& sourceRegion) override;
+    void copy(std::uint64_t address, const Image& destination, std::uint32_t level) override;
     void upload(std::uint64_t address, std::span<const std::byte> data) override;
     void download(std::uint64_t address, Readback& readback, std::size_t bytes) override;
     void beginTimestamp(TimestampQuery& query) override;

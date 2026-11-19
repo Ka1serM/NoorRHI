@@ -41,7 +41,7 @@ enum class CullMode : std::uint8_t { None, Front, Back };
 enum class FrontFace : std::uint8_t { CounterClockwise, Clockwise };
 enum class PolygonMode : std::uint8_t { Fill, Line, Point };
 enum class CompareOp : std::uint8_t { Never, Less, Equal, LessOrEqual, Greater, NotEqual, GreaterOrEqual, Always };
-enum class BlendMode : std::uint8_t { Opaque, Alpha, PremultipliedAlpha, Additive };
+enum class BlendMode : std::uint8_t { Opaque, Alpha, PremultipliedAlpha, Additive, Multiply };
 enum class StencilOp : std::uint8_t { Keep, Zero, Replace, Increment, Decrement, Invert };
 
 struct StencilState {
@@ -101,5 +101,7 @@ public:
 private:
     std::shared_ptr<Backend::GraphicsPipeline> backend;
 };
+
+[[nodiscard]] std::expected<void, Error> prepareShader(Device& device, const Shader& shader);
 
 }

@@ -99,6 +99,7 @@ std::expected<void, Error> checkGraphicsPipelineDesc(const GraphicsPipelineDesc&
 void setTarget(GraphicsPipeline& pipeline, const GraphicsPipelineDesc& desc);
 std::expected<std::shared_ptr<ComputePipeline>, Error> openComputePipeline(NoorRHI::Device& device, const Shader& shader, bool background);
 std::expected<std::shared_ptr<GraphicsPipeline>, Error> openGraphicsPipeline(NoorRHI::Device& device, const GraphicsPipelineDesc& desc, bool background);
+std::expected<void, Error> prepareShader(NoorRHI::Device& device, const Shader& shader);
 
 struct TimestampQuery {
     virtual ~TimestampQuery() = default;
@@ -174,6 +175,7 @@ struct CommandList {
                              std::span<const std::byte> arguments) = 0;
     virtual void drawIndirect(const GraphicsPipeline& pipeline, const IndirectDraw& draw, std::span<const std::byte> arguments) = 0;
     virtual void copy(const Image& source, const Image& destination, const Rect& sourceRegion) = 0;
+    virtual void copy(std::uint64_t address, const Image& destination, std::uint32_t level) = 0;
     virtual void upload(std::uint64_t address, std::span<const std::byte> data) = 0;
     virtual void download(std::uint64_t address, Readback& readback, std::size_t bytes) = 0;
     virtual void beginTimestamp(TimestampQuery& query) = 0;
