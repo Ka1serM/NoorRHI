@@ -1,7 +1,11 @@
 set(shaders shaders/Add.slang shaders/Count.slang shaders/StorageImage.slang shaders/Triangle.slang shaders/Raster.slang shaders/RayTracing.slang
-            shaders/RayQuery.slang shaders/RayGrid.slang shaders/Gradient.slang shaders/Matrix.slang
+            shaders/RayQuery.slang shaders/HitFilter.slang shaders/RayGrid.slang shaders/Gradient.slang shaders/Matrix.slang
             shaders/MatrixFloat.slang shaders/Scene.slang shaders/Network.slang)
 set(tests Main.cpp ComputeTest.cpp ImageTest.cpp RasterTest.cpp RayTracingTest.cpp GradientTest.cpp MatrixTest.cpp SceneTest.cpp)
+if(NOORRHI_BACKEND STREQUAL "Vulkan")
+    list(APPEND shaders shaders/ReplaceHost.slang shaders/ReplaceDonor.slang)
+    list(APPEND tests SpirvModuleTest.cpp)
+endif()
 noorrhi_add_shaders(NoorRHITestShaders ${shaders})
 
 add_executable(NoorRHITests ${tests})
@@ -15,9 +19,6 @@ endif()
 if(TARGET SDL3::SDL3)
     target_sources(NoorRHITests PRIVATE PresentationTest.cpp)
     target_link_libraries(NoorRHITests PRIVATE SDL3::SDL3)
-endif()
-if(NOORRHI_BACKEND STREQUAL "WebGpu")
-    target_sources(NoorRHITests PRIVATE TranslatorTest.cpp)
 endif()
 add_test(NAME NoorRHITests COMMAND NoorRHITests)
 

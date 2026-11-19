@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <span>
 
 #include "NoorRHI/Device/Device.h"
 #include "NoorRHI/Present/Swapchain.h"
@@ -30,8 +31,9 @@ std::expected<wgpu::TextureFormat, Error> chooseFormat(const wgpu::SurfaceCapabi
             return getWebGpuFormat(preferred);
         return fail(ErrorCode::Unsupported, "the surface does not offer the requested swapchain format");
     }
-    for (const wgpu::TextureFormat format : {wgpu::TextureFormat::BGRA8Unorm, wgpu::TextureFormat::RGBA8Unorm})
-        if (contains(capabilities.formats, capabilities.formatCount, format))
+    //! The surface lists its preferred format first, and a browser copies the canvas on every frame in any other format.
+    for (const wgpu::TextureFormat format : std::span(capabilities.formats, capabilities.formatCount))
+        if (format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::RGBA8Unorm)
             return format;
     return fail(ErrorCode::Unsupported, "the surface offers no 8-bit RGBA or BGRA format");
 }
@@ -131,10 +133,14 @@ std::expected<void, Error> WebGpuSwapchain::configure() {
     if (!publicFormat)
         return fail(ErrorCode::Unsupported, "the swapchain format has no NoorRHI image format");
     const wgpu::PresentMode presentMode = choosePresentMode(capabilities, requestedMode);
-    nativeUsage = wgpu::TextureUsage::RenderAttachment | (capabilities.usages & (wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst));
+    const wgpu::TextureDescriptor frameDescriptor{
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
+        .size = {extentWidth, extentHeight, 1},
+        .format = *chosen};
+    frame = device->device.CreateTexture(&frameDescriptor);
     const wgpu::SurfaceConfiguration configuration{.device = device->device,
                                                    .format = *chosen,
-                                                   .usage = nativeUsage,
+                                                   .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopyDst,
                                                    .width = extentWidth,
                                                    .height = extentHeight,
                                                    .alphaMode = chooseAlphaMode(capabilities, transparent),
@@ -197,28 +203,9 @@ std::expected<std::optional<AcquiredImage>, Error> WebGpuSwapchain::acquire(cons
             return std::unexpected(std::move(configured.error()));
     if (stale)
         return std::nullopt;
-
-    wgpu::SurfaceTexture current;
-    surface.GetCurrentTexture(&current);
-    switch (current.status) {
-    case wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal:
-        break;
-    //! A suboptimal surface still presents correctly, so the reconfigure waits for the next acquire.
-    case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
-        stale = true;
-        break;
-    case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
-        return std::nullopt;
-    case wgpu::SurfaceGetCurrentTextureStatus::Outdated:
-    case wgpu::SurfaceGetCurrentTextureStatus::Lost:
-        stale = true;
-        return std::nullopt;
-    default:
-        return fail(ErrorCode::DeviceLost, "the WebGPU surface gives no texture");
-    }
     auto wrapped = std::make_shared<WebGpuImage>();
     wrapped->device = device;
-    wrapped->texture = current.texture;
+    wrapped->texture = frame;
     wrapped->nativeFormat = nativeFormat;
     wrapped->format = format;
     wrapped->width = width;
@@ -232,10 +219,39 @@ std::expected<void, Error> WebGpuSwapchain::present(const std::uint32_t index, s
     if (!acquired || index != generation)
         return fail(ErrorCode::InvalidArgument, "the frame belongs to an older swapchain");
     acquired = false;
+    wgpu::SurfaceTexture current;
+    surface.GetCurrentTexture(&current);
+    switch (current.status) {
+    case wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal:
+        break;
+    //! A suboptimal surface still presents correctly, so the reconfigure waits for the next acquire.
+    case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
+        stale = true;
+        break;
+    case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+        return {};
+    case wgpu::SurfaceGetCurrentTextureStatus::Outdated:
+    case wgpu::SurfaceGetCurrentTextureStatus::Lost:
+        stale = true;
+        return {};
+    default:
+        return fail(ErrorCode::DeviceLost, "the WebGPU surface gives no texture");
+    }
+    //! In the browser the canvas can change size before the window reports it. The frame still shows, cut to the canvas, and the next
+    //! acquire reconfigures; dropping it would leave the cleared canvas blank for as long as the sizes disagree.
+    const std::uint32_t canvasWidth = current.texture.GetWidth();
+    const std::uint32_t canvasHeight = current.texture.GetHeight();
+    if (canvasWidth != width || canvasHeight != height)
+        stale = true;
     std::expected<Token, Error> token;
     {
         std::lock_guard deviceLock(device->mutex);
-        token = device->submitCommands(device->device.CreateCommandEncoder().Finish());
+        const wgpu::CommandEncoder encoder = device->device.CreateCommandEncoder();
+        const wgpu::TexelCopyTextureInfo source{.texture = frame};
+        const wgpu::TexelCopyTextureInfo destination{.texture = current.texture};
+        const wgpu::Extent3D extent{std::min(width, canvasWidth), std::min(height, canvasHeight), 1};
+        encoder.CopyTextureToTexture(&source, &destination, &extent);
+        token = device->submitCommands(encoder.Finish());
     }
     if (!token)
         return std::unexpected(std::move(token.error()));

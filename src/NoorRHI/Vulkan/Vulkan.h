@@ -262,7 +262,7 @@ struct VulkanBuffer final : Buffer {
 struct VulkanImage final : Image {
     ~VulkanImage() override;
 
-    std::expected<void, Error> upload(std::span<const std::byte> mipChain) override;
+    std::expected<void, Error> upload(std::span<const std::byte> levels, std::uint32_t levelCount) override;
     std::expected<void, Error> download(std::uint32_t x, std::uint32_t y, std::uint32_t regionWidth, std::uint32_t regionHeight,
                                         std::span<std::byte> destination) override;
 

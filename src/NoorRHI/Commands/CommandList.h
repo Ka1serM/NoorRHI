@@ -28,6 +28,8 @@ struct RenderTarget {
     const Image* color = nullptr;
     const Image* depth = nullptr;
     const Image* resolve = nullptr;
+    //! Vulkan loads, clears, stores and resolves only this area; WebGPU has no render area and uses the whole image.
+    std::optional<Rect> area;
     bool clear = true;
     float4 clearColor{0.0f, 0.0f, 0.0f, 1.0f};
     float clearDepth = 1.0f;

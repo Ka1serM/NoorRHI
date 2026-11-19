@@ -13,18 +13,62 @@ public struct RayHit {
     public bool frontFace;
 }
 
+public struct RayCandidate {
+    public float t;
+    public float2 barycentrics;
+    public uint instanceIndex;
+    public uint instanceId;
+    public uint primitiveIndex;
+    public uint geometryIndex;
+    public bool frontFace;
+    public float3 objectRayOrigin;
+    public float3 objectRayDirection;
+}
+
+public enum HitVerdict : uint {
+    Ignore = 0,
+    Accept = 1,
+    AcceptAndEnd = 2,
+}
+
+//! Called for non-opaque triangle candidates only, in no fixed order. On the software path a filter must not trace rays, because all traversals share one stack.
+public interface IHitFilter {
+    [mutating] HitVerdict filter(RayCandidate candidate);
+}
+
 #if !defined(NOORRHI_RAYTRACING_FALLBACK)
 
 RaytracingAccelerationStructure noorrhi_scene(AccelerationStructureHandle scene) {
     return RaytracingAccelerationStructure(uint64_t(scene.low) | uint64_t(scene.high) << 32);
 }
 
-public bool traceRayInline(AccelerationStructureHandle scene, uint flags, uint mask, RayDesc ray, out RayHit hit) {
+struct NoorRHIAcceptAllHits : IHitFilter {
+    [mutating] HitVerdict filter(RayCandidate candidate) { return HitVerdict.Accept; }
+}
+
+public bool traceRayInline<F : IHitFilter>(AccelerationStructureHandle scene, uint flags, uint mask, RayDesc ray, inout F filter, out RayHit hit) {
     RayQuery<RAY_FLAG_NONE> query;
     query.TraceRayInline(noorrhi_scene(scene), flags, mask, ray);
-    while (query.Proceed())
-        if (query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
-            query.CommitNonOpaqueTriangleHit();
+    while (query.Proceed()) {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+            continue;
+        RayCandidate candidate;
+        candidate.t = query.CandidateTriangleRayT();
+        candidate.barycentrics = query.CandidateTriangleBarycentrics();
+        candidate.instanceIndex = query.CandidateInstanceIndex();
+        candidate.instanceId = query.CandidateInstanceID();
+        candidate.primitiveIndex = query.CandidatePrimitiveIndex();
+        candidate.geometryIndex = query.CandidateGeometryIndex();
+        candidate.frontFace = query.CandidateTriangleFrontFace();
+        candidate.objectRayOrigin = query.CandidateObjectRayOrigin();
+        candidate.objectRayDirection = query.CandidateObjectRayDirection();
+        const HitVerdict verdict = filter.filter(candidate);
+        if (verdict == HitVerdict.Ignore)
+            continue;
+        query.CommitNonOpaqueTriangleHit();
+        if (verdict == HitVerdict.AcceptAndEnd)
+            query.Abort();
+    }
     hit = {};
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
         return false;
@@ -36,6 +80,11 @@ public bool traceRayInline(AccelerationStructureHandle scene, uint flags, uint m
     hit.geometryIndex = query.CommittedGeometryIndex();
     hit.frontFace = query.CommittedTriangleFrontFace();
     return true;
+}
+
+public bool traceRayInline(AccelerationStructureHandle scene, uint flags, uint mask, RayDesc ray, out RayHit hit) {
+    NoorRHIAcceptAllHits filter;
+    return traceRayInline(scene, flags, mask, ray, filter, hit);
 }
 
 public void traceRay<P>(AccelerationStructureHandle scene, uint flags, uint mask, uint hitGroupOffset, uint hitGroupStride, uint missIndex, RayDesc ray,
@@ -61,8 +110,11 @@ public void acceptHitAndEndSearch() { AcceptHitAndEndSearch(); }
 
 #else
 
-static const uint noorrhi_stack_size = 96;
+//! The TLAS needs at most 64 entries. A BLAS path holds one entry per wide level, and RayTracingBuild::clusterLevels + 1 bounds the levels.
+static const uint noorrhi_stack_size = 64 + 128;
+static uint noorrhi_stack[noorrhi_stack_size];
 static const uint noorrhi_node_words = 4;
+static const uint noorrhi_wide_node_words = 6;
 static const uint noorrhi_instance_words = 7;
 static const uint noorrhi_triangle_words = 3;
 static const uint noorrhi_none = 0xffffffffu;
@@ -86,10 +138,13 @@ struct NoorRHICandidate {
     float t;
     float2 barycentrics;
     uint instanceIndex;
+    uint instanceId;
     uint primitiveIndex;
     uint geometryIndex;
     uint hitGroupBase;
     bool frontFace;
+    float3 objectRayOrigin;
+    float3 objectRayDirection;
 }
 
 interface INoorRHIHitFilter {
@@ -98,6 +153,24 @@ interface INoorRHIHitFilter {
 
 struct NoorRHIAcceptAll : INoorRHIHitFilter {
     [mutating] uint filter(NoorRHICandidate candidate, RayDesc ray) { return noorrhi_verdict_accept; }
+}
+
+struct NoorRHIPublicFilter<F : IHitFilter> : INoorRHIHitFilter {
+    F inner;
+
+    [mutating] uint filter(NoorRHICandidate candidate, RayDesc ray) {
+        RayCandidate publicCandidate;
+        publicCandidate.t = candidate.t;
+        publicCandidate.barycentrics = candidate.barycentrics;
+        publicCandidate.instanceIndex = candidate.instanceIndex;
+        publicCandidate.instanceId = candidate.instanceId;
+        publicCandidate.primitiveIndex = candidate.primitiveIndex;
+        publicCandidate.geometryIndex = candidate.geometryIndex;
+        publicCandidate.frontFace = candidate.frontFace;
+        publicCandidate.objectRayOrigin = candidate.objectRayOrigin;
+        publicCandidate.objectRayDirection = candidate.objectRayDirection;
+        return uint(inner.filter(publicCandidate));
+    }
 }
 
 Ptr<uint4> noorrhi_words(uint low, uint high) {
@@ -131,16 +204,177 @@ float3 noorrhi_transform_vector(Ptr<uint4> rows, float3 vector) {
     return float3(dot(asfloat(rows[0]).xyz, vector), dot(asfloat(rows[1]).xyz, vector), dot(asfloat(rows[2]).xyz, vector));
 }
 
+struct NoorRHITraversal {
+    float tMax;
+    bool found;
+    bool done;
+    NoorRHICandidate hit;
+}
+
+struct NoorRHIInstanceRay {
+    float3 origin;
+    float3 direction;
+    float3 inverse;
+    uint octant;
+    uint item;
+    uint4 info;
+}
+
+uint noorrhi_byte(uint2 plane, uint slot) {
+    return (plane[slot >> 2] >> ((slot & 3) * 8)) & 0xffu;
+}
+
+float noorrhi_scale(uint exponents, uint axis) {
+    return asfloat(((exponents >> (axis * 8)) & 0xffu) << 23);
+}
+
+//! A wide node is 6 words: origin and exponents, 8 child descriptors, then the quantized low and high planes of 8 boxes, 8 bytes per axis.
+uint noorrhi_wide_hits(Ptr<uint4> node, NoorRHIInstanceRay instanceRay, float tMin, float tMax) {
+    const uint4 header = node[0];
+    const uint4 descriptors0 = node[1];
+    const uint4 descriptors1 = node[2];
+    const uint4 planes0 = node[3];
+    const uint4 planes1 = node[4];
+    const uint4 planes2 = node[5];
+    const float3 scale = float3(noorrhi_scale(header.w, 0), noorrhi_scale(header.w, 1), noorrhi_scale(header.w, 2));
+    const float3 slope = scale * instanceRay.inverse;
+    const float3 offset = (asfloat(header.xyz) - instanceRay.origin) * instanceRay.inverse;
+    const uint octant = instanceRay.octant;
+    const uint2 nearX = (octant & 1) != 0 ? planes1.zw : planes0.xy;
+    const uint2 farX = (octant & 1) != 0 ? planes0.xy : planes1.zw;
+    const uint2 nearY = (octant & 2) != 0 ? planes2.xy : planes0.zw;
+    const uint2 farY = (octant & 2) != 0 ? planes0.zw : planes2.xy;
+    const uint2 nearZ = (octant & 4) != 0 ? planes2.zw : planes1.xy;
+    const uint2 farZ = (octant & 4) != 0 ? planes1.xy : planes2.zw;
+    uint hits = 0;
+    [unroll]
+    for (uint slot = 0; slot < 8; ++slot) {
+        const uint descriptor = slot < 4 ? descriptors0[slot] : descriptors1[slot - 4];
+        const float3 near = float3(noorrhi_byte(nearX, slot), noorrhi_byte(nearY, slot), noorrhi_byte(nearZ, slot)) * slope + offset;
+        const float3 far = float3(noorrhi_byte(farX, slot), noorrhi_byte(farY, slot), noorrhi_byte(farZ, slot)) * slope + offset;
+        const float entry = max(max(near.x, near.y), max(near.z, tMin));
+        const float exit = min(min(far.x, far.y), min(far.z, tMax));
+        if (descriptor != noorrhi_none && entry <= exit)
+            hits |= 1u << (slot ^ octant);
+    }
+    return hits;
+}
+
+void noorrhi_test_triangles<F : INoorRHIHitFilter>(Ptr<uint4> triangles, uint first, uint count, NoorRHIInstanceRay instanceRay, RayDesc ray, uint flags,
+                                                   inout F filter, inout NoorRHITraversal traversal) {
+    const uint instanceFlags = instanceRay.info.w >> 24;
+    for (uint primitive = first; primitive < first + count; ++primitive) {
+        const Ptr<uint4> triangle = triangles + primitive * noorrhi_triangle_words;
+        const uint4 word0 = triangle[0];
+        const uint4 word1 = triangle[1];
+        const uint4 word2 = triangle[2];
+        const float3 vertex = asfloat(word0.xyz);
+        const float3 edge1 = asfloat(word1.xyz);
+        const float3 edge2 = asfloat(word2.xyz);
+        const float3 p = cross(instanceRay.direction, edge2);
+        const float determinant = dot(edge1, p);
+        if (determinant == 0.0)
+            continue;
+        const float reciprocal = 1.0 / determinant;
+        const float3 s = instanceRay.origin - vertex;
+        const float u = dot(s, p) * reciprocal;
+        if (u < 0.0 || u > 1.0)
+            continue;
+        const float3 q = cross(s, edge1);
+        const float v = dot(instanceRay.direction, q) * reciprocal;
+        if (v < 0.0 || u + v > 1.0)
+            continue;
+        const float t = dot(edge2, q) * reciprocal;
+        if (t < ray.TMin || t > traversal.tMax)
+            continue;
+        const bool frontFace = (determinant > 0.0) != ((instanceFlags & noorrhi_instance_front_counter_clockwise) != 0);
+        if ((instanceFlags & noorrhi_instance_cull_disable) == 0) {
+            if ((flags & RAY_FLAG_CULL_BACK_FACING_TRIANGLES) != 0 && !frontFace)
+                continue;
+            if ((flags & RAY_FLAG_CULL_FRONT_FACING_TRIANGLES) != 0 && frontFace)
+                continue;
+        }
+        bool opaque = (word2.w & 1u) != 0;
+        if ((instanceFlags & noorrhi_instance_force_opaque) != 0)
+            opaque = true;
+        if ((instanceFlags & noorrhi_instance_force_no_opaque) != 0)
+            opaque = false;
+        if ((flags & RAY_FLAG_FORCE_OPAQUE) != 0)
+            opaque = true;
+        if ((flags & RAY_FLAG_FORCE_NON_OPAQUE) != 0)
+            opaque = false;
+        if ((flags & RAY_FLAG_CULL_OPAQUE) != 0 && opaque)
+            continue;
+        if ((flags & RAY_FLAG_CULL_NON_OPAQUE) != 0 && !opaque)
+            continue;
+        NoorRHICandidate candidate;
+        candidate.t = t;
+        candidate.barycentrics = float2(u, v);
+        candidate.instanceIndex = instanceRay.item;
+        candidate.instanceId = instanceRay.info.z & 0x00ffffffu;
+        candidate.primitiveIndex = word0.w;
+        candidate.geometryIndex = word1.w;
+        candidate.hitGroupBase = instanceRay.info.w & 0x00ffffffu;
+        candidate.frontFace = frontFace;
+        candidate.objectRayOrigin = instanceRay.origin;
+        candidate.objectRayDirection = instanceRay.direction;
+        const uint verdict = opaque ? noorrhi_verdict_accept : filter.filter(candidate, ray);
+        if (verdict == noorrhi_verdict_ignore)
+            continue;
+        traversal.hit = candidate;
+        traversal.tMax = t;
+        traversal.found = true;
+        if (verdict == noorrhi_verdict_end || (flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) != 0) {
+            traversal.done = true;
+            return;
+        }
+    }
+}
+
+//! Children are visited in the order of their slot index xor the ray octant, which the builder made front to back. A group is a node index above an 8-bit hit mask.
+void noorrhi_traverse_blas<F : INoorRHIHitFilter>(NoorRHIInstanceRay instanceRay, RayDesc ray, uint flags, inout F filter,
+                                                  inout NoorRHITraversal traversal, uint base) {
+    const Ptr<uint4> blas = noorrhi_words(instanceRay.info.x, instanceRay.info.y);
+    const Ptr<uint4> nodes = blas + 4u;
+    const Ptr<uint4> triangles = blas + (blas[0].z >> 4);
+    uint depth = base;
+    uint group = noorrhi_wide_hits(nodes, instanceRay, ray.TMin, traversal.tMax);
+    for (;;) {
+        if ((group & 0xffu) == 0) {
+            if (depth == base)
+                return;
+            group = noorrhi_stack[--depth];
+            continue;
+        }
+        const uint slot = firstbitlow(group) ^ instanceRay.octant;
+        group &= group - 1;
+        const uint descriptor = nodes[(group >> 8) * noorrhi_wide_node_words + 1 + (slot >> 2)][slot & 3];
+        const uint reference = descriptor >> 3;
+        const uint count = descriptor & 7u;
+        if (count == 0) {
+            if ((group & 0xffu) != 0)
+                noorrhi_stack[depth++] = group;
+            group = reference << 8 | noorrhi_wide_hits(nodes + reference * noorrhi_wide_node_words, instanceRay, ray.TMin, traversal.tMax);
+            continue;
+        }
+        noorrhi_test_triangles(triangles, reference, count, instanceRay, ray, flags, filter, traversal);
+        if (traversal.done)
+            return;
+    }
+}
+
+float3 noorrhi_inverse(float3 direction) {
+    return 1.0 / float3(noorrhi_safe(direction.x), noorrhi_safe(direction.y), noorrhi_safe(direction.z));
+}
+
 bool noorrhi_traverse<F : INoorRHIHitFilter>(AccelerationStructureHandle scene, uint flags, uint mask, RayDesc ray, inout F filter,
                                              out NoorRHICandidate hit) {
-    hit = {};
     const Ptr<uint4> tlas = noorrhi_words(scene.low, scene.high);
     const Ptr<uint4> tlasNodes = tlas + 4u;
     const Ptr<uint4> instances = tlas + (tlas[0].z >> 4);
-    const float3 worldInverse = 1.0 / float3(noorrhi_safe(ray.Direction.x), noorrhi_safe(ray.Direction.y), noorrhi_safe(ray.Direction.z));
-    float tMax = ray.TMax;
-    bool found = false;
-    uint stack[noorrhi_stack_size] = {};
+    const float3 worldInverse = noorrhi_inverse(ray.Direction);
+    NoorRHITraversal traversal = {};
+    traversal.tMax = ray.TMax;
     uint depth = 0;
     uint node = 0;
     for (;;) {
@@ -151,8 +385,8 @@ bool noorrhi_traverse<F : INoorRHIHitFilter>(AccelerationStructureHandle scene, 
         const uint4 high1 = entry[3];
         float near0;
         float near1;
-        const bool hit0 = noorrhi_box(low0, high0, ray.Origin, worldInverse, ray.TMin, tMax, near0);
-        const bool hit1 = noorrhi_box(low1, high1, ray.Origin, worldInverse, ray.TMin, tMax, near1);
+        const bool hit0 = noorrhi_box(low0, high0, ray.Origin, worldInverse, ray.TMin, traversal.tMax, near0);
+        const bool hit1 = noorrhi_box(low1, high1, ray.Origin, worldInverse, ray.TMin, traversal.tMax, near1);
         for (uint side = 0; side < 2; ++side) {
             const uint4 low = side == 0 ? low0 : low1;
             const uint4 high = side == 0 ? high0 : high1;
@@ -160,110 +394,20 @@ bool noorrhi_traverse<F : INoorRHIHitFilter>(AccelerationStructureHandle scene, 
                 continue;
             for (uint item = low.w; item < low.w + high.w; ++item) {
                 const Ptr<uint4> instance = instances + item * noorrhi_instance_words;
-                const uint4 info = instance[6];
-                if (((info.z >> 24) & mask) == 0)
+                NoorRHIInstanceRay instanceRay;
+                instanceRay.info = instance[6];
+                if (((instanceRay.info.z >> 24) & mask) == 0)
                     continue;
-                const uint instanceFlags = info.w >> 24;
-                const float3 origin = noorrhi_transform_point(instance, ray.Origin);
-                const float3 direction = noorrhi_transform_vector(instance, ray.Direction);
-                const float3 inverse = 1.0 / float3(noorrhi_safe(direction.x), noorrhi_safe(direction.y), noorrhi_safe(direction.z));
-                const Ptr<uint4> blas = noorrhi_words(info.x, info.y);
-                const Ptr<uint4> blasNodes = blas + 4u;
-                const Ptr<uint4> triangles = blas + (blas[0].z >> 4);
-                const uint base = depth;
-                uint blasNode = 0;
-                for (;;) {
-                    const Ptr<uint4> blasEntry = blasNodes + blasNode * noorrhi_node_words;
-                    const uint4 blasLow0 = blasEntry[0];
-                    const uint4 blasHigh0 = blasEntry[1];
-                    const uint4 blasLow1 = blasEntry[2];
-                    const uint4 blasHigh1 = blasEntry[3];
-                    float blasNear0;
-                    float blasNear1;
-                    const bool blasHit0 = noorrhi_box(blasLow0, blasHigh0, origin, inverse, ray.TMin, tMax, blasNear0);
-                    const bool blasHit1 = noorrhi_box(blasLow1, blasHigh1, origin, inverse, ray.TMin, tMax, blasNear1);
-                    for (uint blasSide = 0; blasSide < 2; ++blasSide) {
-                        const uint4 leafLow = blasSide == 0 ? blasLow0 : blasLow1;
-                        const uint4 leafHigh = blasSide == 0 ? blasHigh0 : blasHigh1;
-                        if (!(blasSide == 0 ? blasHit0 : blasHit1) || leafHigh.w == 0)
-                            continue;
-                        for (uint primitive = leafLow.w; primitive < leafLow.w + leafHigh.w; ++primitive) {
-                            const Ptr<uint4> triangle = triangles + primitive * noorrhi_triangle_words;
-                            const uint4 word0 = triangle[0];
-                            const uint4 word1 = triangle[1];
-                            const uint4 word2 = triangle[2];
-                            const float3 vertex = asfloat(word0.xyz);
-                            const float3 edge1 = asfloat(word1.xyz);
-                            const float3 edge2 = asfloat(word2.xyz);
-                            const float3 p = cross(direction, edge2);
-                            const float determinant = dot(edge1, p);
-                            if (determinant == 0.0)
-                                continue;
-                            const float reciprocal = 1.0 / determinant;
-                            const float3 s = origin - vertex;
-                            const float u = dot(s, p) * reciprocal;
-                            if (u < 0.0 || u > 1.0)
-                                continue;
-                            const float3 q = cross(s, edge1);
-                            const float v = dot(direction, q) * reciprocal;
-                            if (v < 0.0 || u + v > 1.0)
-                                continue;
-                            const float t = dot(edge2, q) * reciprocal;
-                            if (t < ray.TMin || t > tMax)
-                                continue;
-                            const bool frontFace = (determinant > 0.0) != ((instanceFlags & noorrhi_instance_front_counter_clockwise) != 0);
-                            if ((instanceFlags & noorrhi_instance_cull_disable) == 0) {
-                                if ((flags & RAY_FLAG_CULL_BACK_FACING_TRIANGLES) != 0 && !frontFace)
-                                    continue;
-                                if ((flags & RAY_FLAG_CULL_FRONT_FACING_TRIANGLES) != 0 && frontFace)
-                                    continue;
-                            }
-                            bool opaque = (word2.w & 1u) != 0;
-                            if ((instanceFlags & noorrhi_instance_force_opaque) != 0)
-                                opaque = true;
-                            if ((instanceFlags & noorrhi_instance_force_no_opaque) != 0)
-                                opaque = false;
-                            if ((flags & RAY_FLAG_FORCE_OPAQUE) != 0)
-                                opaque = true;
-                            if ((flags & RAY_FLAG_FORCE_NON_OPAQUE) != 0)
-                                opaque = false;
-                            if ((flags & RAY_FLAG_CULL_OPAQUE) != 0 && opaque)
-                                continue;
-                            if ((flags & RAY_FLAG_CULL_NON_OPAQUE) != 0 && !opaque)
-                                continue;
-                            NoorRHICandidate candidate;
-                            candidate.t = t;
-                            candidate.barycentrics = float2(u, v);
-                            candidate.instanceIndex = item;
-                            candidate.primitiveIndex = word0.w;
-                            candidate.geometryIndex = word1.w;
-                            candidate.hitGroupBase = info.w & 0x00ffffffu;
-                            candidate.frontFace = frontFace;
-                            const uint verdict = opaque ? noorrhi_verdict_accept : filter.filter(candidate, ray);
-                            if (verdict == noorrhi_verdict_ignore)
-                                continue;
-                            hit = candidate;
-                            tMax = t;
-                            found = true;
-                            if (verdict == noorrhi_verdict_end || (flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) != 0)
-                                return true;
-                        }
-                    }
-                    const bool inner0 = blasHit0 && blasHigh0.w == 0;
-                    const bool inner1 = blasHit1 && blasHigh1.w == 0;
-                    if (inner0 && inner1) {
-                        const bool secondFirst = blasNear1 < blasNear0;
-                        blasNode = secondFirst ? blasLow1.w : blasLow0.w;
-                        stack[depth++] = secondFirst ? blasLow0.w : blasLow1.w;
-                        continue;
-                    }
-                    if (inner0 || inner1) {
-                        blasNode = inner0 ? blasLow0.w : blasLow1.w;
-                        continue;
-                    }
-                    if (depth == base)
-                        break;
-                    blasNode = stack[--depth];
+                instanceRay.item = item;
+                instanceRay.origin = noorrhi_transform_point(instance, ray.Origin);
+                instanceRay.direction = noorrhi_transform_vector(instance, ray.Direction);
+                instanceRay.inverse = noorrhi_inverse(instanceRay.direction);
+                instanceRay.octant = (instanceRay.direction.x < 0.0 ? 1u : 0u) | (instanceRay.direction.y < 0.0 ? 2u : 0u)
+                                     | (instanceRay.direction.z < 0.0 ? 4u : 0u);
+                noorrhi_traverse_blas(instanceRay, ray, flags, filter, traversal, depth);
+                if (traversal.done) {
+                    hit = traversal.hit;
+                    return true;
                 }
             }
         }
@@ -272,7 +416,7 @@ bool noorrhi_traverse<F : INoorRHIHitFilter>(AccelerationStructureHandle scene, 
         if (inner0 && inner1) {
             const bool secondFirst = near1 < near0;
             node = secondFirst ? low1.w : low0.w;
-            stack[depth++] = secondFirst ? low0.w : low1.w;
+            noorrhi_stack[depth++] = secondFirst ? low0.w : low1.w;
             continue;
         }
         if (inner0 || inner1) {
@@ -281,9 +425,22 @@ bool noorrhi_traverse<F : INoorRHIHitFilter>(AccelerationStructureHandle scene, 
         }
         if (depth == 0)
             break;
-        node = stack[--depth];
+        node = noorrhi_stack[--depth];
     }
-    return found;
+    hit = traversal.hit;
+    return traversal.found;
+}
+
+RayHit noorrhi_ray_hit(NoorRHICandidate candidate) {
+    RayHit hit;
+    hit.t = candidate.t;
+    hit.barycentrics = candidate.barycentrics;
+    hit.instanceIndex = candidate.instanceIndex;
+    hit.instanceId = candidate.instanceId;
+    hit.primitiveIndex = candidate.primitiveIndex;
+    hit.geometryIndex = candidate.geometryIndex;
+    hit.frontFace = candidate.frontFace;
+    return hit;
 }
 
 public bool traceRayInline(AccelerationStructureHandle scene, uint flags, uint mask, RayDesc ray, out RayHit hit) {
@@ -292,14 +449,20 @@ public bool traceRayInline(AccelerationStructureHandle scene, uint flags, uint m
     NoorRHICandidate candidate;
     if (!noorrhi_traverse(scene, flags, mask, ray, filter, candidate))
         return false;
-    const Ptr<uint4> tlas = noorrhi_words(scene.low, scene.high);
-    hit.t = candidate.t;
-    hit.barycentrics = candidate.barycentrics;
-    hit.instanceIndex = candidate.instanceIndex;
-    hit.instanceId = (tlas + (tlas[0].z >> 4) + candidate.instanceIndex * noorrhi_instance_words)[6].z & 0x00ffffffu;
-    hit.primitiveIndex = candidate.primitiveIndex;
-    hit.geometryIndex = candidate.geometryIndex;
-    hit.frontFace = candidate.frontFace;
+    hit = noorrhi_ray_hit(candidate);
+    return true;
+}
+
+public bool traceRayInline<F : IHitFilter>(AccelerationStructureHandle scene, uint flags, uint mask, RayDesc ray, inout F filter, out RayHit hit) {
+    hit = {};
+    NoorRHIPublicFilter<F> adapter;
+    adapter.inner = filter;
+    NoorRHICandidate candidate;
+    const bool found = noorrhi_traverse(scene, flags, mask, ray, adapter, candidate);
+    filter = adapter.inner;
+    if (!found)
+        return false;
+    hit = noorrhi_ray_hit(candidate);
     return true;
 }
 
@@ -372,7 +535,7 @@ BuiltInTriangleIntersectionAttributes noorrhi_set_hit(AccelerationStructureHandl
     const Ptr<uint4> instance = tlas + (tlas[0].z >> 4) + candidate.instanceIndex * noorrhi_instance_words;
     noorrhi_hit.t = candidate.t;
     noorrhi_hit.instanceIndex = candidate.instanceIndex;
-    noorrhi_hit.instanceId = instance[6].z & 0x00ffffffu;
+    noorrhi_hit.instanceId = candidate.instanceId;
     noorrhi_hit.primitiveIndex = candidate.primitiveIndex;
     noorrhi_hit.geometryIndex = candidate.geometryIndex;
     noorrhi_hit.frontFace = candidate.frontFace;

@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SHADER = ROOT / "src/NoorRHI/Shaders/NoorRHIWebGpu.slang"
 HEADER = ROOT / "src/NoorRHI/WebGpu/WebGpuBindings.h"
+FORMATS = ROOT / "cmake/NoorRHIWgslFormats.cmake"
 
 HEAP_BINDING = 0
 ATOMIC_BINDING = 1
@@ -16,10 +17,14 @@ STORAGE_EXTENT_ADDRESS = 256
 STORAGE_LAYER_CAPACITY = 256
 TEXTURE_TABLE_CAPACITY = 65536
 SAMPLER_MODE_SHIFT = 8
+SAMPLER_NEAREST = 1
 
 #! Chrome gives at most 48 sampled textures per stage.
 SAMPLED_POOLS = [("Float", 40, "float4"), ("Unfilterable", 4, "float4"), ("Uint", 4, "uint4")]
-SAMPLER_COUNT = 16
+#! One linear sampler serves every texture, since a switch over samplers would multiply the pool switch that GPU compilers inline at each sample.
+SAMPLER_COUNT = 1
+#! Slang writes no read_write storage texture of these formats, so the WGSL declares them rgba32float.
+WGSL_WIDENED_FORMATS = {"rgba16f": "rgba16float", "r16f": "r16float", "r8": "r8unorm"}
 STORAGE_POOLS = [("Rgba8Unorm", "rgba8", "float4"), ("Rgba16Float", "rgba16f", "float4"), ("R32Float", "r32f", "float4"), ("R32Uint", "r32ui", "uint4"),
                  ("Rgba32Float", "rgba32f", "float4"), ("R16Float", "r16f", "float4"), ("R8Unorm", "r8", "float4")]
 TEXTURE_TABLE_ADDRESS = STORAGE_EXTENT_ADDRESS + len(STORAGE_POOLS) * STORAGE_LAYER_CAPACITY * 8
@@ -68,8 +73,21 @@ def generate_shader():
             lines.append(f"[vk::binding({binding}, 0)] Texture2DArray<{texel}> {pool_name(binding)};")
     for binding in samplers:
         lines.append(f"[vk::binding({binding}, 0)] SamplerState noorrhi_sampler_{binding};")
+    explained = False
     for _, binding, slangFormat, texel in storage:
-        lines.append(f'[format("{slangFormat}")] [vk::binding({binding}, 0)] RWTexture2DArray<{texel}> {pool_name(binding)};')
+        declaration = f'[vk::binding({binding}, 0)] RWTexture2DArray<{texel}> {pool_name(binding)};'
+        if slangFormat not in WGSL_WIDENED_FORMATS:
+            lines.append(f'[format("{slangFormat}")] {declaration}')
+            continue
+        lines.append("#if defined(NOORRHI_WGSL)")
+        if not explained:
+            lines.append("//! Slang writes no read_write rgba16float, r16float or r8unorm storage textures, so these pools are rgba32float here and "
+                         "NoorRHIWgslFormats.cmake restores their formats.")
+            explained = True
+        lines.append(f'[format("rgba32f")] {declaration}')
+        lines.append("#else")
+        lines.append(f'[format("{slangFormat}")] {declaration}')
+        lines.append("#endif")
     lines.append("")
 
     floatPools = sampled[0][1]
@@ -85,23 +103,12 @@ def generate_shader():
             cases.append((binding, f"{{ {dimensions} return {pool_name(binding)}.{call}; }}"))
         return cases
 
-    def by_sampler(name, parameters, arguments):
-        lines.append(f"float4 {name}(uint sampler, uint binding, {parameters}) {{")
-        lines.append(f"    switch (sampler & {(1 << SAMPLER_MODE_SHIFT) - 1}u) {{")
-        for binding in samplers:
-            lines.append(f"    case {binding}: return {name}_pool(binding, noorrhi_sampler_{binding}, {arguments});")
-        lines.append("    default: return float4(0.0);")
-        lines.append("    }")
-        lines.append("}")
-        lines.append("")
-
     location = "float3(texel * scale, layer)"
-    write_switch(lines, "float4 noorrhi_sample_level_pool(uint binding, SamplerState s, float2 texel, float layer, float lod)",
-                 pool_cases(f"SampleLevel(s, {location}, lod)"), "return float4(0.0);", "binding")
-    by_sampler("noorrhi_sample_level", "float2 texel, float layer, float lod", "texel, layer, lod")
-    write_switch(lines, "float4 noorrhi_sample_grad_pool(uint binding, SamplerState s, float2 texel, float layer, float2 dx, float2 dy)",
-                 pool_cases(f"SampleGrad(s, {location}, dx * scale, dy * scale)"), "return float4(0.0);", "binding")
-    by_sampler("noorrhi_sample_grad", "float2 texel, float layer, float2 dx, float2 dy", "texel, layer, dx, dy")
+    sampler = f"noorrhi_sampler_{samplers[0]}"
+    write_switch(lines, "float4 noorrhi_sample_level(uint binding, float2 texel, float layer, float lod)",
+                 pool_cases(f"SampleLevel({sampler}, {location}, lod)"), "return float4(0.0);", "binding")
+    write_switch(lines, "float4 noorrhi_sample_grad(uint binding, float2 texel, float layer, float2 dx, float2 dy)",
+                 pool_cases(f"SampleGrad({sampler}, {location}, dx * scale, dy * scale)"), "return float4(0.0);", "binding")
 
     load = "Load(int4(coord, layer, mip))"
     write_switch(lines, "float4 noorrhi_load_pool(uint binding, int2 coord, int layer, int mip)",
@@ -127,6 +134,7 @@ def generate_shader():
     lines.append("")
     lines.append(f"static const uint noorrhi_texture_table = {TEXTURE_TABLE_ADDRESS}u;")
     lines.append(f"static const uint noorrhi_sampler_mode_shift = {SAMPLER_MODE_SHIFT}u;")
+    lines.append(f"static const uint noorrhi_sampler_nearest = {SAMPLER_NEAREST}u;")
     return "\n".join(lines) + "\n"
 
 
@@ -145,6 +153,7 @@ def generate_header():
     lines.append(f"inline constexpr std::uint64_t textureTableAddress = {TEXTURE_TABLE_ADDRESS};")
     lines.append(f"inline constexpr std::uint32_t textureTableCapacity = {TEXTURE_TABLE_CAPACITY};")
     lines.append(f"inline constexpr std::uint32_t samplerModeShift = {SAMPLER_MODE_SHIFT};")
+    lines.append(f"inline constexpr std::uint32_t samplerNearest = {SAMPLER_NEAREST};")
     lines.append(f"inline constexpr std::uint32_t bindingCount = {end};")
     lines.append("")
     lines.append("enum class PoolKind : std::uint8_t { " + ", ".join(kind for kind, _, _ in SAMPLED_POOLS) + " };")
@@ -165,6 +174,23 @@ def generate_header():
     return "\n".join(lines) + "\n"
 
 
+def generate_formats():
+    _, _, storage, _ = assign_bindings()
+    pools = " ".join(f'"{binding}:{WGSL_WIDENED_FORMATS[slangFormat]}"' for _, binding, slangFormat, _ in storage if slangFormat in WGSL_WIDENED_FORMATS)
+    lines = ["#! Generated by tools/generate_webgpu_bindings.py; runs with cmake -P on FILE, a WGSL module from slangc, and gives the storage pools that "
+             "NoorRHIWebGpu.slang declares as rgba32float their real formats.",
+             'file(READ "${FILE}" text)',
+             f"foreach(pool IN ITEMS {pools})",
+             '    string(REPLACE ":" ";" pool "${pool}")',
+             "    list(GET pool 0 binding)",
+             "    list(GET pool 1 format)",
+             '    string(REGEX REPLACE "(noorrhi_pool_${binding}_[0-9]+ : texture_storage_2d_array<)rgba32float" "\\\\1${format}" text "${text}")',
+             "endforeach()",
+             'file(WRITE "${FILE}" "${text}")']
+    return "\n".join(lines) + "\n"
+
+
 SHADER.write_text(generate_shader())
+FORMATS.write_text(generate_formats())
 HEADER.parent.mkdir(parents=True, exist_ok=True)
 HEADER.write_text(generate_header())

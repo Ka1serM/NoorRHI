@@ -157,12 +157,25 @@ float noorrhi_wrap(float value, uint mode) {
     return saturate(value);
 }
 
+//! The one WebGPU sampler is linear, so a nearest sample reads a texel centre of the nearest level, where linear filtering returns that texel. Each method
+//! ends in a single pool switch, because GPU compilers inline a copy of the switch at every sample.
+float2 noorrhi_nearest_texel(NoorRHITexture texture, uint sampler, float2 uv, inout float level) {
+    level = clamp(floor(level + 0.5), 0.0, texture.maxLod);
+    float scale = exp2(level);
+    return (floor(texture.getTexel(sampler, uv, level) / scale) + 0.5) * scale;
+}
+
 public struct TextureHandle {
     public uint value;
     public float4 SampleLevel(SamplerHandle sampler, float2 uv, float lod) {
         NoorRHITexture texture = NoorRHITexture(value);
         float level = min(lod, texture.maxLod);
-        return noorrhi_sample_level(sampler.value, texture.binding, texture.getTexel(sampler.value, uv, level), float(texture.layer), level);
+        float2 texel;
+        if ((sampler.value & noorrhi_sampler_nearest) != 0u)
+            texel = noorrhi_nearest_texel(texture, sampler.value, uv, level);
+        else
+            texel = texture.getTexel(sampler.value, uv, level);
+        return noorrhi_sample_level(texture.binding, texel, float(texture.layer), level);
     }
     public float4 SampleGrad(SamplerHandle sampler, float2 uv, float2 ddx, float2 ddy) {
         NoorRHITexture texture = NoorRHITexture(value);
@@ -170,13 +183,21 @@ public struct TextureHandle {
         float2 dx = ddx * extent;
         float2 dy = ddy * extent;
         float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-20));
-        if (lod > texture.maxLod) {
-            float shrink = exp2(texture.maxLod - lod);
-            dx *= shrink;
-            dy *= shrink;
-            lod = texture.maxLod;
+        float2 texel;
+        if ((sampler.value & noorrhi_sampler_nearest) != 0u) {
+            texel = noorrhi_nearest_texel(texture, sampler.value, uv, lod);
+            dx = float2(exp2(lod), 0.0);
+            dy = float2(0.0, exp2(lod));
+        } else {
+            if (lod > texture.maxLod) {
+                float shrink = exp2(texture.maxLod - lod);
+                dx *= shrink;
+                dy *= shrink;
+                lod = texture.maxLod;
+            }
+            texel = texture.getTexel(sampler.value, uv, lod);
         }
-        return noorrhi_sample_grad(sampler.value, texture.binding, texture.getTexel(sampler.value, uv, lod), float(texture.layer), dx, dy);
+        return noorrhi_sample_grad(texture.binding, texel, float(texture.layer), dx, dy);
     }
     public float4 Sample(SamplerHandle sampler, float2 uv) { return SampleGrad(sampler, uv, ddx(uv), ddy(uv)); }
     public float4 Load(int2 coord, int mip = 0) {

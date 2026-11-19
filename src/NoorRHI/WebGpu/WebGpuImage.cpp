@@ -1,3 +1,4 @@
+#include <array>
 #include <bit>
 #include <cstring>
 
@@ -157,16 +158,16 @@ std::expected<void, Error> Image::open(Device& device, const ImageDesc& desc) {
 
 namespace Backend {
 
-std::expected<void, Error> WebGpuImage::upload(const std::span<const std::byte> mipChain) {
+std::expected<void, Error> WebGpuImage::upload(const std::span<const std::byte> levels, const std::uint32_t levelCount) {
     const FormatInfo info = getFormatInfo(format);
     std::lock_guard lock(device->mutex);
     std::vector<TextureRegion> regions{device->getPrimary(*this)};
     if (isShadowed())
         regions.push_back(device->getSampled(*this));
-    const std::uint32_t levels = sampled.binding != 0 ? sampled.levels : mipLevels;
+    const std::uint32_t available = sampled.binding != 0 ? sampled.levels : mipLevels;
     for (const TextureRegion& region : regions) {
         std::size_t offset = 0;
-        for (std::uint32_t level = 0; level < levels; ++level) {
+        for (std::uint32_t level = 0; level < std::min(levelCount, available); ++level) {
             const std::uint32_t levelWidth = std::max(width >> level, 1u);
             const std::uint32_t levelHeight = std::max(height >> level, 1u);
             const std::uint32_t columns = (levelWidth + info.blockExtent - 1) / info.blockExtent;
@@ -176,11 +177,63 @@ std::expected<void, Error> WebGpuImage::upload(const std::span<const std::byte> 
                 .texture = region.texture, .mipLevel = level, .origin = {region.x >> level, region.y >> level, region.layer}};
             const wgpu::TexelCopyBufferLayout layout{.offset = 0, .bytesPerRow = columns * info.blockBytes, .rowsPerImage = rows};
             const wgpu::Extent3D extent{columns * info.blockExtent, rows * info.blockExtent, 1};
-            device->queue.WriteTexture(&destination, mipChain.data() + offset, bytes, &layout, &extent);
+            device->queue.WriteTexture(&destination, levels.data() + offset, bytes, &layout, &extent);
             offset += bytes;
         }
     }
+    if (levelCount < available)
+        if (std::expected<void, Error> generated = generateLevels(regions.front(), levelCount, available); !generated)
+            return generated;
     return device->takeError();
+}
+
+std::expected<void, Error> WebGpuImage::generateLevels(const TextureRegion& region, const std::uint32_t firstLevel, const std::uint32_t levelCount) {
+    if (!device->isRenderable(format))
+        return fail(ErrorCode::Unsupported, "the WebGPU device cannot render this format to generate mip levels");
+    std::expected<wgpu::RenderPipeline, Error> pipeline = device->getMipPipeline(nativeFormat);
+    if (!pipeline)
+        return std::unexpected(std::move(pipeline.error()));
+    constexpr std::uint32_t originStride = 256;
+    const wgpu::BufferDescriptor originDescriptor{
+        .usage = wgpu::BufferUsage::Uniform, .size = std::uint64_t{originStride} * levelCount, .mappedAtCreation = true};
+    const wgpu::Buffer originBuffer = device->device.CreateBuffer(&originDescriptor);
+    auto* mapped = static_cast<std::byte*>(originBuffer.GetMappedRange());
+    for (std::uint32_t level = firstLevel; level < levelCount; ++level) {
+        const std::array origins{region.x >> level, region.y >> level, region.x >> (level - 1), region.y >> (level - 1),
+                                 std::max(width >> (level - 1), 1u) - 1, std::max(height >> (level - 1), 1u) - 1, 0u, 0u};
+        std::memcpy(mapped + std::size_t{originStride} * level, origins.data(), sizeof(origins));
+    }
+    originBuffer.Unmap();
+    const auto createLevelView = [&](const std::uint32_t level) {
+        const wgpu::TextureViewDescriptor descriptor{.format = nativeFormat,
+                                                     .dimension = wgpu::TextureViewDimension::e2D,
+                                                     .baseMipLevel = level,
+                                                     .mipLevelCount = 1,
+                                                     .baseArrayLayer = region.layer,
+                                                     .arrayLayerCount = 1};
+        return region.texture.CreateView(&descriptor);
+    };
+    const wgpu::CommandEncoder encoder = device->device.CreateCommandEncoder();
+    for (std::uint32_t level = firstLevel; level < levelCount; ++level) {
+        const std::array entries{wgpu::BindGroupEntry{.binding = 0, .textureView = createLevelView(level - 1)},
+                                 wgpu::BindGroupEntry{.binding = 1, .buffer = originBuffer, .offset = std::uint64_t{originStride} * level, .size = 32}};
+        const wgpu::BindGroupDescriptor groupDescriptor{.layout = device->mipGroupLayout, .entryCount = entries.size(), .entries = entries.data()};
+        const wgpu::RenderPassColorAttachment attachment{.view = createLevelView(level), .loadOp = wgpu::LoadOp::Load, .storeOp = wgpu::StoreOp::Store};
+        const wgpu::RenderPassDescriptor descriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+        const std::uint32_t levelWidth = std::max(width >> level, 1u);
+        const std::uint32_t levelHeight = std::max(height >> level, 1u);
+        const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&descriptor);
+        pass.SetPipeline(*pipeline);
+        pass.SetBindGroup(0, device->device.CreateBindGroup(&groupDescriptor));
+        pass.SetViewport(static_cast<float>(region.x >> level), static_cast<float>(region.y >> level), static_cast<float>(levelWidth),
+                         static_cast<float>(levelHeight), 0, 1);
+        pass.SetScissorRect(region.x >> level, region.y >> level, levelWidth, levelHeight);
+        pass.Draw(3);
+        pass.End();
+    }
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    device->queue.Submit(1, &commands);
+    return {};
 }
 
 std::expected<void, Error> WebGpuImage::download(const std::uint32_t x, const std::uint32_t y, const std::uint32_t regionWidth,

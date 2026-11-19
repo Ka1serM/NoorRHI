@@ -31,12 +31,17 @@ std::expected<void, Error> Backend::checkImageDesc(const ImageDesc& desc) {
     return {};
 }
 
-std::expected<void, Error> Image::upload(const std::span<const std::byte> mipChain) {
-    if (!backend || mipChain.size() != getByteSize())
-        return fail(ErrorCode::InvalidArgument, "the upload must hold the whole mip chain of the image");
-    if (samples > 1 || getFormatInfo(format).depth)
+std::expected<void, Error> Image::upload(const std::span<const std::byte> pixels) {
+    const bool baseLevel = pixels.size() == getLevelByteSize(format, width, height);
+    if (!backend || (!baseLevel && pixels.size() != getByteSize()))
+        return fail(ErrorCode::InvalidArgument, "the upload must hold the base level or the whole mip chain of the image");
+    const FormatInfo info = getFormatInfo(format);
+    if (samples > 1 || info.depth)
         return fail(ErrorCode::InvalidArgument, "multisampled and depth images take no uploads");
-    return backend->upload(mipChain);
+    const std::uint32_t levels = baseLevel ? 1 : mipLevels;
+    if (levels < mipLevels && (info.blockExtent > 1 || info.integer))
+        return fail(ErrorCode::InvalidArgument, "block-compressed and integer images upload their whole mip chain");
+    return backend->upload(pixels, levels);
 }
 
 std::expected<void, Error> Image::download(const std::span<std::byte> destination) const {

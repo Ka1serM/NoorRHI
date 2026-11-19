@@ -328,7 +328,7 @@ AccelerationStructureResult buildHardwareBlas(NoorRHI::Device& device, const std
                                                                           static_cast<std::uint32_t>(vertexCount - 1), vk::IndexType::eUint32,
                                                                           item.indices.getAddress());
         geometries.emplace_back(vk::GeometryTypeKHR::eTriangles, triangles,
-                                item.opaque ? vk::GeometryFlagBitsKHR::eOpaque : vk::GeometryFlagBitsKHR::eNoDuplicateAnyHitInvocation);
+                                item.opaque ? vk::GeometryFlagBitsKHR::eOpaque : vk::GeometryFlagsKHR{});
         primitiveCounts.push_back(item.triangleCount);
     }
 

@@ -31,6 +31,7 @@ static_assert(sizeof(RayLaunch) == 48);
 
 constexpr std::uint32_t headerWords = 4;
 constexpr std::uint32_t nodeWords = 4;
+constexpr std::uint32_t wideNodeWords = 6;
 constexpr std::uint32_t triangleWords = 3;
 constexpr std::uint32_t instanceWords = 7;
 constexpr std::uint32_t recordWords = 4;
@@ -38,6 +39,7 @@ constexpr std::uint32_t buildGroupSize = 128;
 constexpr std::uint32_t radixPasses = 8;
 constexpr std::uint32_t radixBits = 4;
 constexpr std::uint32_t maxPrimitives = 1u << 22;
+constexpr std::uint32_t boundsWords = 12;
 constexpr std::uint32_t noShader = 0xffffffffu;
 constexpr DispatchSize raygenGroupSize{8, 8, 1};
 
@@ -47,17 +49,31 @@ std::uint32_t getWords(const std::uint32_t values) {
 
 struct BuildLayout {
     BuildLayout() = default;
+    //! A wide node with i inner children has 8 - i leaf slots and a wide leaf covers 4+ triangles: 1 + 2 * count / 7 nodes.
     BuildLayout(const std::uint32_t count, const bool topLevel)
         : count(count), topLevel(topLevel), leafBase(std::bit_ceil(count)), blockCount((count + buildGroupSize - 1) / buildGroupSize),
-          primitiveOffset(headerWords + (std::max(count, 2u) - 1) * nodeWords) {
+          primitiveOffset(headerWords + (topLevel ? (std::max(count, 2u) - 1) * nodeWords : (1 + 2 * count / 7) * wideNodeWords)) {
         leafBoxes = count * (topLevel ? recordWords : triangleWords);
         tree = leafBoxes + count * 2;
-        keys = tree + leafBase * 4;
+        keys = tree + (topLevel ? leafBase * 4 : 0);
         values = keys + getWords(count);
         sortedKeys = values + getWords(count);
         sortedValues = sortedKeys + getWords(count);
         histogram = sortedValues + getWords(count);
-        scratchWords = histogram + getWords(blockCount * 16);
+        nodes = histogram + getWords(blockCount * 16);
+        if (topLevel) {
+            scratchWords = nodes;
+            return;
+        }
+        const std::uint32_t nodeCount = 2 * count - 1;
+        nodeCounts = nodes + nodeCount * 2;
+        clusters = nodeCounts + getWords(nodeCount);
+        neighbors = clusters + getWords(count * 2);
+        slots = neighbors + getWords(count);
+        blockSums = slots + getWords(count);
+        state = blockSums + getWords(blockCount);
+        pending = state + getWords(RayTracingBuild::stateWords);
+        scratchWords = pending + getWords(count);
     }
 
     std::uint32_t getStorageWords() const { return primitiveOffset + count * (topLevel ? instanceWords : triangleWords); }
@@ -74,6 +90,14 @@ struct BuildLayout {
     std::uint32_t sortedKeys = 0;
     std::uint32_t sortedValues = 0;
     std::uint32_t histogram = 0;
+    std::uint32_t nodes = 0;
+    std::uint32_t nodeCounts = 0;
+    std::uint32_t clusters = 0;
+    std::uint32_t neighbors = 0;
+    std::uint32_t slots = 0;
+    std::uint32_t blockSums = 0;
+    std::uint32_t state = 0;
+    std::uint32_t pending = 0;
     std::uint32_t scratchWords = 0;
 };
 
@@ -90,6 +114,15 @@ struct Backend::SoftwareBuildKernels {
     NoorRHI::ComputePipeline placeLeaves;
     NoorRHI::ComputePipeline reduceTreeLevel;
     NoorRHI::ComputePipeline writeNodes;
+    NoorRHI::ComputePipeline beginClusters;
+    NoorRHI::ComputePipeline findNeighbors;
+    NoorRHI::ComputePipeline mergeClusters;
+    NoorRHI::ComputePipeline scanClusters;
+    NoorRHI::ComputePipeline compactClusters;
+    NoorRHI::ComputePipeline finishClusters;
+    NoorRHI::ComputePipeline beginCollapse;
+    NoorRHI::ComputePipeline collapseNodes;
+    NoorRHI::ComputePipeline prepareCollapse;
 };
 
 namespace {
@@ -100,7 +133,7 @@ std::expected<std::shared_ptr<const Backend::SoftwareBuildKernels>, Error> getBu
     if (std::shared_ptr<const Backend::SoftwareBuildKernels> existing = owner.softwareBuildKernels.lock())
         return existing;
     auto kernels = std::make_shared<Backend::SoftwareBuildKernels>();
-    const std::array<std::pair<ComputePipeline Backend::SoftwareBuildKernels::*, const Shader*>, 10> shaders{{
+    const std::array<std::pair<ComputePipeline Backend::SoftwareBuildKernels::*, const Shader*>, 19> shaders{{
         {&Backend::SoftwareBuildKernels::resetBounds, &RayTracingBuild::resetBounds},
         {&Backend::SoftwareBuildKernels::gatherTriangles, &RayTracingBuild::gatherTriangles},
         {&Backend::SoftwareBuildKernels::prepareInstances, &RayTracingBuild::prepareInstances},
@@ -111,6 +144,15 @@ std::expected<std::shared_ptr<const Backend::SoftwareBuildKernels>, Error> getBu
         {&Backend::SoftwareBuildKernels::placeLeaves, &RayTracingBuild::placeLeaves},
         {&Backend::SoftwareBuildKernels::reduceTreeLevel, &RayTracingBuild::reduceTreeLevel},
         {&Backend::SoftwareBuildKernels::writeNodes, &RayTracingBuild::writeNodes},
+        {&Backend::SoftwareBuildKernels::beginClusters, &RayTracingBuild::beginClusters},
+        {&Backend::SoftwareBuildKernels::findNeighbors, &RayTracingBuild::findNeighbors},
+        {&Backend::SoftwareBuildKernels::mergeClusters, &RayTracingBuild::mergeClusters},
+        {&Backend::SoftwareBuildKernels::scanClusters, &RayTracingBuild::scanClusters},
+        {&Backend::SoftwareBuildKernels::compactClusters, &RayTracingBuild::compactClusters},
+        {&Backend::SoftwareBuildKernels::finishClusters, &RayTracingBuild::finishClusters},
+        {&Backend::SoftwareBuildKernels::beginCollapse, &RayTracingBuild::beginCollapse},
+        {&Backend::SoftwareBuildKernels::collapseNodes, &RayTracingBuild::collapseNodes},
+        {&Backend::SoftwareBuildKernels::prepareCollapse, &RayTracingBuild::prepareCollapse},
     }};
     for (const auto& [member, shader] : shaders)
         if (std::expected<void, Error> opened = ((*kernels).*member).open(device, *shader); !opened)
@@ -147,7 +189,7 @@ struct SoftwareAccelerationStructure final : Backend::AccelerationStructure {
             return fail(ErrorCode::InvalidState, "refit needs a BLAS built with BuildMode::Dynamic");
         BuildRecorder recorder(device);
         recordGather(recorder);
-        recordHierarchy(recorder, getArguments());
+        recordClusters(recorder);
         return recorder.submit(device);
     }
 
@@ -180,7 +222,7 @@ struct SoftwareAccelerationStructure final : Backend::AccelerationStructure {
             return opened;
         if (std::expected<void, Error> opened = scratch.open(device, layout.scratchWords); !opened)
             return opened;
-        if (std::expected<void, Error> opened = bounds.open(device, 6); !opened)
+        if (std::expected<void, Error> opened = bounds.open(device, boundsWords); !opened)
             return opened;
         address = storage.getPtr().getAddress();
         return {};
@@ -207,11 +249,35 @@ struct SoftwareAccelerationStructure final : Backend::AccelerationStructure {
                 layout.count,
                 layout.leafBase,
                 layout.primitiveOffset,
-                layout.topLevel ? 1u : 0u,
                 0,
                 layout.blockCount,
                 0,
                 0};
+    }
+
+    RayTracingBuild::ClusterArguments getClusterArguments(const std::uint32_t round) const {
+        const Ptr<Word> base = scratch.getPtr();
+        return {storage.getPtr().as<NoorRHI::uint4>(),
+                base.as<NoorRHI::uint4>(),
+                (base + layout.leafBoxes).as<NoorRHI::float4>(),
+                (base + layout.values).as<std::uint32_t>(),
+                (base + layout.nodes).as<NoorRHI::uint4>(),
+                (base + layout.nodeCounts).as<std::uint32_t>(),
+                (base + layout.clusters).as<std::uint32_t>(),
+                (base + layout.neighbors).as<std::uint32_t>(),
+                (base + layout.slots).as<std::uint32_t>(),
+                (base + layout.blockSums).as<std::uint32_t>(),
+                (base + layout.state).as<std::uint32_t>(),
+                (base + layout.pending).as<std::uint32_t>(),
+                bounds.getPtr(),
+                layout.count,
+                layout.primitiveOffset,
+                round,
+                round >= RayTracingBuild::clusterRounds ? 1u : 0u};
+    }
+
+    Ptr<DispatchSize> getStateSize(const std::uint32_t offset) const {
+        return ((scratch.getPtr() + layout.state).as<std::uint32_t>() + offset).as<DispatchSize>();
     }
 
     void recordGather(BuildRecorder& recorder) const {
@@ -248,13 +314,35 @@ struct SoftwareAccelerationStructure final : Backend::AccelerationStructure {
         recorder.dispatch(kernels->writeNodes, std::max(layout.count, 2u) - 1, arguments);
     }
 
+    void recordClusters(BuildRecorder& recorder) const {
+        recorder.dispatch(kernels->beginClusters, layout.count, getClusterArguments(0));
+        constexpr std::uint32_t rounds = RayTracingBuild::clusterRounds + RayTracingBuild::pairingRounds;
+        for (std::uint32_t round = 0; round < rounds; ++round) {
+            const RayTracingBuild::ClusterArguments arguments = getClusterArguments(round);
+            const Ptr<DispatchSize> groups = getStateSize(RayTracingBuild::stateRoundSizes + (round & 1) * 4);
+            recorder.getList().dispatchIndirect(kernels->findNeighbors, groups, arguments);
+            recorder.getList().dispatchIndirect(kernels->mergeClusters, groups, arguments);
+            recorder.dispatch(kernels->scanClusters, buildGroupSize, arguments);
+            recorder.getList().dispatchIndirect(kernels->compactClusters, groups, arguments);
+        }
+        recorder.dispatch(kernels->finishClusters, buildGroupSize, getClusterArguments(rounds));
+        const RayTracingBuild::ClusterArguments arguments = getClusterArguments(0);
+        const Ptr<DispatchSize> groups = getStateSize(RayTracingBuild::stateWideSize);
+        recorder.dispatch(kernels->beginCollapse, 1, arguments);
+        //! A merge in round r makes a node at most r + 1 levels high, and each collapse round makes one wide level.
+        for (std::uint32_t round = 0; round <= RayTracingBuild::clusterLevels; ++round) {
+            recorder.getList().dispatchIndirect(kernels->collapseNodes, groups, arguments);
+            recorder.dispatch(kernels->prepareCollapse, 1, arguments);
+        }
+    }
+
     std::expected<void, Error> buildBottom() {
         BuildRecorder recorder(device);
         const RayTracingBuild::BuildArguments arguments = getArguments();
         recorder.dispatch(kernels->resetBounds, 1, arguments);
         recordGather(recorder);
         recordSort(recorder, arguments);
-        recordHierarchy(recorder, arguments);
+        recordClusters(recorder);
         return recorder.submit(device);
     }
 

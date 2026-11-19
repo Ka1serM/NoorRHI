@@ -14,6 +14,7 @@ set(NOORRHI_SHADER_HEADER_SCRIPT "${noorrhi_cmake_dir}/NoorRHIShaderHeader.cmake
 find_program(NOORRHI_SLANGC slangc HINTS "$ENV{VULKAN_SDK}/bin" REQUIRED)
 
 set(NOORRHI_FALLBACK_SCRIPT "${noorrhi_cmake_dir}/NoorRHIRayTracingFallback.cmake" CACHE INTERNAL "")
+set(NOORRHI_WGSL_FORMATS_SCRIPT "${noorrhi_cmake_dir}/NoorRHIWgslFormats.cmake" CACHE INTERNAL "")
 
 #! Compiles one Slang source to one module and adds it to the embedded data of the shader target.
 function(noorrhi_compile_module source module reflection symbol)
@@ -26,11 +27,16 @@ function(noorrhi_compile_module source module reflection symbol)
         message(FATAL_ERROR "noorrhi_add_shaders: ${module} contains a quote or backslash")
     endif()
     get_filename_component(depfile "${module}" NAME)
+    set(formats "")
+    if(module MATCHES "\\.wgsl$")
+        set(formats COMMAND "${CMAKE_COMMAND}" "-DFILE=${module}" -P "${NOORRHI_WGSL_FORMATS_SCRIPT}")
+    endif()
     add_custom_command(OUTPUT "${module}" "${reflection}"
                        COMMAND "${CMAKE_COMMAND}" -E make_directory "${output}"
                        COMMAND "${NOORRHI_SLANGC}" "${source}" ${compile_FLAGS} -I "${directory}" -I "${shaders}" -I "${NOORRHI_SOURCE_DIR}"
                                -matrix-layout-row-major -o "${module}" -reflection-json "${reflection}" -depfile "${output}/${depfile}.d"
-                       DEPENDS "${source}" ${compile_DEPENDS} "${shaders}/NoorRHI.slang" "${shaders}/NoorRHIWebGpu.slang" "${shaders}/NoorRHIRayTracing.slang"
+                       ${formats}
+                       DEPENDS "${source}" ${compile_DEPENDS} "${NOORRHI_WGSL_FORMATS_SCRIPT}" "${shaders}/NoorRHI.slang" "${shaders}/NoorRHIWebGpu.slang" "${shaders}/NoorRHIRayTracing.slang"
                        DEPFILE "${output}/${depfile}.d"
                        VERBATIM)
     set(modules ${modules} "${module}" PARENT_SCOPE)
@@ -61,21 +67,29 @@ ${symbol}_size:
 " PARENT_SCOPE)
 endfunction()
 
-#! Compiles each Slang source, embeds the modules, and generates <name>.slang.h with a NoorRHI::Shader for each entry point. A source with ray tracing or cooperative matrices also gets modules for the fallbacks, and Shader::getCode chooses one when the pipeline opens.
+#! Compiles each Slang source, embeds the modules, and generates <name>.slang.h with a NoorRHI::Shader for each entry point. A source with ray tracing or cooperative matrices also gets modules for the fallbacks, and Shader::getCode chooses one when the pipeline opens. RAY_QUERIES marks every source as a traceRayInline user, for entry files that only import the tracing code.
 function(noorrhi_compile_shaders target)
-    #! The WebGPU backend translates SPIR-V 1.3 to WGSL when a pipeline opens, because the Tint SPIR-V reader reads at most SPIR-V 1.3.
+    cmake_parse_arguments(PARSE_ARGV 1 shaders "RAY_QUERIES" "" "INCLUDES")
+    #! The WebGPU backend embeds WGSL from slangc, so no pipeline translates shaders when it opens.
     set(extension .spv)
     if(NOORRHI_BACKEND STREQUAL "WebGpu")
-        set(flags -target spirv -profile spirv_1_3 -fvk-use-entrypoint-name -DNOORRHI_WEBGPU)
+        set(extension .wgsl)
+        set(target_flags -target wgsl -DNOORRHI_WGSL)
+        set(flags -fvk-use-entrypoint-name -DNOORRHI_WEBGPU)
     else()
-        set(flags -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -bindless-space-index 0 -Wno-41012)
+        set(target_flags -target spirv -profile spirv_1_5)
+        set(flags -fvk-use-entrypoint-name -bindless-space-index 0 -Wno-41012)
     endif()
+    foreach(directory IN LISTS shaders_INCLUDES)
+        cmake_path(ABSOLUTE_PATH directory NORMALIZE)
+        list(APPEND flags -I "${directory}")
+    endforeach()
     set(output "${CMAKE_CURRENT_BINARY_DIR}/${target}")
     set(headers "")
     set(modules "")
     set(data "")
     set(functions "")
-    foreach(source IN LISTS ARGN)
+    foreach(source IN LISTS shaders_UNPARSED_ARGUMENTS)
         cmake_path(ABSOLUTE_PATH source NORMALIZE)
         cmake_path(GET source STEM name)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}")
@@ -88,7 +102,7 @@ function(noorrhi_compile_shaders target)
         set(ray_tracing "")
         if(text MATCHES "\\[shader\\(\"(raygeneration|miss|closesthit|anyhit|intersection|callable)\"\\)\\]")
             set(ray_tracing pipeline)
-        elseif(text MATCHES "traceRayInline")
+        elseif(shaders_RAY_QUERIES OR text MATCHES "traceRayInline")
             set(ray_tracing inline)
         endif()
         set(matrices OFF)
@@ -138,7 +152,7 @@ function(noorrhi_compile_shaders target)
                 list(APPEND variant_flags -DNOORRHI_MATRIX_FALLBACK)
             endif()
             noorrhi_compile_module("${variant_source}" "${output}/${name}.${variant}${extension}" "${output}/${name}.${variant}.json" "${symbol}_${variant}"
-                                   FLAGS ${variant_flags} DEPENDS ${variant_depends})
+                                   FLAGS ${target_flags} ${variant_flags} DEPENDS ${variant_depends})
             list(APPEND header_depends "${output}/${name}.${variant}${extension}")
         endforeach()
         if(NOT ray_tracing STREQUAL "pipeline")

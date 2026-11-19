@@ -17,7 +17,8 @@ RayDesc makeBenchRay(uint2 pixel, Bench::TraceArguments arguments) {
     ray.TMax = 100.0f;
     if (arguments.incoherent != 0u) {
         const uint seed = (pixel.y * arguments.width + pixel.x) * 4u;
-        ray.Origin = float3(randomBench(seed) * arguments.extent, 0.3f + randomBench(seed + 1u) * 0.7f, randomBench(seed + 2u) * arguments.extent);
+        const float3 cell = float3(randomBench(seed), randomBench(seed + 1u), randomBench(seed + 2u));
+        ray.Origin = arguments.originLow.xyz + cell * (arguments.originHigh.xyz - arguments.originLow.xyz);
         const float z = randomBench(seed + 3u) * 2.0f - 1.0f;
         const float angle = randomBench(seed ^ 0x9e3779b9u) * 6.2831853f;
         const float radius = sqrt(max(0.0f, 1.0f - z * z));
@@ -25,11 +26,11 @@ RayDesc makeBenchRay(uint2 pixel, Bench::TraceArguments arguments) {
         return ray;
     }
     const float2 uv = (float2(pixel) + 0.5f) / float2(float(arguments.width), float(arguments.height)) * 2.0f - 1.0f;
-    const float3 forward = normalize(float3(0.0f, -0.35f, 1.0f));
-    const float3 right = float3(1.0f, 0.0f, 0.0f);
+    const float3 forward = normalize(arguments.forward.xyz);
+    const float3 right = normalize(cross(float3(0.0f, 1.0f, 0.0f), forward));
     const float3 up = cross(forward, right);
     const float aspect = float(arguments.width) / float(arguments.height);
-    ray.Origin = float3(arguments.extent * 0.5f, 1.5f, -1.0f);
+    ray.Origin = arguments.eye.xyz;
     ray.Direction = normalize(forward + right * (uv.x * aspect * 0.6f) - up * (uv.y * 0.6f));
     return ray;
 }

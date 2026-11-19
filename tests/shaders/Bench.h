@@ -27,10 +27,14 @@ struct DrawArguments {
 struct TraceArguments {
     Ptr<float> result;
     AccelerationStructureHandle scene;
+    float4 eye;
+    float4 forward;
+    float4 originLow;
+    float4 originHigh;
     uint width;
     uint height;
     uint incoherent;
-    float extent;
+    uint padding;
 };
 
 }

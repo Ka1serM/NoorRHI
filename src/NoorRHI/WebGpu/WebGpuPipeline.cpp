@@ -1,10 +1,9 @@
-#include <cstring>
+#include <string>
 #include <vector>
 
 #include "NoorRHI/Device/Device.h"
 #include "NoorRHI/Pipelines/Pipeline.h"
-#include "NoorRHI/Shaders/SpirvModule.h"
-#include "NoorRHI/Shaders/WgslTranslator.h"
+#include "NoorRHI/Shaders/WgslModule.h"
 #include "NoorRHI/WebGpu/WebGpu.h"
 
 namespace NoorRHI {
@@ -12,7 +11,7 @@ namespace NoorRHI {
 namespace {
 
 //! The device declares only the float pools that its limits allow, so the other float pools move onto the first one.
-std::expected<void, Error> moveFloatPools(SpirvModule& module, const Backend::PoolBindings used) {
+std::expected<void, Error> moveFloatPools(WgslModule& module, const Backend::PoolBindings used) {
     const Backend::PoolBindings declared = Backend::sampledPoolBindings[static_cast<std::size_t>(Backend::PoolKind::Float)];
     for (std::uint32_t binding = used.first + used.count; binding < declared.first + declared.count; ++binding)
         if (std::expected<void, Error> moved = module.moveBinding(0, binding, declared.first); !moved)
@@ -86,34 +85,37 @@ std::expected<void, Error> asShaderError(std::expected<void, Error> result) {
     return result;
 }
 
-std::expected<wgpu::ShaderModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
+struct CompiledModule {
+    wgpu::ShaderModule module;
+    Backend::BindingSet bindings;
+};
+
+std::expected<CompiledModule, Error> createModule(Backend::WebGpuDevice& owner, const Shader& shader) {
     const std::span<const std::byte> code = shader.getCode(false, false);
-    if (code.size() % sizeof(std::uint32_t) != 0)
-        return fail(ErrorCode::InvalidShader, "a WebGPU shader must be a SPIR-V module");
-    std::vector<std::uint32_t> words(code.size() / sizeof(std::uint32_t));
-    std::memcpy(words.data(), code.data(), code.size());
-    SpirvModule spirv;
-    if (std::expected<void, Error> read = spirv.read(words); !read)
-        return std::unexpected(std::move(read.error()));
-    //! SPIR-V keeps no type names, and the cooperative matrix fallback shuffles across groups of eight lanes, so each shader with subgroup shuffles needs at least 8 lanes.
-    if (spirv.hasCapability(spv::Capability::GroupNonUniformShuffle) && (!owner.features.subgroups || owner.features.minSubgroupSize < 8))
+    WgslModule wgsl(std::string(reinterpret_cast<const char*>(code.data()), code.size()));
+    const std::string& text = wgsl.getText();
+    if (text.contains("enable subgroups;") && !owner.features.subgroups)
+        return fail(ErrorCode::Unsupported, "a WebGPU shader with subgroup operations needs the subgroups feature");
+    //! The cooperative matrix fallback shuffles across groups of eight lanes.
+    if (text.contains("subgroupShuffle") && owner.features.minSubgroupSize < 8)
         return fail(ErrorCode::Unsupported, "subgroup shuffles on WebGPU need subgroups of at least 8 lanes");
-    if (!owner.storageImages && spirv.hasStorageImages())
+    if (!owner.storageImages && text.contains("texture_storage_"))
         return fail(ErrorCode::Unsupported, "a WebGPU shader with storage images needs the texture-formats-tier2 feature");
-    if (std::expected<void, Error> moved = moveFloatPools(spirv, owner.sampledRanges[static_cast<std::size_t>(Backend::PoolKind::Float)]); !moved)
+    if (std::expected<void, Error> moved = moveFloatPools(wgsl, owner.sampledRanges[static_cast<std::size_t>(Backend::PoolKind::Float)]); !moved)
         return std::unexpected(std::move(moved.error()));
-    std::expected<std::string, Error> text = translateToWgsl(spirv);
-    if (!text)
-        return std::unexpected(std::move(text.error()));
-    wgpu::ShaderSourceWGSL wgsl;
-    wgsl.code = wgpu::StringView(text->data(), text->size());
-    const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &wgsl};
+    wgpu::ShaderSourceWGSL source;
+    source.code = wgpu::StringView(wgsl.getText().data(), wgsl.getText().size());
+    const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &source};
     std::lock_guard lock(owner.mutex);
     owner.pushErrorScope();
     wgpu::ShaderModule module = owner.device.CreateShaderModule(&descriptor);
     if (std::expected<void, Error> created = asShaderError(owner.popErrorScope("compiling WGSL")); !created)
         return std::unexpected(std::move(created.error()));
-    return module;
+    Backend::BindingSet bindings;
+    for (const std::uint32_t binding : wgsl.listBindings(0))
+        if (binding < bindings.size())
+            bindings.set(binding);
+    return CompiledModule{std::move(module), bindings};
 }
 
 wgpu::StringView getEntryPoint(const Shader& shader) {
@@ -180,14 +182,15 @@ std::expected<std::shared_ptr<ComputePipeline>, Error> openComputePipeline(NoorR
     if (std::expected<void, Error> checked = checkShader(shader, ShaderStage::Compute); !checked)
         return std::unexpected(std::move(checked.error()));
     auto& owner = static_cast<WebGpuDevice&>(*device.getBackend());
-    std::expected<wgpu::ShaderModule, Error> module = createModule(owner, shader);
+    std::expected<CompiledModule, Error> module = createModule(owner, shader);
     if (!module)
         return std::unexpected(std::move(module.error()));
     wgpu::ComputePipelineDescriptor descriptor{.layout = owner.computeLayout};
-    descriptor.compute.module = *module;
+    descriptor.compute.module = module->module;
     descriptor.compute.entryPoint = getEntryPoint(shader);
     auto result = std::make_shared<WebGpuComputePipeline>();
     result->threadGroupSize = shader.threadGroupSize;
+    result->bindings = module->bindings;
     result->compilation.device = owner.shared_from_this();
     std::lock_guard lock(owner.mutex);
     result->compilation.future = owner.device.CreateComputePipelineAsync(
@@ -208,10 +211,10 @@ std::expected<std::shared_ptr<GraphicsPipeline>, Error> openGraphicsPipeline(Noo
     auto& owner = static_cast<WebGpuDevice&>(*device.getBackend());
     if (!owner.isRenderable(desc.colorFormat))
         return fail(ErrorCode::Unsupported, "the WebGPU device cannot render to the color format of the pipeline");
-    std::expected<wgpu::ShaderModule, Error> vertex = createModule(owner, desc.vertex);
+    std::expected<CompiledModule, Error> vertex = createModule(owner, desc.vertex);
     if (!vertex)
         return std::unexpected(std::move(vertex.error()));
-    std::expected<wgpu::ShaderModule, Error> fragment = createModule(owner, desc.fragment);
+    std::expected<CompiledModule, Error> fragment = createModule(owner, desc.fragment);
     if (!fragment)
         return std::unexpected(std::move(fragment.error()));
     const bool usesDepth = desc.depthFormat != ImageFormat::Undefined;
@@ -221,7 +224,7 @@ std::expected<std::shared_ptr<GraphicsPipeline>, Error> openGraphicsPipeline(Noo
     const wgpu::ColorTargetState target{.format = colorFormat,
                                         .blend = desc.state.blend == BlendMode::Opaque ? nullptr : &blend,
                                         .writeMask = desc.state.colorWrite ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None};
-    const wgpu::FragmentState fragmentState{.module = *fragment, .entryPoint = getEntryPoint(desc.fragment), .targetCount = 1, .targets = &target};
+    const wgpu::FragmentState fragmentState{.module = fragment->module, .entryPoint = getEntryPoint(desc.fragment), .targetCount = 1, .targets = &target};
     const StencilState& stencil = desc.state.stencil;
     const wgpu::StencilFaceState stencilFace{.compare = getCompare(stencil.compare), .passOp = getStencilOp(stencil.pass)};
     const wgpu::DepthStencilState depthState{
@@ -241,7 +244,7 @@ std::expected<std::shared_ptr<GraphicsPipeline>, Error> openGraphicsPipeline(Noo
         .depthStencil = usesDepth ? &depthState : nullptr,
         .multisample = {.count = desc.samples},
         .fragment = &fragmentState};
-    descriptor.vertex.module = *vertex;
+    descriptor.vertex.module = vertex->module;
     descriptor.vertex.entryPoint = getEntryPoint(desc.vertex);
     auto result = std::make_shared<WebGpuGraphicsPipeline>();
     setTarget(*result, desc);

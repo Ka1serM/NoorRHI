@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "HitFilter.slang.h"
 #include "RayGrid.slang.h"
 #include "RayQuery.slang.h"
 #include "RayTracing.h"
@@ -252,4 +253,133 @@ TEST_CASE("an acceleration structure without geometry is rejected") {
     REQUIRE(device);
     AccelerationStructure blas;
     CHECK(blas.build(*device, std::span<const TriangleGeometry>{}).error().code == ErrorCode::InvalidArgument);
+}
+
+namespace {
+
+constexpr std::uint32_t rayFlagAcceptFirstHit = 0x04;
+constexpr std::uint32_t rayFlagCullNonOpaque = 0x80;
+constexpr std::uint32_t firstLayerHit = 0x21;
+constexpr std::uint32_t secondLayerHit = 0x33;
+
+enum FilterMode : std::uint32_t { AcceptAll, IgnoreAll, IgnoreFirstLayer, AcceptAndEnd, ObjectRay };
+
+struct Layers {
+    Buffer<float3> positions;
+    Buffer<std::uint32_t> indices;
+    Buffer<std::uint32_t> output;
+    AccelerationStructure blas;
+    AccelerationStructure tlas;
+    std::array<Instance, 2> instances;
+    ComputePipeline pipeline;
+};
+
+std::expected<void, Error> openLayers(Device& device, Layers& layers, const bool opaque) {
+    const std::vector<float3> vertices{{-0.6f, -0.6f, 0.0f}, {0.6f, -0.6f, 0.0f}, {0.0f, 0.6f, 0.0f}};
+    const std::vector<std::uint32_t> triangle{0, 1, 2};
+    for (std::expected<void, Error> step : {layers.positions.open(device, vertices.size()), layers.indices.open(device, triangle.size()),
+                                            layers.output.open(device, 1), layers.pipeline.open(device, HitFilter::hitFilterMain)})
+        if (!step)
+            return step;
+    for (std::expected<void, Error> step : {layers.positions.upload(vertices), layers.indices.upload(triangle)})
+        if (!step)
+            return step;
+    const TriangleGeometry geometry{.positions = layers.positions.getPtr(), .indices = layers.indices.getPtr(), .triangleCount = 1, .opaque = opaque};
+    if (std::expected<void, Error> built = layers.blas.build(device, {&geometry, 1}); !built)
+        return built;
+    layers.instances = {Instance{.blas = &layers.blas, .mask = 0x01}, Instance{.blas = &layers.blas, .customIndex = 1, .mask = 0x02}};
+    for (Instance& instance : layers.instances)
+        for (std::size_t index = 0; index < 4; ++index)
+            instance.transform.values[index][index] = 1.0f;
+    layers.instances[1].transform.values[2][3] = -0.5f;
+    return layers.tlas.build(device, layers.instances);
+}
+
+std::expected<std::uint32_t, Error> filterRay(Device& device, Layers& layers, const FilterMode mode, const std::uint32_t flags = 0,
+                                              const std::uint32_t mask = 0xff) {
+    CommandList list(device);
+    list.dispatch(layers.pipeline, {1, 1}, RayTracing::FilterArguments{layers.output.getPtr(), layers.tlas.getHandle(), mode, flags, mask});
+    if (std::expected<void, Error> executed = Test::execute(device, std::move(list)); !executed)
+        return std::unexpected(std::move(executed.error()));
+    std::vector<std::uint32_t> value(1);
+    if (std::expected<void, Error> downloaded = layers.output.download(value); !downloaded)
+        return std::unexpected(std::move(downloaded.error()));
+    return value[0];
+}
+
+std::uint32_t getHit(const std::uint32_t value) {
+    return value & 0xff;
+}
+
+std::uint32_t getCalls(const std::uint32_t value) {
+    return value >> 8;
+}
+
+}
+
+TEST_CASE("a hit filter decides which non-opaque candidates an inline ray query commits") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    Layers layers;
+    REQUIRE_OK(openLayers(*device, layers, false));
+
+    std::expected<std::uint32_t, Error> value = filterRay(*device, layers, AcceptAll);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == firstLayerHit);
+
+    value = filterRay(*device, layers, IgnoreAll);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == 0u);
+    CHECK(getCalls(*value) == 2u);
+
+    value = filterRay(*device, layers, IgnoreFirstLayer);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == secondLayerHit);
+
+    value = filterRay(*device, layers, AcceptAndEnd);
+    REQUIRE_OK(value);
+    CHECK((getHit(*value) == firstLayerHit || getHit(*value) == secondLayerHit));
+    CHECK(getCalls(*value) == 1u);
+
+    value = filterRay(*device, layers, ObjectRay);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == firstLayerHit);
+
+    value = filterRay(*device, layers, AcceptAll, 0, 0x02);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == secondLayerHit);
+
+    value = filterRay(*device, layers, AcceptAll, rayFlagCullNonOpaque);
+    REQUIRE_OK(value);
+    CHECK(*value == 0u);
+
+    value = filterRay(*device, layers, AcceptAll, rayFlagAcceptFirstHit);
+    REQUIRE_OK(value);
+    CHECK((getHit(*value) == firstLayerHit || getHit(*value) == secondLayerHit));
+    CHECK(getCalls(*value) == 1u);
+}
+
+TEST_CASE("a hit filter is not called for opaque triangles") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    Layers layers;
+    REQUIRE_OK(openLayers(*device, layers, true));
+    const std::expected<std::uint32_t, Error> value = filterRay(*device, layers, IgnoreAll);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == firstLayerHit);
+    CHECK(getCalls(*value) == 0u);
+}
+
+TEST_CASE("a dynamic BLAS follows its triangles after an update") {
+    Device* device = Test::getDevice();
+    REQUIRE(device);
+    Layers layers;
+    REQUIRE_OK(openLayers(*device, layers, false));
+    const std::vector<float3> moved{{-0.6f, -0.6f, -1.0f}, {0.6f, -0.6f, -1.0f}, {0.0f, 0.6f, -1.0f}};
+    REQUIRE_OK(layers.positions.upload(moved));
+    REQUIRE_OK(layers.blas.update());
+    REQUIRE_OK(layers.tlas.update(layers.instances));
+    const std::expected<std::uint32_t, Error> value = filterRay(*device, layers, AcceptAll);
+    REQUIRE_OK(value);
+    CHECK(getHit(*value) == 0x41u);
 }

@@ -23,6 +23,8 @@ vk::DeviceSize alignUp(const vk::DeviceSize value, const vk::DeviceSize alignmen
     return (value + alignment - 1) / alignment * alignment;
 }
 
+constexpr vk::DeviceSize minimumBarBytes = 4ull << 30;
+
 struct MemoryPreference {
     vk::MemoryPropertyFlags required;
     vk::MemoryPropertyFlags preferred;
@@ -49,7 +51,10 @@ std::optional<std::uint32_t> findMemoryType(const vk::PhysicalDeviceMemoryProper
         const vk::MemoryPropertyFlags flags = properties.memoryTypes[index].propertyFlags;
         if (!(typeBits & (1u << index)) || (flags & required) != required)
             continue;
-        if ((flags & preferred) == preferred)
+        //! Without resizable BAR the device-local host-visible heap holds only about 256 MB, too small for texture uploads.
+        const bool smallBar = (preferred & vk::MemoryPropertyFlagBits::eDeviceLocal) && (flags & vk::MemoryPropertyFlagBits::eDeviceLocal)
+                              && properties.memoryHeaps[properties.memoryTypes[index].heapIndex].size < minimumBarBytes;
+        if ((flags & preferred) == preferred && !smallBar)
             return index;
         if (!fallback)
             fallback = index;

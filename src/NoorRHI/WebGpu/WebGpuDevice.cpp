@@ -137,6 +137,27 @@ struct Varyings {
 }
 )";
 
+constexpr std::string_view mipSource = R"(
+@group(0) @binding(0) var source : texture_2d<f32>;
+@group(0) @binding(1) var<uniform> origins : array<vec4u, 2>;
+
+@vertex fn vertexMain(@builtin(vertex_index) index : u32) -> @builtin(position) vec4f {
+    let uv = vec2f(f32((index << 1u) & 2u), f32(index & 2u));
+    return vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+}
+
+@fragment fn fragmentMain(@builtin(position) position : vec4f) -> @location(0) vec4f {
+    let texel = (vec2u(position.xy) - origins[0].xy) * 2u;
+    var sum = vec4f(0.0);
+    for (var y = 0u; y < 2u; y++) {
+        for (var x = 0u; x < 2u; x++) {
+            sum += textureLoad(source, origins[0].zw + min(texel + vec2u(x, y), origins[1].xy), 0);
+        }
+    }
+    return sum * 0.25;
+}
+)";
+
 constexpr std::string_view patchSource = R"(
 @group(0) @binding(0) var<storage, read_write> heap : array<u32>;
 @group(1) @binding(0) var<storage, read> bytePatch : vec4u;
@@ -514,6 +535,14 @@ std::expected<void, Error> WebGpuDevice::createLayouts() {
     const wgpu::PipelineLayoutDescriptor blitLayoutDescriptor{.bindGroupLayoutCount = 1, .bindGroupLayouts = &blitGroupLayout};
     blitLayout = device.CreatePipelineLayout(&blitLayoutDescriptor);
     blitModule = createWgslModule(device, blitSource);
+    std::array mipEntries{makeTextureEntry(0, wgpu::ShaderStage::Fragment, wgpu::TextureSampleType::UnfilterableFloat),
+                          makeBufferEntry(1, wgpu::ShaderStage::Fragment, wgpu::BufferBindingType::Uniform)};
+    mipEntries[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+    const wgpu::BindGroupLayoutDescriptor mipDescriptor{.entryCount = mipEntries.size(), .entries = mipEntries.data()};
+    mipGroupLayout = device.CreateBindGroupLayout(&mipDescriptor);
+    const wgpu::PipelineLayoutDescriptor mipLayoutDescriptor{.bindGroupLayoutCount = 1, .bindGroupLayouts = &mipGroupLayout};
+    mipLayout = device.CreatePipelineLayout(&mipLayoutDescriptor);
+    mipModule = createWgslModule(device, mipSource);
     wgpu::ComputePipelineDescriptor patchDescriptor{.layout = computeLayout};
     patchDescriptor.compute.module = createWgslModule(device, patchSource);
     patchDescriptor.compute.entryPoint = "main";
@@ -545,8 +574,11 @@ std::expected<void, Error> WebGpuDevice::createEmptyResources() {
         const wgpu::TextureDescriptor descriptor{.usage = wgpu::TextureUsage::StorageBinding, .size = {1, 1, 1}, .format = storageFormats[index]};
         emptyStorage[index] = device.CreateTexture(&descriptor).CreateView(&arrayView);
     }
-    const wgpu::SamplerDescriptor samplerDescriptor;
-    emptySampler = device.CreateSampler(&samplerDescriptor);
+    const wgpu::SamplerDescriptor samplerDescriptor{.magFilter = wgpu::FilterMode::Linear,
+                                                    .minFilter = wgpu::FilterMode::Linear,
+                                                    .mipmapFilter = wgpu::MipmapFilterMode::Linear,
+                                                    .maxAnisotropy = samplerAnisotropy};
+    sampler = device.CreateSampler(&samplerDescriptor);
     reserve(argumentBuffer, argumentBufferBytes, argumentUsage);
     for (std::size_t index = 0; index < storagePools.size(); ++index)
         storagePools[index].format = storageFormats[index];
@@ -647,8 +679,7 @@ void WebGpuDevice::updateBindGroups() {
             const wgpu::TextureView& view = sampledPools[binding].view ? sampledPools[binding].view : emptySampled[getPoolKind(binding)];
             shared.push_back({.binding = binding, .textureView = view});
         }
-    for (std::uint32_t index = 0; index < samplerBindings.count; ++index)
-        shared.push_back({.binding = samplerBindings.first + index, .sampler = samplers[index].sampler ? samplers[index].sampler : emptySampler});
+    shared.push_back({.binding = samplerBindings.first, .sampler = sampler});
 
     std::vector<wgpu::BindGroupEntry> computeEntries{{.binding = heapBinding, .buffer = heaps[0].buffer},
                                                      {.binding = atomicBinding, .buffer = heaps[1].buffer}};
@@ -683,6 +714,22 @@ std::expected<wgpu::RenderPipeline, Error> WebGpuDevice::getBlitPipeline(const w
     if (std::expected<void, Error> created = popErrorScope("the blit pipeline"); !created)
         return std::unexpected(std::move(created.error()));
     blitPipelines.emplace(format, pipeline);
+    return pipeline;
+}
+
+std::expected<wgpu::RenderPipeline, Error> WebGpuDevice::getMipPipeline(const wgpu::TextureFormat format) {
+    if (const auto found = mipPipelines.find(format); found != mipPipelines.end())
+        return found->second;
+    const wgpu::ColorTargetState target{.format = format};
+    const wgpu::FragmentState fragment{.module = mipModule, .entryPoint = "fragmentMain", .targetCount = 1, .targets = &target};
+    wgpu::RenderPipelineDescriptor descriptor{.layout = mipLayout, .fragment = &fragment};
+    descriptor.vertex.module = mipModule;
+    descriptor.vertex.entryPoint = "vertexMain";
+    pushErrorScope();
+    wgpu::RenderPipeline pipeline = device.CreateRenderPipeline(&descriptor);
+    if (std::expected<void, Error> created = popErrorScope("the mip pipeline"); !created)
+        return std::unexpected(std::move(created.error()));
+    mipPipelines.emplace(format, pipeline);
     return pipeline;
 }
 

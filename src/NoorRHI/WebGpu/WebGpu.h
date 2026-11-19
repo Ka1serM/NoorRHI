@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -28,12 +29,17 @@
 
 namespace NoorRHI::Backend {
 
+//! The bindings of group 0 that a shader declares; slangc leaves out the ones it does not use.
+using BindingSet = std::bitset<bindingCount>;
+
 inline constexpr std::size_t argumentAlignment = 16;
 inline constexpr std::uint64_t argumentWindowBytes = 4096;
 inline constexpr std::uint64_t heapReservedBytes = textureTableAddress + std::uint64_t{textureTableCapacity} * 16;
 inline constexpr std::array<std::uint64_t, 2> initialHeapBytes{16ull << 20, 64ull << 10};
 inline constexpr std::uint64_t addressOffsetMask = 0xffffffffull;
 inline constexpr std::uint64_t indirectSlotBytes = 16;
+//! The anisotropy of the one WebGPU sampler; a sampler that asks for less still gets it, and nearest samplers read single texels.
+inline constexpr std::uint16_t samplerAnisotropy = 8;
 
 wgpu::TextureFormat getWebGpuFormat(ImageFormat format);
 std::string toString(wgpu::StringView text);
@@ -71,12 +77,6 @@ struct StoragePool {
     std::uint32_t capacity = 0;
     std::uint32_t nextLayer = 0;
     std::vector<std::uint32_t> freeLayers;
-};
-
-struct SamplerSlot {
-    wgpu::Sampler sampler;
-    SamplerDesc desc;
-    std::uint32_t references = 0;
 };
 
 struct TextureRegion {
@@ -132,14 +132,16 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
     void releaseSampled(const SampledSlot& slot);
     std::expected<std::uint32_t, Error> allocateStorageLayer(std::uint32_t binding, std::uint32_t width, std::uint32_t height);
     void releaseStorageLayer(std::uint32_t binding, std::uint32_t layer);
-    std::expected<std::uint32_t, Error> acquireSampler(const SamplerDesc& desc, const wgpu::SamplerDescriptor& native);
-    void releaseSampler(std::uint32_t binding);
     TextureRegion getPrimary(const WebGpuImage& image) const;
     TextureRegion getSampled(const WebGpuImage& image) const;
-    bool hasStaleShadows(bool dispatched) const;
-    void refreshShadows(const wgpu::CommandEncoder& encoder, bool dispatched);
+    //! The images in the storage pools of written now have stale sampled copies.
+    void markWritten(const BindingSet& written);
+    bool hasStaleShadows(const BindingSet& sampled) const;
+    //! Copies the stale images whose sampled pool is in sampled to their sampled copies.
+    void refreshShadows(const wgpu::CommandEncoder& encoder, const BindingSet& sampled);
     void updateBindGroups();
     std::expected<wgpu::RenderPipeline, Error> getBlitPipeline(wgpu::TextureFormat format);
+    std::expected<wgpu::RenderPipeline, Error> getMipPipeline(wgpu::TextureFormat format);
     bool isRenderable(ImageFormat format) const;
 
     std::unique_ptr<WebGpuPlatform> platform;
@@ -180,10 +182,10 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
 
     std::array<SampledPool, bindingCount> sampledPools;
     std::array<StoragePool, storagePoolBindings.count> storagePools;
-    std::array<SamplerSlot, samplerBindings.count> samplers;
     std::array<wgpu::TextureView, sampledPoolBindings.size()> emptySampled;
     std::array<wgpu::TextureView, storagePoolBindings.count> emptyStorage;
-    wgpu::Sampler emptySampler;
+    //! The one sampler of every texture sample; see tools/generate_webgpu_bindings.py.
+    wgpu::Sampler sampler;
     std::set<WebGpuImage*> shadowedImages;
     std::vector<std::uint32_t> freeTextureIndices;
     std::uint32_t nextTextureIndex = 1;
@@ -193,6 +195,10 @@ struct WebGpuDevice final : Device, std::enable_shared_from_this<WebGpuDevice> {
     wgpu::ShaderModule blitModule;
     wgpu::Sampler blitSampler;
     std::map<wgpu::TextureFormat, wgpu::RenderPipeline> blitPipelines;
+    wgpu::BindGroupLayout mipGroupLayout;
+    wgpu::PipelineLayout mipLayout;
+    wgpu::ShaderModule mipModule;
+    std::map<wgpu::TextureFormat, wgpu::RenderPipeline> mipPipelines;
     wgpu::ComputePipeline patchPipeline;
     wgpu::BindGroupLayout countGroupLayout;
     wgpu::ComputePipeline countPipeline;
@@ -235,12 +241,13 @@ struct WebGpuBuffer final : Buffer {
 struct WebGpuImage final : Image, std::enable_shared_from_this<WebGpuImage> {
     ~WebGpuImage() override;
 
-    std::expected<void, Error> upload(std::span<const std::byte> mipChain) override;
+    std::expected<void, Error> upload(std::span<const std::byte> levels, std::uint32_t levelCount) override;
     std::expected<void, Error> download(std::uint32_t x, std::uint32_t y, std::uint32_t regionWidth, std::uint32_t regionHeight,
                                         std::span<std::byte> destination) override;
 
+    std::expected<void, Error> generateLevels(const TextureRegion& region, std::uint32_t firstLevel, std::uint32_t levelCount);
     bool isShadowed() const { return sampled.binding != 0 && (texture || storageBinding != 0); }
-    bool needsShadowRefresh(const bool dispatched) const { return shadowStale || (dispatched && storageBinding != 0); }
+    bool needsShadowRefresh(const BindingSet& sampledPools) const { return shadowStale && sampledPools[sampled.binding]; }
     wgpu::TextureView createView(const TextureRegion& region) const;
 
     std::shared_ptr<WebGpuDevice> device;
@@ -258,10 +265,7 @@ struct WebGpuImage final : Image, std::enable_shared_from_this<WebGpuImage> {
 };
 
 struct WebGpuSampler final : Sampler {
-    ~WebGpuSampler() override;
-
     std::shared_ptr<WebGpuDevice> device;
-    std::uint32_t binding = 0;
 };
 
 struct WebGpuCompilation {
@@ -277,6 +281,7 @@ struct WebGpuComputePipeline final : ComputePipeline, std::enable_shared_from_th
     std::expected<void, Error> wait() override;
 
     wgpu::ComputePipeline pipeline;
+    BindingSet bindings;
     WebGpuCompilation compilation;
 };
 
@@ -456,7 +461,8 @@ struct WebGpuSwapchain final : Swapchain {
     SurfaceProvider* provider = nullptr;
     wgpu::Surface surface;
     wgpu::TextureFormat nativeFormat = wgpu::TextureFormat::Undefined;
-    wgpu::TextureUsage nativeUsage = wgpu::TextureUsage::RenderAttachment;
+    //! A surface texture ends when control returns to the browser, and every WebGPU wait yields to it, so a frame renders here and present copies it to the surface.
+    wgpu::Texture frame;
     std::uint32_t maxFramesInFlight = 1;
     bool transparent = false;
     bool stale = true;

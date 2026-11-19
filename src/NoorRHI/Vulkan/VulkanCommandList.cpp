@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <bit>
 #include <cstring>
 
@@ -186,8 +187,15 @@ void VulkanCommandList::beginRender(const RenderTarget& target) {
         colorAttachment.setResolveMode(vk::ResolveModeFlagBits::eAverage)
             .setResolveImageView(*static_cast<const VulkanImage&>(*target.resolve->getBackend()).view)
             .setResolveImageLayout(vk::ImageLayout::eGeneral);
-    vk::RenderingInfo rendering =
-        vk::RenderingInfo().setRenderArea({{0, 0}, {color.width, color.height}}).setLayerCount(1).setColorAttachments(colorAttachment);
+    vk::Rect2D area({0, 0}, {color.width, color.height});
+    if (target.area) {
+        const std::int32_t left = std::clamp(target.area->x, 0, static_cast<std::int32_t>(color.width));
+        const std::int32_t top = std::clamp(target.area->y, 0, static_cast<std::int32_t>(color.height));
+        const std::int64_t right = std::clamp<std::int64_t>(std::int64_t{target.area->x} + target.area->width, left, color.width);
+        const std::int64_t bottom = std::clamp<std::int64_t>(std::int64_t{target.area->y} + target.area->height, top, color.height);
+        area = vk::Rect2D({left, top}, {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)});
+    }
+    vk::RenderingInfo rendering = vk::RenderingInfo().setRenderArea(area).setLayerCount(1).setColorAttachments(colorAttachment);
     vk::RenderingAttachmentInfo depthAttachment;
     if (target.depth) {
         depthAttachment.setImageView(*static_cast<const VulkanImage&>(*target.depth->getBackend()).view)
@@ -202,7 +210,7 @@ void VulkanCommandList::beginRender(const RenderTarget& target) {
     pool.commands.beginRendering(rendering);
     //! The viewport has a negative height, so clip space Y points up as in WebGPU, D3D and Metal, and one shader draws the same image on each backend.
     pool.commands.setViewport(0, vk::Viewport(0, static_cast<float>(color.height), static_cast<float>(color.width), -static_cast<float>(color.height), 0, 1));
-    pool.commands.setScissor(0, vk::Rect2D({0, 0}, {color.width, color.height}));
+    pool.commands.setScissor(0, area);
     pool.commands.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, 0);
 }
 

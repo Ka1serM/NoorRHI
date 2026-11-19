@@ -44,7 +44,7 @@ public:
     Backend::Image* getBackend() const { return backend.get(); }
     explicit operator bool() const { return backend != nullptr; }
 
-    [[nodiscard]] std::expected<void, Error> upload(std::span<const std::byte> mipChain);
+    [[nodiscard]] std::expected<void, Error> upload(std::span<const std::byte> pixels);
     [[nodiscard]] std::expected<void, Error> download(std::span<std::byte> destination) const;
     [[nodiscard]] std::expected<void, Error> download(std::span<std::byte> destination, Rect region) const;
 

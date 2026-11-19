@@ -40,6 +40,50 @@ std::size_t literalStringWords(const std::span<const std::uint32_t> words) {
     return words.size();
 }
 
+bool isTypeOrConstant(const spv::Op op) {
+    switch (op) {
+    case spv::Op::OpTypeVoid:
+    case spv::Op::OpTypeBool:
+    case spv::Op::OpTypeInt:
+    case spv::Op::OpTypeFloat:
+    case spv::Op::OpTypeVector:
+    case spv::Op::OpTypeMatrix:
+    case spv::Op::OpTypeImage:
+    case spv::Op::OpTypeSampler:
+    case spv::Op::OpTypeSampledImage:
+    case spv::Op::OpTypeArray:
+    case spv::Op::OpTypeRuntimeArray:
+    case spv::Op::OpTypeStruct:
+    case spv::Op::OpTypePointer:
+    case spv::Op::OpTypeFunction:
+    case spv::Op::OpTypeAccelerationStructureKHR:
+    case spv::Op::OpTypeRayQueryKHR:
+    case spv::Op::OpTypeCooperativeMatrixKHR:
+    case spv::Op::OpConstantTrue:
+    case spv::Op::OpConstantFalse:
+    case spv::Op::OpConstant:
+    case spv::Op::OpConstantComposite:
+    case spv::Op::OpConstantNull:
+    case spv::Op::OpSpecConstantTrue:
+    case spv::Op::OpSpecConstantFalse:
+    case spv::Op::OpSpecConstant:
+    case spv::Op::OpSpecConstantComposite:
+    case spv::Op::OpSpecConstantOp:
+    case spv::Op::OpUndef:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::string_view withoutSuffix(const std::string_view name) {
+    const std::size_t underscore = name.rfind('_');
+    if (underscore == std::string_view::npos || underscore + 1 == name.size())
+        return name;
+    const std::string_view suffix = name.substr(underscore + 1);
+    return std::ranges::all_of(suffix, [](const char character) { return character >= '0' && character <= '9'; }) ? name.substr(0, underscore) : name;
+}
+
 }
 
 std::expected<void, Error> SpirvModule::read(const std::span<const std::uint32_t> words) {
@@ -809,6 +853,451 @@ void SpirvModule::rewriteFunctions(const Rewriter& rewriter) {
             output.push_back(std::move(instruction));
     }
     instructions = std::move(output);
+}
+
+
+std::expected<void, Error> SpirvModule::replaceFunction(const std::string_view functionName, const std::span<const std::uint32_t> words) {
+    SpirvModule donor;
+    if (std::expected<void, Error> read = donor.read(words); !read)
+        return read;
+    const std::uint32_t host = function(functionName);
+    if (host == 0)
+        return fail(ErrorCode::InvalidShader, std::format("The shader has no function {} to replace.", functionName));
+    const std::uint32_t source = donor.function(functionName);
+    if (source == 0)
+        return fail(ErrorCode::InvalidShader, std::format("The donor module has no function {}.", functionName));
+    Merge merge{donor, {}, {}, {}, {}};
+    merge.ids[source] = host;
+    mergeCapabilities(donor);
+    const std::expected<std::uint32_t, Error> type = mergeGlobal(merge, donor.definition(source)->operands[3]);
+    if (!type)
+        return std::unexpected(std::move(type.error()));
+    if (*type != definition(host)->operands[3])
+        return fail(ErrorCode::InvalidShader, std::format("The donor function {} has another signature than the host function.", functionName));
+
+    std::vector<std::uint32_t> parameters;
+    const auto [hostBegin, hostEnd] = functionRange(host);
+    for (std::size_t index = hostBegin + 1; index < hostEnd && instructions[index].op == spv::Op::OpFunctionParameter; ++index)
+        parameters.push_back(instructions[index].operands[1]);
+    std::expected<std::vector<Instruction>, Error> body = mergeBody(merge, source, true, parameters);
+    if (!body)
+        return std::unexpected(std::move(body.error()));
+    std::vector<Instruction> copies;
+    while (!merge.copies.empty()) {
+        const std::uint32_t copy = merge.copies.back();
+        merge.copies.pop_back();
+        std::expected<std::vector<Instruction>, Error> copied = mergeBody(merge, copy, false, {});
+        if (!copied)
+            return std::unexpected(std::move(copied.error()));
+        std::ranges::move(*copied, std::back_inserter(copies));
+    }
+
+    const auto [begin, end] = functionRange(host);
+    const std::size_t first = begin + 1 + parameters.size();
+    instructions.erase(instructions.begin() + static_cast<std::ptrdiff_t>(first), instructions.begin() + static_cast<std::ptrdiff_t>(end));
+    instructions.insert(instructions.begin() + static_cast<std::ptrdiff_t>(first), std::make_move_iterator(body->begin()),
+                        std::make_move_iterator(body->end()));
+    std::ranges::move(copies, std::back_inserter(instructions));
+    for (Instruction& annotation : merge.annotations)
+        addAnnotation(std::move(annotation));
+    return {};
+}
+
+void SpirvModule::mergeCapabilities(const SpirvModule& donor) {
+    for (const Instruction& instruction : donor.instructions) {
+        if (instruction.op != spv::Op::OpCapability && instruction.op != spv::Op::OpExtension)
+            continue;
+        if (std::ranges::any_of(instructions, [&](const Instruction& item) { return item.op == instruction.op && item.operands == instruction.operands; }))
+            continue;
+        const auto last = std::ranges::find_if(instructions.rbegin(), instructions.rend(), [](const Instruction& item) { return item.op == spv::Op::OpCapability; });
+        instructions.insert(instruction.op == spv::Op::OpCapability ? instructions.begin() : last.base(), instruction);
+    }
+}
+
+std::expected<std::uint32_t, Error> SpirvModule::mergeId(Merge& merge, const std::uint32_t id) {
+    if (const auto found = merge.ids.find(id); found != merge.ids.end())
+        return found->second;
+    const Instruction* source = merge.donor.definition(id);
+    if (source && source->op == spv::Op::OpFunction)
+        return mergeFunction(merge, id);
+    return mergeGlobal(merge, id);
+}
+
+std::expected<std::uint32_t, Error> SpirvModule::mergeGlobal(Merge& merge, const std::uint32_t id) {
+    if (const auto found = merge.ids.find(id); found != merge.ids.end())
+        return found->second;
+    const Instruction* source = merge.donor.definition(id);
+    if (!source)
+        return fail(ErrorCode::InvalidShader, std::format("The donor module uses %{} without defining it.", id));
+    if (source->op == spv::Op::OpExtInstImport) {
+        const std::uint32_t imported = extInstImport(reinterpret_cast<const char*>(source->operands.data() + 1));
+        merge.ids[id] = imported;
+        return imported;
+    }
+    if (!isTypeOrConstant(source->op))
+        return fail(ErrorCode::InvalidShader, std::format("The donor function uses %{}, which is neither a type nor a constant.", id));
+    if (!merge.active.insert(id).second)
+        return fail(ErrorCode::InvalidShader, std::format("The donor type %{} is recursive.", id));
+    Instruction copy = *source;
+    bool hasResult = false;
+    bool hasType = false;
+    spv::HasResultAndType(copy.op, &hasResult, &hasType);
+    const std::size_t result = hasType ? 1 : 0;
+    for (const std::size_t position : merge.donor.idPositions(copy)) {
+        if (position == result)
+            continue;
+        const std::expected<std::uint32_t, Error> mapped = mergeId(merge, copy.operands[position]);
+        if (!mapped)
+            return mapped;
+        copy.operands[position] = *mapped;
+    }
+    std::vector<Instruction> annotations = merge.donor.decorations(id);
+    for (Instruction& annotation : annotations)
+        for (const std::size_t position : merge.donor.idPositions(annotation))
+            if (position != 0) {
+                const std::expected<std::uint32_t, Error> mapped = mergeId(merge, annotation.operands[position]);
+                if (!mapped)
+                    return mapped;
+                annotation.operands[position] = *mapped;
+            }
+    merge.active.erase(id);
+    const auto withoutTarget = [](std::vector<Instruction> items) {
+        std::vector<std::pair<spv::Op, std::vector<std::uint32_t>>> keys;
+        for (Instruction& item : items)
+            keys.emplace_back(item.op, std::vector<std::uint32_t>(item.operands.begin() + 1, item.operands.end()));
+        std::ranges::sort(keys);
+        return keys;
+    };
+    const auto wanted = withoutTarget(annotations);
+    for (const Instruction& candidate : instructions) {
+        if (candidate.op == spv::Op::OpFunction)
+            break;
+        if (candidate.op != copy.op || candidate.operands.size() != copy.operands.size())
+            continue;
+        bool same = true;
+        for (std::size_t position = 0; position < copy.operands.size() && same; ++position)
+            same = position == result || candidate.operands[position] == copy.operands[position];
+        if (!same || withoutTarget(decorations(candidate.operands[result])) != wanted)
+            continue;
+        merge.ids[id] = candidate.operands[result];
+        return candidate.operands[result];
+    }
+    const std::uint32_t fresh = newId();
+    copy.operands[result] = fresh;
+    addGlobal(std::move(copy));
+    for (Instruction& annotation : annotations) {
+        annotation.operands[0] = fresh;
+        addAnnotation(std::move(annotation));
+    }
+    merge.ids[id] = fresh;
+    return fresh;
+}
+
+std::expected<std::uint32_t, Error> SpirvModule::mergeFunction(Merge& merge, const std::uint32_t id) {
+    if (const auto found = merge.ids.find(id); found != merge.ids.end())
+        return found->second;
+    const Instruction source = *merge.donor.definition(id);
+    const std::expected<std::uint32_t, Error> type = mergeGlobal(merge, source.operands[3]);
+    if (!type)
+        return type;
+    const std::string_view calleeName = merge.donor.name(id);
+    if (const std::uint32_t linked = calleeName.empty() ? 0 : function(calleeName, *type)) {
+        merge.ids[id] = linked;
+        return linked;
+    }
+    const auto [begin, end] = merge.donor.functionRange(id);
+    const bool defined = std::ranges::any_of(std::span(merge.donor.instructions).subspan(begin, end - begin),
+                                             [](const Instruction& instruction) { return instruction.op == spv::Op::OpLabel; });
+    if (!defined)
+        return fail(ErrorCode::InvalidShader, std::format("The donor declares {}, and the host has no function of that name and type.", calleeName));
+    const std::uint32_t fresh = newId();
+    merge.ids[id] = fresh;
+    merge.copies.push_back(id);
+    return fresh;
+}
+
+//! A replacing body takes the host parameters and leaves out the function header, else the result is the whole function.
+std::expected<std::vector<SpirvModule::Instruction>, Error> SpirvModule::mergeBody(Merge& merge, const std::uint32_t function, const bool replacing,
+                                                                                    const std::span<const std::uint32_t> parameters) {
+    SpirvModule& donor = merge.donor;
+    const auto [begin, end] = donor.functionRange(function);
+    std::set<std::uint32_t> debugSets;
+    for (const Instruction& instruction : donor.instructions)
+        if (instruction.op == spv::Op::OpExtInstImport && std::string_view(reinterpret_cast<const char*>(instruction.operands.data() + 1)).starts_with("NonSemantic."))
+            debugSets.insert(instruction.operands[0]);
+    const auto skipped = [&](const Instruction& instruction) {
+        return instruction.op == spv::Op::OpLine || instruction.op == spv::Op::OpNoLine ||
+               (instruction.op == spv::Op::OpExtInst && debugSets.contains(instruction.operands[2]));
+    };
+    std::size_t parameter = 0;
+    std::set<std::uint32_t> locals;
+    for (std::size_t index = begin; index <= end; ++index) {
+        const std::uint32_t id = resultId(donor.instructions[index]);
+        if (id == 0 || index == begin || skipped(donor.instructions[index]))
+            continue;
+        locals.insert(id);
+        const bool hostParameter = replacing && donor.instructions[index].op == spv::Op::OpFunctionParameter;
+        if (hostParameter && parameter >= parameters.size())
+            return fail(ErrorCode::InvalidShader, "The donor function has more parameters than the host function.");
+        merge.ids[id] = hostParameter ? parameters[parameter++] : newId();
+    }
+    for (const Instruction& instruction : donor.instructions) {
+        if (!isAnnotation(instruction.op) || !locals.contains(instruction.operands[0]))
+            continue;
+        Instruction annotation = instruction;
+        for (const std::size_t position : donor.idPositions(annotation)) {
+            const std::expected<std::uint32_t, Error> mapped = mergeId(merge, annotation.operands[position]);
+            if (!mapped)
+                return std::unexpected(std::move(mapped.error()));
+            annotation.operands[position] = *mapped;
+        }
+        merge.annotations.push_back(std::move(annotation));
+    }
+    std::vector<Instruction> output;
+    for (std::size_t index = begin; index <= end; ++index) {
+        Instruction instruction = donor.instructions[index];
+        const bool header = instruction.op == spv::Op::OpFunction || instruction.op == spv::Op::OpFunctionParameter || instruction.op == spv::Op::OpFunctionEnd;
+        if (skipped(instruction) || (replacing && header))
+            continue;
+        for (const std::size_t position : donor.idPositions(instruction)) {
+            const std::expected<std::uint32_t, Error> mapped = mergeId(merge, instruction.operands[position]);
+            if (!mapped)
+                return std::unexpected(std::move(mapped.error()));
+            instruction.operands[position] = *mapped;
+        }
+        output.push_back(std::move(instruction));
+    }
+    return output;
+}
+
+std::vector<std::size_t> SpirvModule::idPositions(const Instruction& instruction) {
+    bool hasResult = false;
+    bool hasType = false;
+    spv::HasResultAndType(instruction.op, &hasResult, &hasType);
+    const std::vector<std::uint32_t>& operands = instruction.operands;
+    const std::size_t size = operands.size();
+    const std::size_t start = (hasType ? 1 : 0) + (hasResult ? 1 : 0);
+    std::vector<std::size_t> positions;
+    for (std::size_t position = 0; position < start; ++position)
+        positions.push_back(position);
+    const auto range = [&](const std::size_t first, const std::size_t last) {
+        for (std::size_t position = first; position < std::min(last, size); ++position)
+            positions.push_back(position);
+    };
+    const auto memoryOperands = [&](std::size_t position) {
+        if (position >= size)
+            return position;
+        const std::uint32_t mask = operands[position++];
+        if ((mask & static_cast<std::uint32_t>(spv::MemoryAccessMask::Aligned)) != 0)
+            ++position;
+        if ((mask & static_cast<std::uint32_t>(spv::MemoryAccessMask::MakePointerAvailable)) != 0)
+            positions.push_back(position++);
+        if ((mask & static_cast<std::uint32_t>(spv::MemoryAccessMask::MakePointerVisible)) != 0)
+            positions.push_back(position++);
+        return position;
+    };
+    const auto imageOperands = [&](const std::size_t mask) {
+        range(start, start + mask);
+        range(start + mask + 1, size);
+    };
+    switch (instruction.op) {
+    case spv::Op::OpExtInst:
+        range(start, start + 1);
+        range(start + 2, size);
+        break;
+    case spv::Op::OpCompositeExtract:
+    case spv::Op::OpArrayLength:
+        range(start, start + 1);
+        break;
+    case spv::Op::OpCompositeInsert:
+    case spv::Op::OpVectorShuffle:
+        range(start, start + 2);
+        break;
+    case spv::Op::OpLoad:
+        range(start, start + 1);
+        memoryOperands(start + 1);
+        break;
+    case spv::Op::OpStore:
+        range(0, 2);
+        memoryOperands(2);
+        break;
+    case spv::Op::OpCopyMemory:
+        range(0, 2);
+        memoryOperands(memoryOperands(2));
+        break;
+    case spv::Op::OpCopyMemorySized:
+        range(0, 3);
+        memoryOperands(memoryOperands(3));
+        break;
+    case spv::Op::OpCooperativeMatrixLoadKHR:
+        range(start, start + 3);
+        memoryOperands(start + 3);
+        break;
+    case spv::Op::OpCooperativeMatrixStoreKHR:
+        range(0, 4);
+        memoryOperands(4);
+        break;
+    case spv::Op::OpCooperativeMatrixMulAddKHR:
+        range(start, start + 3);
+        break;
+    case spv::Op::OpSelectionMerge:
+        range(0, 1);
+        break;
+    case spv::Op::OpLoopMerge:
+        range(0, 2);
+        break;
+    case spv::Op::OpBranchConditional:
+        range(0, 3);
+        break;
+    case spv::Op::OpSwitch: {
+        range(0, 2);
+        const Instruction* selector = definition(operands[0]);
+        const Instruction* selectorType = selector ? definition(selector->operands[0]) : nullptr;
+        const std::size_t literal = selectorType && selectorType->op == spv::Op::OpTypeInt && selectorType->operands[1] == 64 ? 2 : 1;
+        for (std::size_t position = 2 + literal; position < size; position += literal + 1)
+            positions.push_back(position);
+        break;
+    }
+    case spv::Op::OpVariable:
+        range(3, 4);
+        break;
+    case spv::Op::OpFunction:
+        range(3, 4);
+        break;
+    case spv::Op::OpTypeVector:
+    case spv::Op::OpTypeMatrix:
+    case spv::Op::OpTypeImage:
+        range(1, 2);
+        break;
+    case spv::Op::OpTypePointer:
+        range(2, 3);
+        break;
+    case spv::Op::OpTypeForwardPointer:
+    case spv::Op::OpLine:
+    case spv::Op::OpDecorate:
+    case spv::Op::OpMemberDecorate:
+    case spv::Op::OpDecorateString:
+    case spv::Op::OpMemberDecorateString:
+    case spv::Op::OpName:
+    case spv::Op::OpMemberName:
+        range(0, 1);
+        break;
+    case spv::Op::OpDecorateId:
+        range(0, 1);
+        range(2, size);
+        break;
+    case spv::Op::OpSpecConstantOp:
+        range(start + 1, size);
+        break;
+    case spv::Op::OpTypeInt:
+    case spv::Op::OpTypeFloat:
+    case spv::Op::OpConstant:
+    case spv::Op::OpSpecConstant:
+    case spv::Op::OpString:
+    case spv::Op::OpExtInstImport:
+        break;
+    case spv::Op::OpImageSampleImplicitLod:
+    case spv::Op::OpImageSampleExplicitLod:
+    case spv::Op::OpImageSampleProjImplicitLod:
+    case spv::Op::OpImageSampleProjExplicitLod:
+    case spv::Op::OpImageFetch:
+    case spv::Op::OpImageRead:
+    case spv::Op::OpImageSparseSampleImplicitLod:
+    case spv::Op::OpImageSparseSampleExplicitLod:
+    case spv::Op::OpImageSparseFetch:
+    case spv::Op::OpImageSparseRead:
+        imageOperands(2);
+        break;
+    case spv::Op::OpImageSampleDrefImplicitLod:
+    case spv::Op::OpImageSampleDrefExplicitLod:
+    case spv::Op::OpImageSampleProjDrefImplicitLod:
+    case spv::Op::OpImageSampleProjDrefExplicitLod:
+    case spv::Op::OpImageGather:
+    case spv::Op::OpImageDrefGather:
+    case spv::Op::OpImageSparseSampleDrefImplicitLod:
+    case spv::Op::OpImageSparseSampleDrefExplicitLod:
+    case spv::Op::OpImageSparseGather:
+    case spv::Op::OpImageSparseDrefGather:
+        imageOperands(3);
+        break;
+    case spv::Op::OpImageWrite:
+        range(0, 3);
+        range(4, size);
+        break;
+    case spv::Op::OpGroupIAdd:
+    case spv::Op::OpGroupFAdd:
+    case spv::Op::OpGroupFMin:
+    case spv::Op::OpGroupUMin:
+    case spv::Op::OpGroupSMin:
+    case spv::Op::OpGroupFMax:
+    case spv::Op::OpGroupUMax:
+    case spv::Op::OpGroupSMax:
+    case spv::Op::OpGroupNonUniformBallotBitCount:
+    case spv::Op::OpGroupNonUniformIAdd:
+    case spv::Op::OpGroupNonUniformFAdd:
+    case spv::Op::OpGroupNonUniformIMul:
+    case spv::Op::OpGroupNonUniformFMul:
+    case spv::Op::OpGroupNonUniformSMin:
+    case spv::Op::OpGroupNonUniformUMin:
+    case spv::Op::OpGroupNonUniformFMin:
+    case spv::Op::OpGroupNonUniformSMax:
+    case spv::Op::OpGroupNonUniformUMax:
+    case spv::Op::OpGroupNonUniformFMax:
+    case spv::Op::OpGroupNonUniformBitwiseAnd:
+    case spv::Op::OpGroupNonUniformBitwiseOr:
+    case spv::Op::OpGroupNonUniformBitwiseXor:
+    case spv::Op::OpGroupNonUniformLogicalAnd:
+    case spv::Op::OpGroupNonUniformLogicalOr:
+    case spv::Op::OpGroupNonUniformLogicalXor:
+        range(start, start + 1);
+        range(start + 2, size);
+        break;
+    default:
+        range(start, size);
+        break;
+    }
+    return positions;
+}
+
+std::vector<SpirvModule::Instruction> SpirvModule::decorations(const std::uint32_t id) const {
+    std::vector<Instruction> result;
+    for (const Instruction& instruction : instructions)
+        if (isAnnotation(instruction.op) && instruction.operands[0] == id)
+            result.push_back(instruction);
+    return result;
+}
+
+std::string_view SpirvModule::name(const std::uint32_t id) const {
+    for (const Instruction& instruction : instructions)
+        if (instruction.op == spv::Op::OpName && instruction.operands[0] == id)
+            return reinterpret_cast<const char*>(instruction.operands.data() + 1);
+    return {};
+}
+
+std::uint32_t SpirvModule::function(const std::string_view wanted, const std::uint32_t type) {
+    std::map<std::uint32_t, std::uint32_t> types;
+    for (const Instruction& instruction : instructions)
+        if (instruction.op == spv::Op::OpFunction)
+            types[instruction.operands[1]] = instruction.operands[3];
+    const std::string_view base = withoutSuffix(wanted);
+    for (const Instruction& instruction : instructions) {
+        if (instruction.op != spv::Op::OpName || withoutSuffix(reinterpret_cast<const char*>(instruction.operands.data() + 1)) != base)
+            continue;
+        const auto found = types.find(instruction.operands[0]);
+        if (found != types.end() && (type == 0 || found->second == type))
+            return instruction.operands[0];
+    }
+    return 0;
+}
+
+std::pair<std::size_t, std::size_t> SpirvModule::functionRange(const std::uint32_t id) const {
+    std::size_t begin = 0;
+    while (begin < instructions.size() && !(instructions[begin].op == spv::Op::OpFunction && instructions[begin].operands[1] == id))
+        ++begin;
+    std::size_t end = begin;
+    while (end < instructions.size() && instructions[end].op != spv::Op::OpFunctionEnd)
+        ++end;
+    return {begin, end};
 }
 
 }

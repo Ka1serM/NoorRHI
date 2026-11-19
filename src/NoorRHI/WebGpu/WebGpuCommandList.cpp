@@ -26,6 +26,9 @@ WebGpuCommandList::~WebGpuCommandList() {
 
 namespace {
 
+//! Takes the timestamp a pass does not need: emdawnwebgpu passes kQuerySetIndexUndefined to the browser unchanged, which rejects it.
+constexpr std::uint32_t spareTimestamp = 2;
+
 bool isFilterable(const WebGpuDevice& device, const ImageFormat format) {
     const FormatInfo info = getFormatInfo(format);
     if (info.integer || info.depth)
@@ -242,6 +245,8 @@ void WebGpuCommandList::popLabel() {
 
 namespace {
 
+const BindingSet allBindings = BindingSet().set();
+
 struct Replayer {
     Replayer(WebGpuDevice& owner, const wgpu::CommandEncoder& commands, std::vector<std::shared_ptr<WebGpuTimestampQuery>>& queries)
         : device(owner), encoder(commands), ended(queries) {}
@@ -255,8 +260,6 @@ struct Replayer {
     std::uint64_t indirectSlot = 0;
     std::uint32_t encoderLabels = 0;
     std::uint32_t passLabels = 0;
-    bool dispatched = false;
-    bool written = false;
     bool concurrent = false;
     const void* boundPipeline = nullptr;
     std::uint32_t boundRoot = ~0u;
@@ -308,20 +311,16 @@ struct Replayer {
         ended.push_back(query);
     }
 
-    //! WebGPU orders passes and dispatches itself; only the sampled copies of written images wait for a command that could sample them.
-    void settle() {
-        if (concurrent || (!dispatched && !written))
+    //! WebGPU orders passes and dispatches itself; only the sampled copies of written images wait for a command that samples their pools.
+    void settle(const BindingSet& sampled) {
+        if (concurrent || !device.hasStaleShadows(sampled))
             return;
-        if (device.hasStaleShadows(dispatched)) {
-            endCompute();
-            device.refreshShadows(encoder, dispatched);
-        }
-        dispatched = false;
-        written = false;
+        endCompute();
+        device.refreshShadows(encoder, sampled);
     }
 
     std::expected<void, Error> operator()(const DispatchCommand& command) {
-        settle();
+        settle(command.pipeline->bindings);
         if (command.indirect != 0) {
             endCompute();
             encoder.CopyBufferToBuffer(device.heaps[0].buffer, command.indirect, device.indirect, indirectSlot, 12);
@@ -334,13 +333,13 @@ struct Replayer {
         } else {
             compute.DispatchWorkgroups(command.groups.x, command.groups.y, command.groups.z);
         }
-        dispatched = true;
+        device.markWritten(command.pipeline->bindings);
         return {};
     }
 
     std::expected<void, Error> operator()(const ConcurrentCommand& command) {
         if (command.begin)
-            settle();
+            settle(allBindings);
         concurrent = command.begin;
         return {};
     }
@@ -364,7 +363,7 @@ struct Replayer {
     }
 
     std::expected<void, Error> operator()(const BeginRenderCommand& command) {
-        settle();
+        settle(allBindings);
         endCompute();
         if (!command.counts.empty())
             countDraws(command.counts);
@@ -396,8 +395,8 @@ struct Replayer {
         wgpu::PassTimestampWrites timestamps;
         if (query) {
             timestamps.querySet = query->querySet;
-            timestamps.beginningOfPassWriteIndex = command.beginQuery ? 0 : wgpu::kQuerySetIndexUndefined;
-            timestamps.endOfPassWriteIndex = command.endQuery ? 1 : wgpu::kQuerySetIndexUndefined;
+            timestamps.beginningOfPassWriteIndex = command.beginQuery ? 0 : spareTimestamp;
+            timestamps.endOfPassWriteIndex = command.endQuery ? 1 : spareTimestamp;
         }
         const wgpu::RenderPassDescriptor descriptor{.colorAttachmentCount = 1,
                                                     .colorAttachments = &colorAttachment,
@@ -423,7 +422,6 @@ struct Replayer {
             pass->depth->shadowStale = true;
         if (pass->resolve)
             pass->resolve->shadowStale = true;
-        written = true;
         if (pass->endQuery)
             resolve(pass->endQuery);
         pass = nullptr;
@@ -483,7 +481,6 @@ struct Replayer {
         source.y += static_cast<std::uint32_t>(region.y);
         const TextureRegion destination = device.getPrimary(to);
         to.shadowStale = true;
-        written = true;
         if (source.texture.Get() == destination.texture.Get() && source.layer == destination.layer) {
             const wgpu::TextureDescriptor descriptor{.usage = wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
                                                      .size = {region.width, region.height, 1},
@@ -551,8 +548,8 @@ struct Replayer {
     std::expected<void, Error> operator()(const TimestampCommand& command) {
         endCompute();
         const wgpu::PassTimestampWrites timestamps{.querySet = command.query->querySet,
-                                                   .beginningOfPassWriteIndex = command.end ? wgpu::kQuerySetIndexUndefined : 0,
-                                                   .endOfPassWriteIndex = command.end ? 1 : wgpu::kQuerySetIndexUndefined};
+                                                   .beginningOfPassWriteIndex = command.end ? spareTimestamp : 0,
+                                                   .endOfPassWriteIndex = command.end ? 1 : spareTimestamp};
         const wgpu::ComputePassDescriptor descriptor{.timestampWrites = &timestamps};
         encoder.BeginComputePass(&descriptor).End();
         if (command.end)
@@ -586,7 +583,7 @@ struct Replayer {
         endCompute();
         for (; encoderLabels != 0; --encoderLabels)
             encoder.PopDebugGroup();
-        device.refreshShadows(encoder, dispatched);
+        device.refreshShadows(encoder, allBindings);
     }
 };
 

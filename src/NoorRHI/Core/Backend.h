@@ -48,7 +48,7 @@ struct Buffer {
 struct Image {
     virtual ~Image() = default;
 
-    virtual std::expected<void, Error> upload(std::span<const std::byte> mipChain) = 0;
+    virtual std::expected<void, Error> upload(std::span<const std::byte> levels, std::uint32_t levelCount) = 0;
     virtual std::expected<void, Error> download(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height,
                                                 std::span<std::byte> destination) = 0;
 };

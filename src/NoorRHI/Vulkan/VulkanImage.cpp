@@ -166,21 +166,35 @@ std::expected<void, Error> Image::open(Device& device, const ImageDesc& desc) {
 
 namespace Backend {
 
-std::expected<void, Error> VulkanImage::upload(const std::span<const std::byte> mipChain) {
+std::expected<void, Error> VulkanImage::upload(const std::span<const std::byte> levels, const std::uint32_t levelCount) {
+    constexpr vk::FormatFeatureFlags filteredBlit =
+        vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst | vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+    if (levelCount < mipLevels && (device->physicalDevice.getFormatProperties(format).optimalTilingFeatures & filteredBlit) != filteredBlit)
+        return fail(ErrorCode::Unsupported, "the Vulkan device cannot filter this format to generate mip levels");
+    const auto getExtent = [this](const std::uint32_t level) {
+        return vk::Offset3D{static_cast<std::int32_t>(std::max(width >> level, 1u)), static_cast<std::int32_t>(std::max(height >> level, 1u)), 1};
+    };
     std::expected<Token, Error> token = device->execute([&](VulkanCommandList& list) {
-        std::expected<Placement, Error> staged = list.place(mipChain);
+        std::expected<Placement, Error> staged = list.place(levels);
         if (!staged)
             return static_cast<void>(list.check(false, staged.error().code, staged.error().message));
         std::vector<vk::BufferImageCopy> copies;
         vk::DeviceSize offset = staged->offset;
-        for (std::uint32_t level = 0; level < mipLevels; ++level) {
-            const std::uint32_t levelWidth = std::max(width >> level, 1u);
-            const std::uint32_t levelHeight = std::max(height >> level, 1u);
+        for (std::uint32_t level = 0; level < levelCount; ++level) {
+            const vk::Offset3D extent = getExtent(level);
+            const auto levelWidth = static_cast<std::uint32_t>(extent.x);
+            const auto levelHeight = static_cast<std::uint32_t>(extent.y);
             copies.emplace_back(offset, 0, 0, vk::ImageSubresourceLayers(aspect, level, 0, 1), vk::Offset3D{}, vk::Extent3D{levelWidth, levelHeight, 1});
             offset += getLevelByteSize(publicFormat, levelWidth, levelHeight);
         }
         list.synchronize(vk::PipelineStageFlagBits2::eAllTransfer);
         list.pool.commands.copyBufferToImage(staged->buffer, image, vk::ImageLayout::eGeneral, copies);
+        for (std::uint32_t level = levelCount; level < mipLevels; ++level) {
+            const vk::ImageBlit blit(vk::ImageSubresourceLayers(aspect, level - 1, 0, 1), {vk::Offset3D{}, getExtent(level - 1)},
+                                     vk::ImageSubresourceLayers(aspect, level, 0, 1), {vk::Offset3D{}, getExtent(level)});
+            list.synchronize(vk::PipelineStageFlagBits2::eAllTransfer);
+            list.pool.commands.blitImage(image, vk::ImageLayout::eGeneral, image, vk::ImageLayout::eGeneral, blit, vk::Filter::eLinear);
+        }
     });
     if (!token)
         return std::unexpected(std::move(token.error()));

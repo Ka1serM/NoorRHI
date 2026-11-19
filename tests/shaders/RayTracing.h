@@ -12,4 +12,12 @@ struct Arguments {
     uint width;
 };
 
+struct FilterArguments {
+    Ptr<uint> result;
+    AccelerationStructureHandle scene;
+    uint mode;
+    uint flags;
+    uint mask;
+};
+
 }

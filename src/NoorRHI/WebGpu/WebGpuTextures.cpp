@@ -57,10 +57,6 @@ std::uint32_t getNodeLayer(const std::uint64_t node) {
     return static_cast<std::uint32_t>(node >> 32);
 }
 
-bool isSameSampler(const SamplerDesc& a, const SamplerDesc& b) {
-    return a.filter == b.filter && a.maxAnisotropy == b.maxAnisotropy;
-}
-
 void copyLayers(const wgpu::CommandEncoder& encoder, const wgpu::Texture& source, const wgpu::Texture& destination, const std::uint32_t mipLevel,
                 const wgpu::Extent3D& size) {
     const wgpu::TexelCopyTextureInfo from{.texture = source, .mipLevel = mipLevel};
@@ -280,30 +276,6 @@ void WebGpuDevice::releaseStorageLayer(const std::uint32_t binding, const std::u
     storagePools[binding - storagePoolBindings.first].freeLayers.push_back(layer);
 }
 
-std::expected<std::uint32_t, Error> WebGpuDevice::acquireSampler(const SamplerDesc& desc, const wgpu::SamplerDescriptor& native) {
-    std::lock_guard lock(mutex);
-    auto found = std::ranges::find_if(samplers, [&desc](const SamplerSlot& slot) { return slot.references != 0 && isSameSampler(slot.desc, desc); });
-    if (found == samplers.end()) {
-        found = std::ranges::find_if(samplers, [](const SamplerSlot& slot) { return slot.references == 0; });
-        if (found == samplers.end())
-            return fail(ErrorCode::Unsupported, "all " + std::to_string(samplerBindings.count) + " WebGPU sampler slots hold other sampler descriptions");
-        pushErrorScope();
-        wgpu::Sampler sampler = device.CreateSampler(&native);
-        if (std::expected<void, Error> created = popErrorScope("creating a WebGPU sampler"); !created)
-            return std::unexpected(std::move(created.error()));
-        found->sampler = std::move(sampler);
-        found->desc = desc;
-        ++version;
-    }
-    ++found->references;
-    return samplerBindings.first + static_cast<std::uint32_t>(found - samplers.begin());
-}
-
-void WebGpuDevice::releaseSampler(const std::uint32_t binding) {
-    std::lock_guard lock(mutex);
-    --samplers[binding - samplerBindings.first].references;
-}
-
 TextureRegion WebGpuDevice::getPrimary(const WebGpuImage& image) const {
     if (image.storageBinding != 0)
         return {storagePools[image.storageBinding - storagePoolBindings.first].texture, image.storageLayer};
@@ -316,13 +288,19 @@ TextureRegion WebGpuDevice::getSampled(const WebGpuImage& image) const {
     return {sampledPools[image.sampled.binding].texture, image.sampled.layer, image.sampled.x, image.sampled.y};
 }
 
-bool WebGpuDevice::hasStaleShadows(const bool dispatched) const {
-    return std::ranges::any_of(shadowedImages, [dispatched](const WebGpuImage* image) { return image->needsShadowRefresh(dispatched); });
+void WebGpuDevice::markWritten(const BindingSet& written) {
+    for (WebGpuImage* image : shadowedImages)
+        if (image->storageBinding != 0 && written[image->storageBinding])
+            image->shadowStale = true;
 }
 
-void WebGpuDevice::refreshShadows(const wgpu::CommandEncoder& encoder, const bool dispatched) {
+bool WebGpuDevice::hasStaleShadows(const BindingSet& sampled) const {
+    return std::ranges::any_of(shadowedImages, [&sampled](const WebGpuImage* image) { return image->needsShadowRefresh(sampled); });
+}
+
+void WebGpuDevice::refreshShadows(const wgpu::CommandEncoder& encoder, const BindingSet& sampled) {
     for (WebGpuImage* image : shadowedImages) {
-        if (!image->needsShadowRefresh(dispatched))
+        if (!image->needsShadowRefresh(sampled))
             continue;
         const TextureRegion primary = getPrimary(*image);
         const TextureRegion sampled = getSampled(*image);
